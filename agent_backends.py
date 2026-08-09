@@ -221,9 +221,7 @@ def _codex_app_server_binary(binary: str) -> str:
     package_root = Path(binary).parent / "node_modules" / "@openai" / "codex"
     try:
         candidates = sorted(
-            package_root.glob(
-                "node_modules/@openai/codex-win32-*/vendor/**/bin/codex.exe"
-            )
+            package_root.glob("node_modules/@openai/codex-win32-*/vendor/**/bin/codex.exe")
         )
     except OSError:
         candidates = []
@@ -300,9 +298,7 @@ def _freebuff_package_readme(binary: Optional[str]) -> Optional[Path]:
     ]
     try:
         resolved = wrapper.resolve()
-        candidates.extend(
-            [resolved.parent / "README.md", resolved.parent.parent / "README.md"]
-        )
+        candidates.extend([resolved.parent / "README.md", resolved.parent.parent / "README.md"])
     except OSError:
         pass
     return next((path for path in candidates if path.is_file()), None)
@@ -417,9 +413,7 @@ def freebuff_model_options() -> tuple[list[str], list[str], str, str, str]:
         models = [FREEBUFF_PREFERRED_MODEL]
         if saved and saved not in models:
             models.append(saved)
-        error = (
-            "Could not refresh FreeBuff's model catalog; showing the preferred default."
-        )
+        error = "Could not refresh FreeBuff's model catalog; showing the preferred default."
     else:
         error = ""
     current = (
@@ -671,9 +665,7 @@ class CodexWorker(threading.Thread):
             if message.get("id") == thread_request:
                 error = message.get("error")
                 if error:
-                    self._on_failed(
-                        self._error_text(error, "Could not start a Codex session")
-                    )
+                    self._on_failed(self._error_text(error, "Could not start a Codex session"))
                     return
                 thread = (message.get("result") or {}).get("thread") or {}
                 self._thread_id = str(thread.get("id") or self._session_id or "")
@@ -694,17 +686,13 @@ class CodexWorker(threading.Thread):
                 if self._effort:
                     params["effort"] = self._effort
                 turn_request = self._next_id()
-                self._send(
-                    {"method": "turn/start", "id": turn_request, "params": params}
-                )
+                self._send({"method": "turn/start", "id": turn_request, "params": params})
                 continue
 
             if turn_request and message.get("id") == turn_request:
                 error = message.get("error")
                 if error:
-                    self._on_failed(
-                        self._error_text(error, "Codex could not start the turn")
-                    )
+                    self._on_failed(self._error_text(error, "Codex could not start the turn"))
                     return
                 turn = (message.get("result") or {}).get("turn") or {}
                 self._turn_id = str(turn.get("id") or "")
@@ -761,9 +749,7 @@ class CodexWorker(threading.Thread):
                 turn = params.get("turn") or {}
                 status = turn.get("status")
                 if status == "failed":
-                    self._on_failed(
-                        self._error_text(turn.get("error"), "Codex turn failed")
-                    )
+                    self._on_failed(self._error_text(turn.get("error"), "Codex turn failed"))
                 elif status == "interrupted":
                     if not self._cancelled:
                         self._on_failed("Codex turn was interrupted")
@@ -773,9 +759,7 @@ class CodexWorker(threading.Thread):
 
         if not self._cancelled:
             detail = "\n".join(self._stderr[-10:]).strip()
-            self._on_failed(
-                detail or "Codex app server closed before the turn completed"
-            )
+            self._on_failed(detail or "Codex app server closed before the turn completed")
 
     def _read_stderr(self) -> None:
         if not self._proc or not self._proc.stderr:
@@ -801,9 +785,7 @@ class CodexWorker(threading.Thread):
             self._send({"id": request_id, "result": {"decision": decision}})
         elif method == "item/fileChange/requestApproval":
             decision = (
-                "accept"
-                if mode in ("acceptEdits", "auto", "bypassPermissions")
-                else "decline"
+                "accept" if mode in ("acceptEdits", "auto", "bypassPermissions") else "decline"
             )
             self._send({"id": request_id, "result": {"decision": decision}})
         else:
@@ -826,11 +808,7 @@ class CodexWorker(threading.Thread):
             self._on_activity("tool", f"Running: {command or 'command'}")
         elif kind == "fileChange":
             changes = item.get("changes") or []
-            paths = [
-                str(c.get("path"))
-                for c in changes
-                if isinstance(c, dict) and c.get("path")
-            ]
+            paths = [str(c.get("path")) for c in changes if isinstance(c, dict) and c.get("path")]
             self._on_activity("tool", "Editing " + (", ".join(paths) or "files"))
         elif kind == "mcpToolCall":
             self._on_activity(
@@ -838,9 +816,7 @@ class CodexWorker(threading.Thread):
                 f"Using {item.get('server') or 'MCP'}: {item.get('tool') or 'tool'}",
             )
         elif kind == "webSearch":
-            self._on_activity(
-                "tool", f"Searching the web: {item.get('query') or ''}".strip()
-            )
+            self._on_activity("tool", f"Searching the web: {item.get('query') or ''}".strip())
         elif kind == "imageView":
             self._on_activity("tool", f"Viewing {item.get('path') or 'image'}")
 
@@ -870,16 +846,12 @@ class CodexWorker(threading.Thread):
             summary = []
             for change in changes:
                 if isinstance(change, dict) and change.get("path"):
-                    summary.append(
-                        f"{change.get('kind') or 'changed'}: {change['path']}"
-                    )
+                    summary.append(f"{change.get('kind') or 'changed'}: {change['path']}")
             if summary:
                 self._on_activity("result", "\n".join(summary))
 
 
-_ANSI_RE = re.compile(
-    r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\)|[()][A-Z0-9])"
-)
+_ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\)|[()][A-Z0-9])")
 
 
 def _strip_terminal_noise(text: str) -> str:
@@ -906,9 +878,7 @@ def _freebuff_chat_dirs(cwd: str) -> dict[str, float]:
         try:
             for path in folder.iterdir():
                 if path.is_dir():
-                    found[path.name] = max(
-                        found.get(path.name, 0.0), path.stat().st_mtime
-                    )
+                    found[path.name] = max(found.get(path.name, 0.0), path.stat().st_mtime)
         except OSError:
             pass
     return found
@@ -923,9 +893,7 @@ class FreebuffWorker(threading.Thread):
     activity rows and resumes the chat id FreeBuff creates on the next turn.
     """
 
-    _PROMPT_RE = re.compile(
-        r"(?mi)(?:^\s*[›>]\s*$|Enter a coding task or / for commands)"
-    )
+    _PROMPT_RE = re.compile(r"(?mi)(?:^\s*[›>]\s*$|Enter a coding task or / for commands)")
     _BUSY_RE = re.compile(
         r"(?mi)(?:thinking(?:\.\.\.|…)|working(?:\.\.\.|…)|■\s*Esc|Esc\s+to\s+(?:stop|interrupt))"
     )
@@ -1038,9 +1006,7 @@ class FreebuffWorker(threading.Thread):
         try:
             import pyte
         except ImportError:
-            self._on_failed(
-                "FreeBuff support needs pyte. Reinstall BlindPilot dependencies."
-            )
+            self._on_failed("FreeBuff support needs pyte. Reinstall BlindPilot dependencies.")
             return
         screen = pyte.HistoryScreen(180, 60, history=4000)
         stream = pyte.Stream(screen)
@@ -1070,11 +1036,7 @@ class FreebuffWorker(threading.Thread):
             # The first FreeBuff launch opens an accessible model chooser.
             # Accept its highlighted recommended model so the hidden terminal
             # reaches the composer; later launches remember the selection.
-            if (
-                not accepted_recommended_model
-                and not sent
-                and "RECOMMENDED" in last_visible
-            ):
+            if not accepted_recommended_model and not sent and "RECOMMENDED" in last_visible:
                 self._write("\r")
                 accepted_recommended_model = True
                 continue
@@ -1103,9 +1065,7 @@ class FreebuffWorker(threading.Thread):
                 and time.monotonic() - screen_changed_at >= 0.35
             ):
                 thinking, answer = pending_sections
-                last_thinking = self._emit_stable_delta(
-                    "thinking", last_thinking, thinking
-                )
+                last_thinking = self._emit_stable_delta("thinking", last_thinking, thinking)
                 last_answer = self._emit_stable_delta("assistant", last_answer, answer)
                 pending_sections = None
             if sent and saw_busy and at_prompt and not busy:
@@ -1218,9 +1178,7 @@ class FreebuffWorker(threading.Thread):
             candidates = raw_lines[thinking_index + 1 :]
             in_thinking = True
         else:
-            prompt_indexes = [
-                index for index, raw in enumerate(raw_lines) if self._prompt in raw
-            ]
+            prompt_indexes = [index for index, raw in enumerate(raw_lines) if self._prompt in raw]
             candidates = raw_lines[prompt_indexes[-1] + 1 :] if prompt_indexes else []
             in_thinking = False
 
@@ -1287,9 +1245,7 @@ class FreebuffWorker(threading.Thread):
         return self._freebuff_sections(visible)[1]
 
 
-def worker_class(
-    backend: str, claude_worker: type[threading.Thread]
-) -> type[threading.Thread]:
+def worker_class(backend: str, claude_worker: type[threading.Thread]) -> type[threading.Thread]:
     backend = normalize_backend(backend)
     if backend == BACKEND_CODEX:
         return CodexWorker

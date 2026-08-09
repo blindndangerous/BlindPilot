@@ -113,9 +113,7 @@ def _live_rows():
         Row(kind="you", label="You: do it", payload="do it", response_number=1),
         Row(kind="header", label="Response 1", payload="Done.", response_number=1),
         Row(kind="thinking", label="Thinking: hmm", payload="hmm", response_number=1),
-        Row(
-            kind="tool", label="Reading a.py", payload="Reading a.py", response_number=1
-        ),
+        Row(kind="tool", label="Reading a.py", payload="Reading a.py", response_number=1),
         Row(kind="result", label="Result: x", payload="x = 1", response_number=1),
         Row(kind="prose", label="Done.", payload="Done.", response_number=1),
     ]
@@ -129,11 +127,7 @@ def test_reassemble_copies_every_row_of_the_response_in_list_order():
 
 def test_reassemble_falls_back_to_the_header_when_there_are_no_other_rows():
     # Mid-stream a response can be nothing but its header.
-    rows = [
-        Row(
-            kind="header", label="Response 1", payload="Full answer.", response_number=1
-        )
-    ]
+    rows = [Row(kind="header", label="Response 1", payload="Full answer.", response_number=1)]
     assert reassemble(rows, 1) == "Full answer."
 
 
@@ -331,9 +325,7 @@ def test_steer_writes_a_second_message_into_the_running_process():
         {
             "type": "assistant",
             "message": {
-                "content": [
-                    {"type": "tool_use", "name": "Read", "input": {"file_path": "a.py"}}
-                ]
+                "content": [{"type": "tool_use", "name": "Read", "input": {"file_path": "a.py"}}]
             },
         },
         {
@@ -406,9 +398,7 @@ def test_steer_is_refused_once_the_run_is_over():
 if __name__ == "__main__":
     import traceback
 
-    fns = [
-        v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)
-    ]
+    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     passed = failed = 0
     for fn in fns:
         try:

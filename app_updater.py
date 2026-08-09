@@ -56,9 +56,7 @@ def version_tuple(value: str) -> tuple[int, ...]:
     return tuple(int(part) for part in match.group(0).split(".")) if match else ()
 
 
-def asset_name_for_platform(
-    system: Optional[str] = None, machine: Optional[str] = None
-) -> str:
+def asset_name_for_platform(system: Optional[str] = None, machine: Optional[str] = None) -> str:
     """Return the release asset expected by this operating system and CPU."""
     system = (system or platform.system()).casefold()
     machine = (machine or platform.machine()).casefold()
@@ -107,9 +105,7 @@ def fetch_latest_release(
 ) -> ReleaseInfo:
     """Query GitHub at runtime and select the asset for this computer."""
     try:
-        with opener(
-            _request(LATEST_RELEASE_API, current_version), timeout=20
-        ) as response:
+        with opener(_request(LATEST_RELEASE_API, current_version), timeout=20) as response:
             payload = json.loads(_read_limited(response, 4 * 1024 * 1024))
     except UpdateError:
         raise
@@ -150,9 +146,7 @@ def fetch_latest_release(
         ),
         None,
     )
-    checksum_url = (
-        str(checksum_asset.get("browser_download_url") or "") if checksum_asset else ""
-    )
+    checksum_url = str(checksum_asset.get("browser_download_url") or "") if checksum_asset else ""
     if not sha256 and not checksum_url:
         raise UpdateError("The release has no SHA-256 verification data.")
     return ReleaseInfo(
@@ -173,8 +167,7 @@ def _allowed_download_url(url: str) -> bool:
     parsed = urlparse(url)
     host = (parsed.hostname or "").casefold()
     return parsed.scheme == "https" and any(
-        host == allowed or host.endswith("." + allowed)
-        for allowed in _ALLOWED_DOWNLOAD_HOSTS
+        host == allowed or host.endswith("." + allowed) for allowed in _ALLOWED_DOWNLOAD_HOSTS
     )
 
 
@@ -184,9 +177,7 @@ def _checksum_from_sidecar(
     if not _allowed_download_url(release.checksum_url):
         raise UpdateError("The checksum download URL is not trusted.")
     try:
-        with opener(
-            _request(release.checksum_url, current_version), timeout=20
-        ) as response:
+        with opener(_request(release.checksum_url, current_version), timeout=20) as response:
             text = _read_limited(response, 4096).decode("ascii", errors="strict")
     except UpdateError:
         raise
@@ -208,18 +199,14 @@ def download_update(
     """Download a release archive and reject it unless SHA-256 matches."""
     if not _allowed_download_url(release.asset_url):
         raise UpdateError("The update download URL is not trusted.")
-    expected = release.sha256 or _checksum_from_sidecar(
-        release, current_version, opener
-    )
+    expected = release.sha256 or _checksum_from_sidecar(release, current_version, opener)
     fd, temporary_name = tempfile.mkstemp(prefix="BlindPilot-update-", suffix=".zip")
     os.close(fd)
     temporary = Path(temporary_name)
     digest = hashlib.sha256()
     received = 0
     try:
-        with opener(
-            _request(release.asset_url, current_version), timeout=60
-        ) as response:
+        with opener(_request(release.asset_url, current_version), timeout=60) as response:
             final_url = getattr(response, "geturl", lambda: release.asset_url)()
             if not _allowed_download_url(final_url):
                 raise UpdateError("GitHub redirected the update to an untrusted host.")
@@ -230,9 +217,7 @@ def download_update(
                         break
                     received += len(chunk)
                     if received > MAX_UPDATE_BYTES or received > release.asset_size:
-                        raise UpdateError(
-                            "The update download exceeded its published size."
-                        )
+                        raise UpdateError("The update download exceeded its published size.")
                     digest.update(chunk)
                     handle.write(chunk)
                     if progress:
@@ -305,9 +290,7 @@ fi
 def schedule_install(archive: Path) -> None:
     """Install the verified archive after this packaged process exits."""
     if not getattr(sys, "frozen", False):
-        raise UpdateError(
-            "Automatic installation is available in packaged builds only."
-        )
+        raise UpdateError("Automatic installation is available in packaged builds only.")
     executable = Path(sys.executable).resolve()
     if platform.system() == "Windows":
         install_dir = executable.parent
@@ -317,11 +300,7 @@ def schedule_install(archive: Path) -> None:
         helper.write_text(_WINDOWS_HELPER, encoding="utf-8-sig")
         powershell = os.environ.get("SystemRoot", r"C:\Windows")
         powershell = str(
-            Path(powershell)
-            / "System32"
-            / "WindowsPowerShell"
-            / "v1.0"
-            / "powershell.exe"
+            Path(powershell) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
         )
         subprocess.Popen(
             [

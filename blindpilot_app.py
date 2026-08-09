@@ -624,10 +624,7 @@ def install_claude(log: Callable[[str], None]) -> Optional[str]:
         log(_missing_prereq_message())
         return None
 
-    log(
-        "Downloading and running the Claude Code installer. "
-        "This usually takes under a minute."
-    )
+    log("Downloading and running the Claude Code installer. This usually takes under a minute.")
     try:
         proc = subprocess.Popen(
             argv,
@@ -655,10 +652,7 @@ def install_claude(log: Callable[[str], None]) -> Optional[str]:
     _add_to_process_path(_native_bin_dir())
     binary = _find_claude()
     if binary is None:
-        log(
-            f"The installer finished with exit code {rc} but `claude` was not "
-            "found afterwards."
-        )
+        log(f"The installer finished with exit code {rc} but `claude` was not found afterwards.")
         return None
 
     log(f"Installed: {binary}")
@@ -769,9 +763,7 @@ def _repair_claude_native_update(binary: str, log: Callable[[str], None]) -> boo
     versions = Path.home() / ".local" / "share" / "claude" / "versions"
     try:
         candidates = [
-            path
-            for path in versions.iterdir()
-            if path.is_file() and _version_tuple(path.name)
+            path for path in versions.iterdir() if path.is_file() and _version_tuple(path.name)
         ]
     except OSError:
         return True
@@ -785,9 +777,7 @@ def _repair_claude_native_update(binary: str, log: Callable[[str], None]) -> boo
     try:
         shutil.copy2(newest, binary)
     except OSError as exc:
-        log(
-            f"Claude downloaded {newest.name}, but its launcher could not be updated: {exc}"
-        )
+        log(f"Claude downloaded {newest.name}, but its launcher could not be updated: {exc}")
         return False
     verified = _version_tuple(_executable_version(binary))
     if verified < newest_version:
@@ -807,17 +797,13 @@ def update_backend(backend: str, log: Callable[[str], None]) -> bool:
         return False
     previous_freebuff_model = ""
     if backend == BACKEND_FREEBUFF:
-        _models, _efforts, previous_freebuff_model, _effort, _error = (
-            freebuff_model_options()
-        )
+        _models, _efforts, previous_freebuff_model, _effort, _error = freebuff_model_options()
     if backend == BACKEND_CLAUDE:
         argv = [binary, "update"]
     else:
         argv = _npm_update_argv(backend)
         if argv is None:
-            log(
-                f"npm was not found, so BlindPilot cannot update {label} automatically."
-            )
+            log(f"npm was not found, so BlindPilot cannot update {label} automatically.")
             return False
     log(f"Checking for {label} updates...")
     try:
@@ -860,9 +846,7 @@ def update_backend(backend: str, log: Callable[[str], None]) -> bool:
         try:
             set_freebuff_model(selected)
         except OSError as exc:
-            log(
-                f"{label} updated, but its model selection could not be restored: {exc}"
-            )
+            log(f"{label} updated, but its model selection could not be restored: {exc}")
             return False
     log(f"{label} is up to date.")
     return True
@@ -963,9 +947,7 @@ def _parse_model_aliases(text: str) -> List[str]:
 
 def _parse_current_model(text: str) -> tuple[str, str]:
     """(display name, effort) from the CLI's `Current model:` status line."""
-    match = re.search(
-        r"Current model:\s*([^\n(]+)(?:\(effort:\s*([^)]*)\))?", text, re.I
-    )
+    match = re.search(r"Current model:\s*([^\n(]+)(?:\(effort:\s*([^)]*)\))?", text, re.I)
     if not match:
         return "", ""
     return match.group(1).strip(), (match.group(2) or "").strip()
@@ -1154,8 +1136,7 @@ PERMISSION_MODES = [
     (
         "dontAsk",
         "Don't ask",
-        "Don't ask mode. Approval prompts are declined instead of interrupting "
-        "the run.",
+        "Don't ask mode. Approval prompts are declined instead of interrupting the run.",
     ),
     (
         "bypassPermissions",
@@ -1505,9 +1486,7 @@ class Earcons:
         for player in ("paplay", "aplay", "ffplay"):
             found = shutil.which(player)
             if found:
-                return [found] + (
-                    ["-nodisp", "-autoexit"] if player == "ffplay" else []
-                )
+                return [found] + (["-nodisp", "-autoexit"] if player == "ffplay" else [])
         return None
 
     def _play_once(self, path: Optional[str]) -> None:
@@ -1716,9 +1695,7 @@ class ClaudeWorker(threading.Thread):
     def _do_run(self) -> None:
         binary = _find_claude()
         if binary is None:
-            self._on_failed(
-                "Claude Code not installed. Install from claude.com/claude-code"
-            )
+            self._on_failed("Claude Code not installed. Install from claude.com/claude-code")
             return
 
         # Streaming *input* mode: the prompt goes in over stdin as a JSON message
@@ -2072,11 +2049,7 @@ class NewSessionDialog(wx.Dialog):
 
     def _browse(self) -> None:
         typed = self.folder_box.GetValue().strip().strip('"')
-        start = (
-            typed
-            if typed and os.path.isdir(os.path.expanduser(typed))
-            else self._default_dir
-        )
+        start = typed if typed and os.path.isdir(os.path.expanduser(typed)) else self._default_dir
         with wx.DirDialog(
             self,
             "Choose a folder for the new session",
@@ -2106,9 +2079,7 @@ class NewSessionDialog(wx.Dialog):
 
     def _reject(self, message: str) -> None:
         announce(message)
-        with wx.MessageDialog(
-            self, message, "New Session", style=wx.OK | wx.ICON_WARNING
-        ) as warn:
+        with wx.MessageDialog(self, message, "New Session", style=wx.OK | wx.ICON_WARNING) as warn:
             warn.ShowModal()
         self.folder_box.SetFocus()
 
@@ -2221,9 +2192,7 @@ class SessionPanel(wx.Panel):
         # run is actually listening.
         self.steer_btn = wx.Button(self, label="Steer")
         self.steer_btn.SetName("Steer the running task")
-        self.steer_btn.SetToolTip(
-            "Send this message into the task that is already running"
-        )
+        self.steer_btn.SetToolTip("Send this message into the task that is already running")
         self.steer_btn.Bind(wx.EVT_BUTTON, lambda _e: self._on_steer())
         self.steer_btn.Disable()
 
@@ -2313,9 +2282,7 @@ class SessionPanel(wx.Panel):
             return
         index = max(0, min(index, count - 1))
         if SETTINGS.text_view:
-            self.responses_text.SetInsertionPoint(
-                self.responses_text.XYToPosition(0, index)
-            )
+            self.responses_text.SetInsertionPoint(self.responses_text.XYToPosition(0, index))
         else:
             self.responses.SetSelection(index)
 
@@ -2398,15 +2365,10 @@ class SessionPanel(wx.Panel):
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _remember_cli_model(
-        self, options: "ModelOptions", backend: Optional[str] = None
-    ) -> None:
+    def _remember_cli_model(self, options: "ModelOptions", backend: Optional[str] = None) -> None:
         if not self:  # tab closed while the probe was running
             return
-        if (
-            backend is not None
-            and normalize_backend(backend) != self.selected_backend()
-        ):
+        if backend is not None and normalize_backend(backend) != self.selected_backend():
             return
         self._cli_model = options.current_model
         self._cli_effort = options.current_effort
@@ -2422,9 +2384,7 @@ class SessionPanel(wx.Panel):
         if force_refresh:
             invalidate_model_options(backend)
         cached = (
-            None
-            if force_refresh
-            else cached_model_options(self.cwd, PROBE_TTL_SECONDS, backend)
+            None if force_refresh else cached_model_options(self.cwd, PROBE_TTL_SECONDS, backend)
         )
         if cached is not None:
             self.warm_model_probe()
@@ -2439,16 +2399,12 @@ class SessionPanel(wx.Panel):
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _show_model_dialog(
-        self, options: "ModelOptions", backend: Optional[str] = None
-    ) -> None:
+    def _show_model_dialog(self, options: "ModelOptions", backend: Optional[str] = None) -> None:
         if not self:  # tab closed while the probe was running
             return
         provider = normalize_backend(backend or self.selected_backend())
         self._remember_cli_model(options, provider)
-        dlg = ModelDialog(
-            self, options, self.model, self.effort, backend_label(provider)
-        )
+        dlg = ModelDialog(self, options, self.model, self.effort, backend_label(provider))
         try:
             if dlg.ShowModal() != wx.ID_OK:
                 self._announce(f"Model unchanged. Still using {self._model_summary()}.")
@@ -2462,9 +2418,7 @@ class SessionPanel(wx.Panel):
         """Apply the model / effort to every message sent from here on."""
         if self.selected_backend() == BACKEND_FREEBUFF and model != self.model:
             self._session_id = None
-            self._announce(
-                "FreeBuff model changed; the next message starts a new conversation."
-            )
+            self._announce("FreeBuff model changed; the next message starts a new conversation.")
         self.model = model
         self.effort = effort
         self._announce(f"Using {self._model_summary()} from your next message.")
@@ -2473,9 +2427,7 @@ class SessionPanel(wx.Panel):
     def cycle_mode(self) -> None:
         """Quick-cycle the everyday subset (default → accept edits → plan)."""
         if self.mode in _CYCLE_VALUES:
-            nxt = _CYCLE_VALUES[
-                (_CYCLE_VALUES.index(self.mode) + 1) % len(_CYCLE_VALUES)
-            ]
+            nxt = _CYCLE_VALUES[(_CYCLE_VALUES.index(self.mode) + 1) % len(_CYCLE_VALUES)]
         else:
             nxt = _CYCLE_VALUES[0]
         self._set_mode(nxt)
@@ -2518,9 +2470,7 @@ class SessionPanel(wx.Panel):
         self.prompt.SetValue(cmd_text)
         self.prompt.SetInsertionPointEnd()
         self.prompt.SetFocus()
-        self._announce(
-            f"Slash command: {cmd_text}. Edit if needed, then press Enter to send."
-        )
+        self._announce(f"Slash command: {cmd_text}. Edit if needed, then press Enter to send.")
 
     def _add_attachments(self, paths) -> None:
         added = 0
@@ -2622,11 +2572,7 @@ class SessionPanel(wx.Panel):
             if on_first_line and self._row_count() > 0:
                 self._focus_row(self._row_count() - 1)
                 return
-        if (
-            key == ord("V")
-            and (event.CmdDown() or event.ControlDown())
-            and not event.AltDown()
-        ):
+        if key == ord("V") and (event.CmdDown() or event.ControlDown()) and not event.AltDown():
             # Paste of a file or image becomes an attachment; plain text pastes
             # normally.
             if self._try_paste_attachment():
@@ -2693,9 +2639,7 @@ class SessionPanel(wx.Panel):
             return
 
         if self._worker is not None and self._worker.is_alive():
-            self._announce(
-                "Error: The current backend is still finishing the previous turn"
-            )
+            self._announce("Error: The current backend is still finishing the previous turn")
             return
 
         prompt = self.prompt.GetValue().strip()
@@ -2782,9 +2726,7 @@ class SessionPanel(wx.Panel):
         if not getattr(worker, "steer")(text):
             # The turn finished between typing and pressing. Leave the text in
             # place so it can just be sent as the next prompt.
-            self._set_status(
-                "Error: The run already finished. Press Send to ask it now."
-            )
+            self._set_status("Error: The run already finished. Press Send to ask it now.")
             return
         self.prompt.SetValue("")
         self._earcons.play_send()
@@ -2852,9 +2794,7 @@ class SessionPanel(wx.Panel):
             )
             self._say(_result_label(text))
         elif kind == "tool":
-            self._rows.append(
-                Row(kind="tool", label=text, payload=text, response_number=n)
-            )
+            self._rows.append(Row(kind="tool", label=text, payload=text, response_number=n))
             self._say(text)
         elif kind == "thinking":
             flat = " ".join(text.split())
@@ -2899,11 +2839,7 @@ class SessionPanel(wx.Panel):
 
     def _narrate_completed_response(self, text: str) -> None:
         """Speak a final answer when no assistant activity was narrated live."""
-        if (
-            not SETTINGS.speak_live
-            or self._assistant_narrated_this_turn
-            or not text.strip()
-        ):
+        if not SETTINGS.speak_live or self._assistant_narrated_this_turn or not text.strip():
             return
         speaker = backend_label(self._session_backend)
         if self._say(f"{speaker}. {' '.join(text.split())}"):
@@ -2931,10 +2867,7 @@ class SessionPanel(wx.Panel):
             # Fill the header payload so 'copy whole response' yields Claude's
             # full answer text (the streamed rows are already in the list).
             for row in self._rows:
-                if (
-                    row.response_number == self._stream_response
-                    and row.kind == "header"
-                ):
+                if row.response_number == self._stream_response and row.kind == "header":
                     row.payload = _strip_noise(text)
                     break
         n = self._response_count
@@ -2964,11 +2897,7 @@ class SessionPanel(wx.Panel):
         labels: List[str] = []
         self._displayed = []
         for row in self._rows:
-            if (
-                term
-                and term not in row.payload.lower()
-                and term not in row.label.lower()
-            ):
+            if term and term not in row.payload.lower() and term not in row.label.lower():
                 continue
             labels.append(row.label)
             self._displayed.append(row)
@@ -3124,13 +3053,9 @@ class SessionPanel(wx.Panel):
         insert_item = menu.Append(wx.ID_ANY, "Insert into prompt")
         self.Bind(wx.EVT_MENU, lambda _e, r=row: self._action_insert(r), insert_item)
         copy_item = menu.Append(wx.ID_ANY, "Copy whole response")
-        self.Bind(
-            wx.EVT_MENU, lambda _e, r=row: self._action_copy_response(r), copy_item
-        )
+        self.Bind(wx.EVT_MENU, lambda _e, r=row: self._action_copy_response(r), copy_item)
         copy_all_item = menu.Append(wx.ID_ANY, "Copy whole conversation")
-        self.Bind(
-            wx.EVT_MENU, lambda _e: self._action_copy_conversation(), copy_all_item
-        )
+        self.Bind(wx.EVT_MENU, lambda _e: self._action_copy_conversation(), copy_all_item)
         self._responses_ctrl().PopupMenu(menu)
         menu.Destroy()
 
@@ -3795,9 +3720,7 @@ class SetupWizard(wx.Dialog):
         elif backend_auth_ok(self.backend):
             self._signin_status.SetLabel(f"{label} reports that you are signed in.")
         else:
-            self._signin_status.SetLabel(
-                f"BlindPilot could not confirm a {label} sign-in yet."
-            )
+            self._signin_status.SetLabel(f"BlindPilot could not confirm a {label} sign-in yet.")
         self._pages[2].Layout()
         self.Layout()
         announce(self._signin_status.GetLabel())
@@ -4000,9 +3923,7 @@ class MainFrame(wx.Frame):
         self.SetMenuBar(menubar)
         self.Bind(wx.EVT_MENU, lambda _e: self._toggle_live_rows(), self._rows_item)
         self.Bind(wx.EVT_MENU, lambda _e: self._toggle_speak_live(), self._speak_item)
-        self.Bind(
-            wx.EVT_MENU, lambda _e: self._toggle_text_view(), self._text_view_item
-        )
+        self.Bind(wx.EVT_MENU, lambda _e: self._toggle_text_view(), self._text_view_item)
         self.Bind(
             wx.EVT_MENU,
             lambda _e: self._use_silent_until_response_mode(),
@@ -4053,16 +3974,12 @@ class MainFrame(wx.Frame):
         id_attach = wx.NewIdRef()
         id_jump_response = wx.NewIdRef()
         id_slash = wx.NewIdRef()
-        self.Bind(
-            wx.EVT_MENU, lambda _e: self._focus_active("prompt"), id=id_focus_prompt
-        )
+        self.Bind(wx.EVT_MENU, lambda _e: self._focus_active("prompt"), id=id_focus_prompt)
         self.Bind(wx.EVT_MENU, lambda _e: self._cycle_tab(+1), id=id_next_tab)
         self.Bind(wx.EVT_MENU, lambda _e: self._cycle_tab(-1), id=id_prev_tab)
         self.Bind(wx.EVT_MENU, lambda _e: self._cycle_mode_active(), id=id_cycle_mode)
         self.Bind(wx.EVT_MENU, lambda _e: self._attach_active(), id=id_attach)
-        self.Bind(
-            wx.EVT_MENU, lambda _e: self._jump_to_latest_response(), id=id_jump_response
-        )
+        self.Bind(wx.EVT_MENU, lambda _e: self._jump_to_latest_response(), id=id_jump_response)
         self.Bind(wx.EVT_MENU, lambda _e: self._slash_active(), id=id_slash)
 
         accel_entries = [
@@ -4106,8 +4023,7 @@ class MainFrame(wx.Frame):
             if isinstance(page, SessionPanel):
                 page.backend_changed()
         message = (
-            f"Backend changed to {backend_label(backend)}. "
-            "It will be used for the next new turn."
+            f"Backend changed to {backend_label(backend)}. It will be used for the next new turn."
         )
         self._announce_setting(message)
 
@@ -4169,9 +4085,7 @@ class MainFrame(wx.Frame):
         """Startup entry point: report only an available update, never network noise."""
         self._check_for_updates(silent=True)
 
-    def _on_update_checked(
-        self, release: Optional[ReleaseInfo], error: str, silent: bool
-    ) -> None:
+    def _on_update_checked(self, release: Optional[ReleaseInfo], error: str, silent: bool) -> None:
         self._update_checking = False
         if error:
             if not silent:
@@ -4179,9 +4093,7 @@ class MainFrame(wx.Frame):
             return
         if release is None or not release.is_newer_than(APP_VERSION):
             if not silent:
-                self._announce_setting(
-                    f"BlindPilot {APP_VERSION} is the newest available version"
-                )
+                self._announce_setting(f"BlindPilot {APP_VERSION} is the newest available version")
             return
         notes = release.notes[:1500]
         message = (
@@ -4206,9 +4118,7 @@ class MainFrame(wx.Frame):
         self._download_release(release)
 
     def _download_release(self, release: ReleaseInfo) -> None:
-        self._announce_setting(
-            f"Downloading and verifying BlindPilot {release.version}"
-        )
+        self._announce_setting(f"Downloading and verifying BlindPilot {release.version}")
 
         def work() -> None:
             last_bucket = -1
@@ -4328,9 +4238,7 @@ class MainFrame(wx.Frame):
             if isinstance(page, SessionPanel):
                 page.apply_view_mode()
         if SETTINGS.text_view:
-            self._announce_setting(
-                "Responses are now a read-only text field, one row per line"
-            )
+            self._announce_setting("Responses are now a read-only text field, one row per line")
         else:
             self._announce_setting("Responses are now a list")
 

@@ -95,9 +95,7 @@ def test_project_local_settings_win():
     with _Sandbox() as box:
         _write_settings(box.user_dir / "settings.json", "acceptEdits")
         _write_settings(box.project / ".claude" / "settings.json", "plan")
-        _write_settings(
-            box.project / ".claude" / "settings.local.json", "bypassPermissions"
-        )
+        _write_settings(box.project / ".claude" / "settings.local.json", "bypassPermissions")
         assert _default_permission_mode(str(box.project)) == "bypassPermissions"
 
 

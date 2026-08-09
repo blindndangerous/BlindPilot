@@ -95,6 +95,9 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     steps:
+      - name: Check out release notes
+        uses: actions/checkout@v7
+
       - name: Download build outputs
         uses: actions/download-artifact@v8
         with:
@@ -116,5 +119,5 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" artifacts/* \
             --repo "${GITHUB_REPOSITORY}" \
             --title "BlindPilot ${GITHUB_REF_NAME#v}" \
-            --generate-notes \
+            --notes-file RELEASE_NOTES.md \
             --verify-tag

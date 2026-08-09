@@ -123,17 +123,13 @@ def test_codex_stream_deltas_become_one_accessible_activity_row():
     worker._assistant_streams["message-1"] = ["Blind", "Pilot", " ready."]
     worker._assistant_parts.extend(["Blind", "Pilot", " ready."])
 
-    worker._item_completed(
-        {"id": "message-1", "type": "agentMessage", "text": "BlindPilot ready."}
-    )
+    worker._item_completed({"id": "message-1", "type": "agentMessage", "text": "BlindPilot ready."})
 
     assert events == [("assistant", "BlindPilot ready.")]
     assert "".join(worker._assistant_parts) == "BlindPilot ready."
 
 
-def test_freebuff_catalog_is_discovered_at_runtime_and_pro_is_default(
-    monkeypatch, tmp_path
-):
+def test_freebuff_catalog_is_discovered_at_runtime_and_pro_is_default(monkeypatch, tmp_path):
     wrapper = tmp_path / "npm" / "freebuff.cmd"
     readme = wrapper.parent / "node_modules" / "freebuff" / "README.md"
     executable = tmp_path / ".config" / "manicode" / "freebuff.exe"
@@ -149,9 +145,7 @@ def test_freebuff_catalog_is_discovered_at_runtime_and_pro_is_default(
     )
     monkeypatch.setattr(agent_backends.Path, "home", classmethod(lambda _cls: tmp_path))
     monkeypatch.setattr(agent_backends.platform, "system", lambda: "Windows")
-    monkeypatch.setattr(
-        agent_backends, "find_backend_cli", lambda _backend: str(wrapper)
-    )
+    monkeypatch.setattr(agent_backends, "find_backend_cli", lambda _backend: str(wrapper))
     agent_backends.invalidate_backend_cache()
 
     models, efforts, current, current_effort, error = freebuff_model_options()
@@ -166,9 +160,7 @@ def test_freebuff_catalog_is_discovered_at_runtime_and_pro_is_default(
     models, _efforts, current, _current_effort, _error = freebuff_model_options()
     assert current == "openai/gpt-next"
     settings = json.loads(
-        (tmp_path / ".config" / "manicode" / "settings.json").read_text(
-            encoding="utf-8"
-        )
+        (tmp_path / ".config" / "manicode" / "settings.json").read_text(encoding="utf-8")
     )
     assert settings["freebuffModel"] == "openai/gpt-next"
 
@@ -213,10 +205,7 @@ def test_freebuff_live_delta_ignores_terminal_redraw_replacements():
         **callbacks,
     )
 
-    assert (
-        worker._emit_stable_delta("assistant", "Old answer", "New answer")
-        == "New answer"
-    )
+    assert worker._emit_stable_delta("assistant", "Old answer", "New answer") == "New answer"
     assert events == []
     assert (
         worker._emit_stable_delta("assistant", "New answer", "New answer continued")

@@ -267,9 +267,7 @@ def test_login_shell_path_split_keeps_entries_containing_spaces():
 
 def test_posix_check_stays_quiet_without_a_usable_login_shell():
     """No shell to ask means no evidence of a problem — don't invent one."""
-    with _Patch(
-        platform=_FakePlatform("Darwin"), _posix_persistent_path_dirs=lambda: []
-    ):
+    with _Patch(platform=_FakePlatform("Darwin"), _posix_persistent_path_dirs=lambda: []):
         assert _is_on_persistent_path(Path("/anywhere"))
 
 
@@ -400,9 +398,7 @@ def test_posix_path_write_creates_missing_parent_directories():
 
 
 def test_install_command_is_the_official_powershell_one_liner():
-    with _Patch(
-        platform=_FakePlatform("Windows"), _powershell_exe=lambda: "powershell.exe"
-    ):
+    with _Patch(platform=_FakePlatform("Windows"), _powershell_exe=lambda: "powershell.exe"):
         argv = _install_argv()
     assert argv is not None
     assert argv[0] == "powershell.exe"
@@ -419,9 +415,7 @@ def test_install_command_is_the_official_shell_one_liner_on_macos():
 
 
 def test_install_command_absent_without_curl():
-    with _Patch(
-        platform=_FakePlatform("Darwin"), shutil=_FakeShutil({"bash": "/bin/bash"})
-    ):
+    with _Patch(platform=_FakePlatform("Darwin"), shutil=_FakeShutil({"bash": "/bin/bash"})):
         assert _install_argv() is None
 
 

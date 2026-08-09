@@ -160,13 +160,7 @@ def test_reassemble_fences_code_rows_that_have_no_language():
 
 
 def test_mixed_document_order_is_preserved():
-    text = (
-        "# Title\n\n"
-        "Opening prose.\n\n"
-        "```bash\nls -la\n```\n\n"
-        "- one\n- two\n\n"
-        "Closing remark."
-    )
+    text = "# Title\n\nOpening prose.\n\n```bash\nls -la\n```\n\n- one\n- two\n\nClosing remark."
     rows = parse_response(text, 1)
     assert kinds(rows) == ["header", "heading", "prose", "code", "list", "prose"]
     assert rows[1].label == "Title"  # no '#', no "Heading:" prefix
@@ -228,9 +222,7 @@ def test_emoji_in_code_is_removed_but_code_structure_kept():
 if __name__ == "__main__":
     import traceback
 
-    fns = [
-        v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)
-    ]
+    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     passed = failed = 0
     for fn in fns:
         try:

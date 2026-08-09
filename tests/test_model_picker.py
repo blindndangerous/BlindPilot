@@ -50,9 +50,7 @@ def test_claude_update_repairs_an_old_windows_launcher(monkeypatch, tmp_path):
         claude_reader,
         "_executable_version",
         lambda binary: (
-            "2.1.226"
-            if Path(binary).read_text(encoding="utf-8") == "new"
-            else "2.1.225"
+            "2.1.226" if Path(binary).read_text(encoding="utf-8") == "new" else "2.1.225"
         ),
     )
 
