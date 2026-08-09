@@ -12,3 +12,4 @@ build/
 *.spec
 NVIDIA Corporation/
 artifacts/
+.release-setup/

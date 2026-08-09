@@ -62,7 +62,7 @@ default until you choose another available FreeBuff model.
 - Optional live narration through NVDA, JAWS, VoiceOver, or another available
   accessibility output.
 - Multiple project sessions with independent backend conversations.
-- Steering messages while a backend is working.
+- Steering messages while a backend is working, and stopping it outright.
 - File and clipboard-image attachments represented as explicit prompt paths.
 - Search, response jumping, whole-response copy, code copy, and code saving.
 - Provider-aware model, reasoning-effort, permission, and slash-command controls.
@@ -114,6 +114,7 @@ configuration is imported once from its legacy location and is never modified.
 - **Ctrl+F**: search responses.
 - **Ctrl+R**: jump to the latest response.
 - **Ctrl+/**: open provider-aware slash commands.
+- **Ctrl+.**: stop the task running in this session.
 - **Ctrl+Shift+A**: attach files.
 - **Ctrl+Shift+M**: cycle common permission modes.
 - **Ctrl+Shift+[ / ]**: previous or next session.

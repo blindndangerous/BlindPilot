@@ -60,6 +60,7 @@ from agent_backends import (
     FREEBUFF_PREFERRED_MODEL,
     backend_auth_ok,
     backend_label,
+    blindpilot_config_dir,
     codex_model_options,
     find_backend_cli,
     freebuff_model_options,
@@ -148,7 +149,7 @@ def announce(text: str) -> None:
 
 
 APP_NAME = "BlindPilot"
-APP_VERSION = "0.3.3"
+APP_VERSION = "0.3.4"
 ORIGINAL_APP_CREDIT = (
     "Based on the original Claude Code Reader application by doubletaponair.\n"
     "https://github.com/doubletaponair/claude-code-reader"
@@ -880,6 +881,7 @@ def _check_auth_quick(binary: str) -> bool:
             text=True,
             timeout=12,
             stdin=subprocess.DEVNULL,
+            **_no_window_kwargs(),
         )
         combined = (result.stdout + result.stderr).lower()
         return not any(m in combined for m in AUTH_ERROR_MARKERS)
@@ -982,6 +984,7 @@ def _run_claude(binary: str, args: List[str], cwd: Optional[str], timeout: int) 
             stdin=subprocess.DEVNULL,
             encoding="utf-8",
             errors="replace",
+            **_no_window_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return ""
@@ -1367,6 +1370,15 @@ def _tool_result_text(content: object) -> str:
     return ""
 
 
+def _flatten(text: str) -> str:
+    """Drop all whitespace, for comparing two copies of the same answer.
+
+    Backends assemble their final text from the same pieces they streamed, but
+    not always with the same joins, so only the characters can be compared.
+    """
+    return "".join(text.split())
+
+
 def _result_label(text: str) -> str:
     """Short, screen-reader-friendly preview line for a result row."""
     first = next((ln for ln in text.splitlines() if ln.strip()), "")
@@ -1377,10 +1389,7 @@ def _result_label(text: str) -> str:
 
 
 def _config_dir() -> Path:
-    if platform.system() == "Windows":
-        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
-        return Path(base) / "BlindPilot"
-    return Path.home() / ".config" / "blindpilot"
+    return blindpilot_config_dir()
 
 
 def _legacy_config_path() -> Path:
@@ -1740,6 +1749,7 @@ class ClaudeWorker(threading.Thread):
                 bufsize=1,
                 encoding="utf-8",
                 env=env,
+                **_no_window_kwargs(),
             )
         except OSError as exc:
             self._on_failed(f"Failed to launch Claude Code: {exc}")
@@ -2126,6 +2136,12 @@ class SessionPanel(wx.Panel):
         # Response number of the turn currently streaming in (None between turns).
         self._stream_response: Optional[int] = None
         self._assistant_narrated_this_turn = False
+        # Answer text already put into the list for the turn in flight, so the
+        # finished answer can be checked against it rather than assumed shown.
+        self._streamed_assistant = ""
+        # Set while the user's Stop is being carried out, so the backend's own
+        # "cancelled" report is not announced to them as an error.
+        self._stopping = False
         self._session_id: Optional[str] = None
         self._session_backend = normalize_backend(self._get_backend())
         self._worker: Optional[threading.Thread] = None
@@ -2196,6 +2212,14 @@ class SessionPanel(wx.Panel):
         self.steer_btn.Bind(wx.EVT_BUTTON, lambda _e: self._on_steer())
         self.steer_btn.Disable()
 
+        # Stop follows Steer: the two things you can do to a run in progress sit
+        # together, one Tab apart from the prompt. Enabled only while one is.
+        self.stop_btn = wx.Button(self, label="Stop")
+        self.stop_btn.SetName("Stop the running task")
+        self.stop_btn.SetToolTip("Stop the task that is running now")
+        self.stop_btn.Bind(wx.EVT_BUTTON, lambda _e: self._on_stop())
+        self.stop_btn.Disable()
+
         self.attach_btn = wx.Button(self, label="Attach")
         self.attach_btn.SetName("Attach files")
         self.attach_btn.Bind(wx.EVT_BUTTON, lambda _e: self.attach_files())
@@ -2213,7 +2237,8 @@ class SessionPanel(wx.Panel):
 
         bottom_row = wx.BoxSizer(wx.HORIZONTAL)
         bottom_row.Add(self.send_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
-        bottom_row.Add(self.steer_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 12)
+        bottom_row.Add(self.steer_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+        bottom_row.Add(self.stop_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 12)
         bottom_row.Add(self.attach_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
         bottom_row.Add(self.slash_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 16)
         bottom_row.Add(mode_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
@@ -2663,6 +2688,8 @@ class SessionPanel(wx.Panel):
         send_text = self._build_send_text(prompt)
         self._turns.append(Turn(prompt=prompt))
         self._assistant_narrated_this_turn = False
+        self._streamed_assistant = ""
+        self._stopping = False
         self._add_your_message(send_text)
         self.prompt.SetValue("")
         self._attachments = []
@@ -2691,6 +2718,7 @@ class SessionPanel(wx.Panel):
         )
         self._worker.start()
         self.steer_btn.Enable()
+        self.stop_btn.Enable()
 
     def _add_your_message(self, text: str, steering: bool = False) -> None:
         """Put the user's own message in the list, ahead of the answer to it.
@@ -2732,6 +2760,40 @@ class SessionPanel(wx.Panel):
         self._earcons.play_send()
         self._add_your_message(text, steering=True)
         self._announce(f"Steered: {text}")
+
+    def _on_stop(self) -> None:
+        """Stop the run in progress, keeping whatever it produced first.
+
+        Cancelling kills the backend process, so the rows and text already
+        streamed are all there will be — they stay in the list, and the turn
+        keeps them as its response so the transcript is not left with a
+        question and no answer.
+        """
+        worker = self._worker
+        if worker is None or not worker.is_alive():
+            self._set_status("Error: Nothing is running to stop")
+            return
+        self.stop_btn.Disable()
+        self.steer_btn.Disable()
+        self._stopping = True
+        self._announce("Stopping")
+        # cancel() waits on the process, so it must not run on the UI thread.
+        threading.Thread(target=worker.cancel, daemon=True).start()
+
+    def _finish_stopped_turn(self) -> None:
+        """Close out a turn the user stopped, without reporting it as failed."""
+        self._earcons.stop_progress()
+        partial = self._streamed_assistant.strip()
+        if self._turns and not self._turns[-1].response:
+            self._turns[-1].response = partial
+        if self._stream_response is not None:
+            for row in self._rows:
+                if row.response_number == self._stream_response and row.kind == "header":
+                    row.payload = _strip_noise(partial)
+                    break
+        self._stream_response = None
+        self._refresh_list()
+        self._announce("Stopped")
 
     def _build_send_text(self, prompt: str) -> str:
         """Combine the prompt with file paths for the selected coding agent."""
@@ -2818,6 +2880,7 @@ class SessionPanel(wx.Panel):
                 if i == 0 and row.kind != "code":
                     row.label = f"{speaker}: {row.label}"
                 self._rows.append(row)
+            self._streamed_assistant += ("\n\n" if self._streamed_assistant else "") + text
             if self._say(f"{speaker}. {' '.join(text.split())}"):
                 self._assistant_narrated_this_turn = True
         self._refresh_list()
@@ -2846,6 +2909,8 @@ class SessionPanel(wx.Panel):
             self._assistant_narrated_this_turn = True
 
     def _on_response_complete(self, text: str) -> None:
+        # The turn beat the cancellation, so it is a normal response.
+        self._stopping = False
         # Stop the in-progress loop and play the "received" cue.
         self._earcons.play_received()
         self._narrate_completed_response(text)
@@ -2870,12 +2935,27 @@ class SessionPanel(wx.Panel):
                 if row.response_number == self._stream_response and row.kind == "header":
                     row.payload = _strip_noise(text)
                     break
+            # Streaming is best-effort: a backend can finish with text that
+            # never arrived as activity. Without this the answer would exist
+            # only in the header payload, and the list would end on whatever
+            # the last streamed row happened to be.
+            if text.strip() and _flatten(text) not in _flatten(self._streamed_assistant):
+                speaker = backend_label(self._session_backend)
+                segments = parse_response(text, self._stream_response)[1:]
+                for i, row in enumerate(segments):
+                    if i == 0 and row.kind != "code":
+                        row.label = f"{speaker}: {row.label}"
+                    self._rows.append(row)
         n = self._response_count
         self._stream_response = None
         self._refresh_list()
         self._set_status(f"Response {n} received")
 
     def _on_failed(self, message: str) -> None:
+        if self._stopping:
+            # A cancelled backend reports its own interruption. The user asked
+            # for it, so it is not news, and it is not an error.
+            return
         self._earcons.stop_progress()
         if self._turns and not self._turns[-1].response:
             self._turns.pop()
@@ -2885,10 +2965,15 @@ class SessionPanel(wx.Panel):
     def _on_worker_finished(self) -> None:
         # Safety net: make sure the loop is never left running.
         self._earcons.stop_progress()
+        if self._stopping:
+            self._stopping = False
+            self._finish_stopped_turn()
         if self.send_btn:
             self.send_btn.Enable()
         if self.steer_btn:
             self.steer_btn.Disable()
+        if self.stop_btn:
+            self.stop_btn.Disable()
         self._worker = None
 
     # ----- List + find -----
@@ -3391,6 +3476,7 @@ class SetupWizard(wx.Dialog):
             "Type in the Prompt field and press Enter to send.\n"
             "Press Ctrl+R to jump to the latest response.\n"
             "Press Ctrl+/ to pick a slash command.\n"
+            "Press Ctrl+period to stop a task that is running.\n"
             "Press Ctrl+Shift+M to cycle permission modes when supported.\n"
             "Type /model to choose the model and effort level when supported."
             f"{limitations}\n\nChoose Finish to open the app."
@@ -3863,6 +3949,12 @@ class MainFrame(wx.Frame):
             "Choose the folder that contains your projects",
         )
         file_menu.AppendSeparator()
+        stop_item = file_menu.Append(
+            wx.ID_STOP,
+            "S&top Task\tCtrl+.",
+            "Stop the task running in this session",
+        )
+        file_menu.AppendSeparator()
         find_item = file_menu.Append(
             wx.ID_FIND,
             "&Find in Responses…\tCtrl+F",
@@ -3932,6 +4024,7 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, lambda _e: self._new_session(), new_item)
         self.Bind(wx.EVT_MENU, lambda _e: self._manage_backends(), manage_backends_item)
         self.Bind(wx.EVT_MENU, lambda _e: self._set_projects_folder(), set_pf_item)
+        self.Bind(wx.EVT_MENU, lambda _e: self._stop_active(), stop_item)
         self.Bind(wx.EVT_MENU, lambda _e: self._find_active(), find_item)
         self.Bind(wx.EVT_MENU, lambda _e: self._close_current_session(), close_item)
         self.Bind(wx.EVT_MENU, lambda _e: self.Close(), quit_item)
@@ -4355,6 +4448,11 @@ class MainFrame(wx.Frame):
         page = self.notebook.GetCurrentPage()
         if isinstance(page, SessionPanel):
             page.open_find()
+
+    def _stop_active(self) -> None:
+        page = self.notebook.GetCurrentPage()
+        if isinstance(page, SessionPanel):
+            page._on_stop()
 
     def _attach_active(self) -> None:
         page = self.notebook.GetCurrentPage()

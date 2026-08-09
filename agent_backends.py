@@ -26,6 +26,18 @@ from pathlib import Path
 from typing import Callable, Optional
 
 
+# A windowed app owns no console, so every child process Windows considers a
+# console program is given a brand new one - a terminal that pops up on screen,
+# takes focus away from the screen reader, and in the case of a long-running
+# agent CLI stays there for the whole turn. CREATE_NO_WINDOW suppresses it.
+CREATE_NO_WINDOW = 0x08000000 if platform.system() == "Windows" else 0
+
+
+def no_window_kwargs() -> dict:
+    """``subprocess`` keyword arguments that keep children off the screen."""
+    return {"creationflags": CREATE_NO_WINDOW} if CREATE_NO_WINDOW else {}
+
+
 BACKEND_CLAUDE = "claude"
 BACKEND_CODEX = "codex"
 BACKEND_FREEBUFF = "freebuff"
@@ -181,6 +193,7 @@ def backend_auth_ok(backend: str, timeout: int = 12) -> bool:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=timeout,
+                **no_window_kwargs(),
             )
             return proc.returncode == 0
         if backend == BACKEND_CODEX:
@@ -190,6 +203,7 @@ def backend_auth_ok(backend: str, timeout: int = 12) -> bool:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=timeout,
+                **no_window_kwargs(),
             )
             return proc.returncode == 0
         if backend == BACKEND_FREEBUFF:
@@ -246,6 +260,7 @@ def codex_model_options(
             errors="replace",
             timeout=30,
             env=_subprocess_env(binary),
+            **no_window_kwargs(),
         )
         payload = json.loads(result.stdout)
     except (OSError, subprocess.TimeoutExpired, ValueError):
@@ -286,6 +301,43 @@ def codex_model_options(
         pass
     error = "" if models else "Codex returned an empty model catalog."
     return models, efforts, current_model, current_effort, error
+
+
+def blindpilot_config_dir() -> Path:
+    """Where BlindPilot keeps its own settings, separate from any backend's."""
+    if platform.system() == "Windows":
+        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+        return Path(base) / "BlindPilot"
+    return Path.home() / ".config" / "blindpilot"
+
+
+def _freebuff_choice_path() -> Path:
+    return blindpilot_config_dir() / "freebuff-model.json"
+
+
+def _read_freebuff_choice() -> str:
+    """Return the FreeBuff model BlindPilot last selected, if any."""
+    try:
+        payload = json.loads(_freebuff_choice_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    model = payload.get("model") if isinstance(payload, dict) else None
+    return model.strip() if isinstance(model, str) else ""
+
+
+def _write_freebuff_choice(model: str) -> None:
+    """Record the selection somewhere only BlindPilot writes.
+
+    FreeBuff resets ``freebuffModel`` in its own settings to whichever model it
+    recommends once a turn has run, so that file cannot be read back as the
+    user's choice.  This record is what survives.
+    """
+    path = _freebuff_choice_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"model": model}, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        pass
 
 
 def _freebuff_package_readme(binary: Optional[str]) -> Optional[Path]:
@@ -398,29 +450,34 @@ def freebuff_model_options() -> tuple[list[str], list[str], str, str, str]:
     """Return the model choices exposed by the installed FreeBuff release."""
     binary = find_backend_cli(BACKEND_FREEBUFF)
     models = _freebuff_models_from_install(binary)
-    settings = Path.home() / ".config" / "manicode" / "settings.json"
+    chosen = _read_freebuff_choice()
     saved = ""
     try:
+        settings = Path.home() / ".config" / "manicode" / "settings.json"
         payload = json.loads(settings.read_text(encoding="utf-8"))
         selected = payload.get("freebuffModel") if isinstance(payload, dict) else None
         if isinstance(selected, str) and selected.strip():
             saved = selected.strip()
-            if saved not in models:
-                models.append(saved)
     except (OSError, ValueError):
         pass
     if not models:
         models = [FREEBUFF_PREFERRED_MODEL]
-        if saved and saved not in models:
-            models.append(saved)
         error = "Could not refresh FreeBuff's model catalog; showing the preferred default."
     else:
         error = ""
+    for candidate in (chosen, saved):
+        if candidate and candidate not in models:
+            models.append(candidate)
+    # BlindPilot's own record wins over FreeBuff's settings file. FreeBuff
+    # rewrites that file to its recommended model after a turn, so honouring it
+    # would quietly downgrade every following turn to the recommendation.
     current = (
-        saved
-        if saved in models
+        chosen
+        if chosen in models
         else FREEBUFF_PREFERRED_MODEL
         if FREEBUFF_PREFERRED_MODEL in models
+        else saved
+        if saved in models
         else models[0]
     )
     return models, [], current, "", error
@@ -457,13 +514,14 @@ def invalidate_backend_cache(backend: str | None = None) -> None:
 
 
 def set_freebuff_model(model: str) -> None:
-    """Persist the model using FreeBuff's own settings format."""
+    """Select the model in FreeBuff, and record the choice as BlindPilot's own."""
     selected = model.strip()
     if not selected:
         models, _efforts, current, _effort, _error = freebuff_model_options()
         selected = current or (models[0] if models else FREEBUFF_PREFERRED_MODEL)
     settings = Path.home() / ".config" / "manicode" / "settings.json"
     with _FREEBUFF_SETTINGS_LOCK:
+        _write_freebuff_choice(selected)
         try:
             payload = json.loads(settings.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -626,6 +684,7 @@ class CodexWorker(threading.Thread):
                 encoding="utf-8",
                 errors="replace",
                 env=_subprocess_env(server_binary),
+                **no_window_kwargs(),
             )
         except OSError as exc:
             self._on_failed(f"Failed to launch Codex: {exc}")
@@ -924,26 +983,60 @@ def _freebuff_chat_path(cwd: str, session_id: str) -> Optional[Path]:
     return None
 
 
-def _freebuff_chat_snapshot(chat: Optional[Path]) -> tuple[str, str, list[tuple[str, str, str]]]:
-    """Read reasoning, answer text, and agent states from FreeBuff's live chat file."""
+_FREEBUFF_INTERRUPTED = "[response interrupted]"
+
+
+def _freebuff_answer_message(payload: object) -> Optional[dict]:
+    """Return the newest AI message that actually carries a reply.
+
+    FreeBuff writes a ``mode-divider`` message ahead of every turn, and it also
+    has ``variant: "ai"``.  Skipping messages with no reply blocks keeps the
+    identity of the turn's real answer stable from the moment it appears.
+    """
+    if not isinstance(payload, list):
+        return None
+    for item in reversed(payload):
+        if not isinstance(item, dict) or item.get("variant") != "ai":
+            continue
+        blocks = item.get("blocks")
+        if isinstance(blocks, list) and any(
+            isinstance(block, dict) and block.get("type") in ("text", "agent") for block in blocks
+        ):
+            return item
+    return None
+
+
+def _freebuff_answer_id(chat: Optional[Path]) -> str:
+    """Identify the newest answer already in a chat, before a new turn starts."""
     if chat is None:
-        return "", "", []
+        return ""
     try:
         payload = json.loads((chat / "chat-messages.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return "", "", []
-    if not isinstance(payload, list):
-        return "", "", []
-    message = next(
-        (
-            item
-            for item in reversed(payload)
-            if isinstance(item, dict) and item.get("variant") == "ai"
-        ),
-        None,
-    )
-    if not isinstance(message, dict):
-        return "", "", []
+        return ""
+    message = _freebuff_answer_message(payload)
+    return str(message.get("id") or "") if message else ""
+
+
+def _freebuff_chat_snapshot(
+    chat: Optional[Path],
+) -> tuple[str, str, str, list[tuple[str, str, str]]]:
+    """Read the newest answer's id, reasoning, text, and agent states.
+
+    The id is what tells one turn's answer from the one before it: FreeBuff
+    rewrites the whole file on every save, so text alone cannot distinguish new
+    output from a resumed conversation's history.
+    """
+    if chat is None:
+        return "", "", "", []
+    try:
+        payload = json.loads((chat / "chat-messages.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "", "", "", []
+    message = _freebuff_answer_message(payload)
+    if message is None:
+        return "", "", "", []
+    message_id = str(message.get("id") or "")
 
     thinking: list[str] = []
     answer: list[str] = []
@@ -957,7 +1050,12 @@ def _freebuff_chat_snapshot(chat: Optional[Path]) -> tuple[str, str, list[tuple[
         kind = block.get("type")
         if kind == "text":
             content = str(block.get("content") or "").strip()
-            if not content or content == "[response interrupted]":
+            # Closing the hidden terminal stamps this marker onto whatever the
+            # turn had produced, so it has to come off the end as well as being
+            # rejected on its own.
+            if content.endswith(_FREEBUFF_INTERRUPTED):
+                content = content[: -len(_FREEBUFF_INTERRUPTED)].strip()
+            if not content:
                 continue
             if block.get("textType") == "reasoning":
                 thinking.append(content)
@@ -968,7 +1066,7 @@ def _freebuff_chat_snapshot(chat: Optional[Path]) -> tuple[str, str, list[tuple[
             status = str(block.get("status") or "running").strip().casefold()
             agent_id = str(block.get("agentId") or f"{index}:{name}")
             agents.append((agent_id, name, status))
-    return "\n\n".join(thinking), "\n\n".join(answer), agents
+    return message_id, "\n\n".join(thinking), "\n\n".join(answer), agents
 
 
 def _freebuff_run_status(chat: Optional[Path], offset: int = 0) -> str:
@@ -1131,6 +1229,11 @@ class FreebuffWorker(threading.Thread):
         last_answer = ""
         structured_thinking = ""
         structured_answer = ""
+        # A resumed chat already holds the previous turn's answer. Remember its
+        # id so it is never mistaken for this turn's, and so the real answer is
+        # recognised as new the moment FreeBuff writes it.
+        baseline_answer_id = _freebuff_answer_id(chat_path)
+        structured_answer_id = ""
         agent_states: dict[str, str] = {}
         pending_sections: Optional[tuple[str, str]] = None
         screen_changed_at = time.monotonic()
@@ -1227,15 +1330,32 @@ class FreebuffWorker(threading.Thread):
                         # The terminal fallback may have emitted the first
                         # settled frame just before the chat directory became
                         # visible. Seed the structured trackers from that
-                        # frame so switching sources does not narrate it twice.
+                        # frame so switching sources does not narrate it twice,
+                        # and claim the message it belongs to so the switch is
+                        # not treated as a brand new answer either.
                         structured_thinking = last_thinking
                         structured_answer = last_answer
+                        if last_thinking or last_answer:
+                            structured_answer_id = _freebuff_answer_id(chat_path)
                 if self._session_id and not session_reported:
                     self._on_session(self._session_id)
                     session_reported = True
 
             if sent and chat_path is not None:
-                thinking, answer, agents = _freebuff_chat_snapshot(chat_path)
+                answer_id, thinking, answer, agents = _freebuff_chat_snapshot(chat_path)
+                if answer_id and answer_id == baseline_answer_id:
+                    # Still the answer this turn was resumed from; nothing of
+                    # this turn has been written yet.
+                    answer_id, thinking, answer, agents = "", "", "", []
+                elif answer_id and answer_id != structured_answer_id:
+                    # FreeBuff opened this turn's answer. Everything tracked so
+                    # far belonged to an earlier message, so start from nothing
+                    # and let the whole new answer be narrated.
+                    structured_answer_id = answer_id
+                    baseline_answer_id = ""
+                    structured_thinking = ""
+                    structured_answer = ""
+                    agent_states.clear()
                 if thinking:
                     structured_thinking = self._emit_stable_delta(
                         "thinking", structured_thinking, thinking
@@ -1265,19 +1385,20 @@ class FreebuffWorker(threading.Thread):
                 elapsed = max(1, int(now - (turn_started_at or now)))
                 self._on_activity("tool", f"FreeBuff is still working; {elapsed} seconds elapsed")
                 next_heartbeat = now + 30
+            # Reading the screen is the fallback for the window before the chat
+            # file exists. Once it does, that file is the only source: narrating
+            # from both makes every line arrive twice, because the redrawn
+            # screen and the saved message are the same text.
             if (
                 started
                 and saw_busy
+                and chat_path is None
                 and pending_sections is not None
-                and not (structured_thinking or structured_answer)
                 and time.monotonic() - screen_changed_at >= 0.35
             ):
                 thinking, answer = pending_sections
                 last_thinking = self._emit_stable_delta("thinking", last_thinking, thinking)
                 last_answer = self._emit_stable_delta("assistant", last_answer, answer)
-                if chat_path is not None:
-                    structured_thinking = last_thinking
-                    structured_answer = last_answer
                 pending_sections = None
             if sent and saw_busy and at_prompt and not busy and chat_path is None:
                 if ready_since is None:

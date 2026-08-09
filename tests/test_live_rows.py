@@ -410,3 +410,129 @@ if __name__ == "__main__":
             traceback.print_exc()
     print(f"\n{passed} passed, {failed} failed")
     sys.exit(1 if failed else 0)
+
+
+# ----- Stopping a run -----
+class _Button:
+    """Minimal stand-in for the wx buttons the lifecycle handlers touch."""
+
+    def __init__(self) -> None:
+        self.enabled = True
+
+    def Enable(self) -> None:
+        self.enabled = True
+
+    def Disable(self) -> None:
+        self.enabled = False
+
+
+class _Earcons:
+    def __init__(self) -> None:
+        self.stopped = 0
+
+    def stop_progress(self) -> None:
+        self.stopped += 1
+
+    def play_received(self) -> None:
+        pass
+
+
+def _stub_panel(app, **overrides):
+    """A SessionPanel stand-in carrying only the state these handlers use."""
+    panel = type("PanelStub", (), {})()
+    panel._earcons = _Earcons()
+    panel._turns = []
+    panel._rows = []
+    panel._response_count = 0
+    panel._stream_response = None
+    panel._streamed_assistant = ""
+    panel._stopping = False
+    panel._assistant_narrated_this_turn = True
+    panel._session_backend = app.BACKEND_FREEBUFF
+    panel.announced = []
+    panel.status = []
+    panel._announce = lambda text: panel.announced.append(text)
+    panel._set_status = lambda text: panel.status.append(text)
+    panel._refresh_list = lambda: None
+    panel._say = lambda _text: False
+    panel.send_btn = _Button()
+    panel.steer_btn = _Button()
+    panel.stop_btn = _Button()
+    panel._finish_stopped_turn = lambda: app.SessionPanel._finish_stopped_turn(panel)
+    for name, value in overrides.items():
+        setattr(panel, name, value)
+    return panel
+
+
+def test_stopping_keeps_the_partial_answer_and_is_not_reported_as_an_error():
+    import blindpilot_app as app
+
+    panel = _stub_panel(app)
+    panel._stopping = True
+    panel._turns = [app.Turn(prompt="Do the work")]
+    panel._streamed_assistant = "Got partway."
+    panel._stream_response = 1
+    panel._rows = [app.Row(kind="header", label="Response 1", payload="", response_number=1)]
+
+    # The cancelled backend reports its own interruption; the user asked for it.
+    app.SessionPanel._on_failed(panel, "FreeBuff reported that the response was interrupted")
+    assert panel.announced == []
+    assert panel._turns == [app.Turn(prompt="Do the work")]
+
+    app.SessionPanel._on_worker_finished(panel)
+
+    assert panel.announced == ["Stopped"]
+    assert panel._turns[0].response == "Got partway."
+    assert panel._rows[0].payload == "Got partway."
+    assert panel._stream_response is None
+    assert panel._stopping is False
+    assert panel.send_btn.enabled is True
+    assert panel.steer_btn.enabled is False
+    assert panel.stop_btn.enabled is False
+
+
+def test_stop_without_a_running_task_says_so_and_does_nothing():
+    import blindpilot_app as app
+
+    panel = _stub_panel(app, _worker=None)
+
+    app.SessionPanel._on_stop(panel)
+
+    assert panel.status == ["Error: Nothing is running to stop"]
+    assert panel._stopping is False
+
+
+def test_finished_answer_that_never_streamed_is_still_added_to_the_list():
+    """Streaming is best effort, so the final text is what the list must show."""
+    import blindpilot_app as app
+
+    panel = _stub_panel(app)
+    panel._turns = [app.Turn(prompt="Say banana")]
+    panel._stream_response = 1
+    panel._response_count = 1
+    panel._streamed_assistant = ""
+    panel._rows = [app.Row(kind="header", label="Response 1", payload="", response_number=1)]
+    panel._narrate_completed_response = lambda _text: None
+
+    app.SessionPanel._on_response_complete(panel, "banana")
+
+    assert [row.label for row in panel._rows[1:]] == ["FreeBuff: banana"]
+    assert panel._rows[0].payload == "banana"
+
+
+def test_answer_already_streamed_is_not_added_to_the_list_twice():
+    import blindpilot_app as app
+
+    panel = _stub_panel(app)
+    panel._turns = [app.Turn(prompt="Say banana")]
+    panel._stream_response = 1
+    panel._response_count = 1
+    # Codex joins its final text differently from the pieces it streamed, so
+    # only the characters can decide whether it is the same answer.
+    panel._streamed_assistant = "One.\n\nTwo."
+    panel._rows = [app.Row(kind="header", label="Response 1", payload="", response_number=1)]
+    panel._narrate_completed_response = lambda _text: None
+
+    app.SessionPanel._on_response_complete(panel, "One.Two.")
+
+    assert len(panel._rows) == 1

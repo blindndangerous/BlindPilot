@@ -228,6 +228,7 @@ def test_windows_helper_script_has_valid_powershell_syntax(tmp_path):
         capture_output=True,
         text=True,
         timeout=15,
+        creationflags=subprocess.CREATE_NO_WINDOW,
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
@@ -243,14 +244,18 @@ def test_windows_helper_waits_for_old_process_then_replaces_and_launches(tmp_pat
     running_marker = install_dir / "new-running.txt"
     install_dir.mkdir()
     payload.mkdir(parents=True)
-    (install_dir / "BlindPilot.cmd").write_text("@echo off\r\n", encoding="ascii")
+    # The stand-in for the app is a script host rather than a batch file: it
+    # keeps running long enough for the helper's launch check, and it does it
+    # without putting a console window on screen during the test run.
+    (install_dir / "BlindPilot.vbs").write_text("WScript.Quit 0\r\n", encoding="ascii")
     (install_dir / "obsolete.txt").write_text("old", encoding="ascii")
-    (payload / "BlindPilot.cmd").write_text(
-        '@echo off\r\n> "%~dp0new-launched.txt" echo launched\r\n'
-        '> "%~dp0new-running.txt" echo running\r\n'
-        "ping 127.0.0.1 -n 6 >nul\r\n"
-        'cd /d "%TEMP%"\r\n'
-        'del /q "%~dp0new-running.txt"\r\n',
+    (payload / "BlindPilot.vbs").write_text(
+        'Set fso = CreateObject("Scripting.FileSystemObject")\r\n'
+        "home = fso.GetParentFolderName(WScript.ScriptFullName)\r\n"
+        'fso.CreateTextFile(fso.BuildPath(home, "new-launched.txt"), True).WriteLine "launched"\r\n'
+        'fso.CreateTextFile(fso.BuildPath(home, "new-running.txt"), True).WriteLine "running"\r\n'
+        "WScript.Sleep 5000\r\n"
+        'fso.DeleteFile fso.BuildPath(home, "new-running.txt")\r\n',
         encoding="ascii",
     )
     (payload / "current.txt").write_text("new", encoding="ascii")
@@ -269,6 +274,7 @@ def test_windows_helper_waits_for_old_process_then_replaces_and_launches(tmp_pat
     blocker = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(30)"],
         cwd=install_dir,
+        creationflags=subprocess.CREATE_NO_WINDOW,
     )
     updater = None
     try:
@@ -288,12 +294,13 @@ def test_windows_helper_waits_for_old_process_then_replaces_and_launches(tmp_pat
                 "-InstallDir",
                 str(install_dir),
                 "-Executable",
-                "BlindPilot.cmd",
+                "BlindPilot.vbs",
             ],
             cwd=tempfile.gettempdir(),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:

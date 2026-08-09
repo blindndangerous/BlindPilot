@@ -1,8 +1,43 @@
-# BlindPilot 0.3.3
+# BlindPilot 0.3.4
 
 BlindPilot is an accessible desktop reader for Claude Code, Codex, and FreeBuff. It is
 based on Claude Code Reader and remains available under the MIT License, with credit to
 the original project throughout the application and documentation.
+
+## No console windows
+
+- Claude Code now runs without a terminal window. It was appearing on screen for the
+  whole turn and taking focus away from the screen reader.
+- The same applies to every backend helper process: sign-in checks, model and version
+  queries, and the Codex app server.
+
+## Stopping a task
+
+- A Stop button sits next to Steer, enabled only while a task is running, and File, Stop
+  Task (Ctrl+period) does the same from anywhere in the session.
+- Stopping keeps whatever the task already produced, records it as that turn's response,
+  and reports "Stopped" rather than an error.
+
+## FreeBuff responses
+
+- A second and later message in a FreeBuff session now shows its own answer. The previous
+  turn's answer was being narrated again in its place, and the new one never reached the
+  list or the read-only text field.
+- FreeBuff answers are narrated once, from its saved chat file, instead of from the file
+  and the hidden terminal at the same time.
+- The interruption marker FreeBuff leaves behind when a session closes is no longer read
+  out as part of the answer.
+- A finished answer that never arrived as live activity is added to the list on
+  completion, for every backend.
+
+## FreeBuff stays on DeepSeek 4 Pro
+
+- FreeBuff rewrites its own settings to its recommended Flash model once a turn has run,
+  which silently downgraded every following turn. BlindPilot now keeps its own record of
+  the selected model and uses that, so Pro remains the default.
+- A model chosen with /model still overrides it and now survives the same reset.
+
+## Included from 0.3.3
 
 ## Updater reliability
 
