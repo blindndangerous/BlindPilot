@@ -38,6 +38,124 @@ def no_window_kwargs() -> dict:
     return {"creationflags": CREATE_NO_WINDOW} if CREATE_NO_WINDOW else {}
 
 
+# A pseudo-terminal is the one child that cannot be given CREATE_NO_WINDOW: the
+# flag belongs to its host, which pywinpty starts itself. Launched from a
+# windowed application, which owns no console to lend it, that host puts a real
+# console on screen. It can still be hidden the moment it appears.
+_CONSOLE_WINDOW_CLASSES = ("ConsoleWindowClass", "PseudoConsoleWindow")
+
+
+def _descendant_pids(roots: set[int]) -> set[int]:
+    """Every process descended from ``roots``, so only our own are touched."""
+    import ctypes
+    import ctypes.wintypes as wintypes
+
+    class ProcessEntry(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", ctypes.c_char * 260),
+        ]
+
+    kernel32 = ctypes.windll.kernel32
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+    if snapshot == -1:
+        return set(roots)
+    parents: dict[int, int] = {}
+    try:
+        entry = ProcessEntry()
+        entry.dwSize = ctypes.sizeof(ProcessEntry)
+        ok = kernel32.Process32First(snapshot, ctypes.byref(entry))
+        while ok:
+            parents[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
+            ok = kernel32.Process32Next(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
+
+    family = set(roots)
+    for pid in parents:
+        seen: set[int] = set()
+        walker = pid
+        while walker and walker not in seen:
+            seen.add(walker)
+            if walker in family:
+                family.update(seen)
+                break
+            walker = parents.get(walker, 0)
+    return family
+
+
+def hide_console_windows(roots: Optional[set[int]] = None) -> int:
+    """Hide the console this process was given, and any its children raise.
+
+    Creating the pseudo-terminal attaches a console to BlindPilot itself, which
+    is why the window belongs to us rather than to the program being run. That
+    one is found directly; the enumeration is the safety net for a child that
+    raises its own, and never touches a console outside this process tree.
+    """
+    if platform.system() != "Windows":
+        return 0
+    import ctypes
+    import ctypes.wintypes as wintypes
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    hidden = 0
+    try:
+        own = kernel32.GetConsoleWindow()
+        if own and user32.IsWindowVisible(own):
+            user32.ShowWindow(own, 0)  # SW_HIDE
+            hidden += 1
+    except OSError:
+        pass
+
+    candidates: list[tuple[int, int]] = []
+
+    def visit(handle, _param):
+        try:
+            if not user32.IsWindowVisible(handle):
+                return True
+            name = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(handle, name, 64)
+            if name.value in _CONSOLE_WINDOW_CLASSES:
+                owner = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(handle, ctypes.byref(owner))
+                candidates.append((handle, int(owner.value)))
+        except Exception:
+            pass
+        return True
+
+    try:
+        callback = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)(visit)
+        user32.EnumWindows(callback, 0)
+    except Exception:
+        return hidden
+    # Walking the process table costs milliseconds, and this runs in a tight
+    # loop to catch the window in the frame it appears. Pay for it only when
+    # there is actually a console window on screen to account for.
+    if not candidates:
+        return hidden
+    try:
+        family = _descendant_pids(set(roots or ()) | {os.getpid()})
+    except Exception:
+        family = set(roots or ()) | {os.getpid()}
+    for handle, owner in candidates:
+        if owner in family:
+            try:
+                user32.ShowWindow(handle, 0)  # SW_HIDE
+                hidden += 1
+            except Exception:
+                pass
+    return hidden
+
+
 BACKEND_CLAUDE = "claude"
 BACKEND_CODEX = "codex"
 BACKEND_FREEBUFF = "freebuff"
@@ -1468,8 +1586,41 @@ class FreebuffWorker(threading.Thread):
         if platform.system() == "Windows":
             from winpty import PtyProcess
 
+            # The console appears while the terminal is being created, so the
+            # watcher has to be running before that call, not after it.
+            roots = {os.getpid()}
+
+            def hide_terminal() -> None:
+                # Poll hard while the terminal is starting, then slowly: the
+                # tools FreeBuff itself starts can each raise a console of
+                # their own, and any of them would take the reader's focus.
+                # Tearing the terminal down raises one last console, after the
+                # output has stopped, so this outlives the stream it guards.
+                started = time.monotonic()
+                grace_until: Optional[float] = None
+                while True:
+                    now = time.monotonic()
+                    if self._stream_ended.is_set():
+                        if grace_until is None:
+                            grace_until = now + 5
+                        elif now > grace_until:
+                            return
+                    try:
+                        hide_console_windows(roots)
+                    except Exception:
+                        # Never let this thread die: it is the only thing
+                        # keeping the terminal off the screen for the whole run.
+                        pass
+                    quick = now - started < 8 or grace_until is not None
+                    time.sleep(0.005 if quick else 0.25)
+
+            threading.Thread(target=hide_terminal, daemon=True).start()
+
             # pywinpty accepts an argv list and supplies a real ConPTY console.
             self._pty = PtyProcess.spawn(args, dimensions=(60, 180), cwd=self._cwd)
+            pty_pid = getattr(self._pty, "pid", 0)
+            if pty_pid:
+                roots.add(int(pty_pid))
             chunks: queue.Queue[str] = queue.Queue()
 
             def pump() -> None:

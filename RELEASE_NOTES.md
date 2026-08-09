@@ -1,8 +1,34 @@
-# BlindPilot 0.3.5
+# BlindPilot 0.3.6
 
 BlindPilot is an accessible desktop reader for Claude Code, Codex, and FreeBuff. It is
 based on Claude Code Reader and remains available under the MIT License, with credit to
 the original project throughout the application and documentation.
+
+## The FreeBuff terminal no longer appears
+
+- Creating a pseudo-terminal attaches a console to BlindPilot itself, and a windowed
+  application has no way to ask for that console to be hidden. It is now hidden as it
+  appears, for the whole run and its shutdown, so a FreeBuff turn puts nothing on screen.
+
+## Updating works however BlindPilot was installed
+
+- A copy from the setup program now updates by running the new installer silently. The
+  previous update replaced the program directory outright, which deleted the uninstaller
+  beside it and left Add or Remove Programs pointing at a file that no longer existed.
+- An unpacked copy still updates by replacing its own folder, which is right for it.
+
+## Desktop shortcut
+
+- The installer offers a desktop shortcut, and remembers the choice on later updates.
+- File, Create Desktop Shortcut makes one at any time, which is how an unpacked copy
+  gets one.
+
+## Reasoning lines read as plain text
+
+- Reasoning no longer has "Thinking" in front of it. When it is switched on in Options it
+  reads as ordinary text.
+
+## Included from 0.3.5
 
 ## FreeBuff works in the installed application
 

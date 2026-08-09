@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+import app_updater
 from app_updater import (
     ReleaseInfo,
     UpdateError,
@@ -346,3 +347,60 @@ def test_windows_helper_waits_for_old_process_then_replaces_and_launches(tmp_pat
         if updater is not None and updater.poll() is None:
             updater.kill()
             updater.wait(timeout=10)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="install kinds are a Windows distinction")
+def test_a_setup_installation_updates_through_its_own_installer(tmp_path, monkeypatch):
+    """Swapping the directory would delete the uninstaller beside the app.
+
+    That leaves Add or Remove Programs pointing at a file that no longer
+    exists and the registered version stuck at the old one, so an installed
+    copy has to be updated by the installer instead.
+    """
+    installed = tmp_path / "installed"
+    installed.mkdir()
+    (installed / "BlindPilot.exe").touch()
+    (installed / "unins000.exe").touch()
+    assert app_updater.install_kind(installed / "BlindPilot.exe") == app_updater.INSTALL_SETUP
+    assert (
+        app_updater.asset_name_for_platform("windows", "amd64", app_updater.INSTALL_SETUP)
+        == "BlindPilot-Setup-x64.exe"
+    )
+
+    portable = tmp_path / "portable"
+    portable.mkdir()
+    (portable / "BlindPilot.exe").touch()
+    assert app_updater.install_kind(portable / "BlindPilot.exe") == app_updater.INSTALL_PORTABLE
+    assert (
+        app_updater.asset_name_for_platform("windows", "amd64", app_updater.INSTALL_PORTABLE)
+        == "BlindPilot-Windows-x64.zip"
+    )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires Windows PowerShell")
+def test_setup_helper_script_has_valid_powershell_syntax(tmp_path):
+    helper = tmp_path / "setup-updater.ps1"
+    helper.write_text(app_updater._WINDOWS_SETUP_HELPER, encoding="utf-8-sig")
+    powershell = (
+        Path(os.environ.get("SystemRoot", r"C:\Windows"))
+        / "System32"
+        / "WindowsPowerShell"
+        / "v1.0"
+        / "powershell.exe"
+    )
+    command = (
+        "$errors=$null; "
+        "[System.Management.Automation.Language.Parser]::ParseFile("
+        "'" + str(helper).replace("'", "''") + "', [ref]$null, [ref]$errors) | Out-Null; "
+        "if ($errors.Count) { $errors | ForEach-Object { $_.Message }; exit 1 }"
+    )
+    result = subprocess.run(
+        [str(powershell), "-NoProfile", "-NonInteractive", "-Command", command],
+        check=False,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        timeout=60,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

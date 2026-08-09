@@ -56,11 +56,40 @@ def version_tuple(value: str) -> tuple[int, ...]:
     return tuple(int(part) for part in match.group(0).split(".")) if match else ()
 
 
-def asset_name_for_platform(system: Optional[str] = None, machine: Optional[str] = None) -> str:
+INSTALL_SETUP = "setup"
+INSTALL_PORTABLE = "portable"
+
+
+def install_kind(executable: Optional[Path] = None) -> str:
+    """Say whether this copy was put here by the installer or unpacked by hand.
+
+    The two need different updates. A copy from the setup program is registered
+    in Add or Remove Programs and keeps its uninstaller beside the executable;
+    replacing that directory wholesale deletes the uninstaller and leaves the
+    registered version behind, so the installer has to do the update itself.
+    An unpacked copy owns nothing but its own folder and is simply swapped.
+    """
+    if platform.system() != "Windows":
+        return INSTALL_PORTABLE
+    folder = (executable or Path(sys.executable)).resolve().parent
+    try:
+        uninstallers = any(folder.glob("unins*.exe"))
+    except OSError:
+        uninstallers = False
+    return INSTALL_SETUP if uninstallers else INSTALL_PORTABLE
+
+
+def asset_name_for_platform(
+    system: Optional[str] = None,
+    machine: Optional[str] = None,
+    kind: Optional[str] = None,
+) -> str:
     """Return the release asset expected by this operating system and CPU."""
     system = (system or platform.system()).casefold()
     machine = (machine or platform.machine()).casefold()
     if system == "windows" and machine in ("amd64", "x86_64"):
+        if (kind or install_kind()) == INSTALL_SETUP:
+            return "BlindPilot-Setup-x64.exe"
         return "BlindPilot-Windows-x64.zip"
     if system == "darwin":
         if machine in ("arm64", "aarch64"):
@@ -102,6 +131,7 @@ def fetch_latest_release(
     opener: Callable[..., object] = urlopen,
     system: Optional[str] = None,
     machine: Optional[str] = None,
+    kind: Optional[str] = None,
 ) -> ReleaseInfo:
     """Query GitHub at runtime and select the asset for this computer."""
     try:
@@ -116,7 +146,7 @@ def fetch_latest_release(
     tag = str(payload.get("tag_name") or "").strip()
     if not version_tuple(tag):
         raise UpdateError("The latest GitHub release has no valid version tag.")
-    expected_name = asset_name_for_platform(system, machine)
+    expected_name = asset_name_for_platform(system, machine, kind)
     assets = payload.get("assets")
     if not isinstance(assets, list):
         assets = []
@@ -200,7 +230,9 @@ def download_update(
     if not _allowed_download_url(release.asset_url):
         raise UpdateError("The update download URL is not trusted.")
     expected = release.sha256 or _checksum_from_sidecar(release, current_version, opener)
-    fd, temporary_name = tempfile.mkstemp(prefix="BlindPilot-update-", suffix=".zip")
+    # Keep the published extension: an installer has to stay a .exe to be run.
+    suffix = ".exe" if release.asset_name.casefold().endswith(".exe") else ".zip"
+    fd, temporary_name = tempfile.mkstemp(prefix="BlindPilot-update-", suffix=suffix)
     os.close(fd)
     temporary = Path(temporary_name)
     digest = hashlib.sha256()
@@ -333,6 +365,48 @@ try {
 """
 
 
+_WINDOWS_SETUP_HELPER = r"""param(
+    [Parameter(Mandatory=$true)][int]$ParentPid,
+    [Parameter(Mandatory=$true)][string]$Installer,
+    [Parameter(Mandatory=$true)][string]$Executable
+)
+$ErrorActionPreference = "Stop"
+try {
+    # Give BlindPilot time to close on its own before the installer replaces
+    # its files. Same bounded forced-close fallback as the portable updater.
+    $parent = Get-Process -Id $ParentPid -ErrorAction SilentlyContinue
+    $parentStarted = if ($null -ne $parent) { $parent.StartTime } else { $null }
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    while ($null -ne $parent) {
+        if ($null -ne $parentStarted -and $parent.StartTime -ne $parentStarted) {
+            break
+        }
+        if ([DateTime]::UtcNow -ge $deadline) {
+            Stop-Process -Id $ParentPid -Force -ErrorAction SilentlyContinue
+            Wait-Process -Id $ParentPid -ErrorAction SilentlyContinue
+            break
+        }
+        Start-Sleep -Milliseconds 200
+        $parent = Get-Process -Id $ParentPid -ErrorAction SilentlyContinue
+    }
+
+    # The setup program owns this installation: it keeps the uninstaller and
+    # the Add or Remove Programs entry correct, and it remembers the shortcuts
+    # chosen last time. Silent, because there is no one at the keyboard.
+    $run = Start-Process -FilePath $Installer -ArgumentList @(
+        "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/NOCANCEL"
+    ) -Wait -PassThru
+    if ($run.ExitCode -ne 0) {
+        throw "The BlindPilot installer exited with code $($run.ExitCode)"
+    }
+    Start-Process -FilePath $Executable -WorkingDirectory (Split-Path -Parent $Executable)
+} finally {
+    Remove-Item -LiteralPath $Installer -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+}
+"""
+
+
 _MACOS_HELPER = r"""#!/bin/sh
 set -eu
 parent_pid="$1"
@@ -384,12 +458,26 @@ def schedule_install(archive: Path) -> None:
     executable = Path(sys.executable).resolve()
     if platform.system() == "Windows":
         install_dir = executable.parent
+        setup = install_kind(executable) == INSTALL_SETUP
+        if setup:
+            script = _WINDOWS_SETUP_HELPER
+            arguments = ["-Installer", str(archive), "-Executable", str(executable)]
+        else:
+            script = _WINDOWS_HELPER
+            arguments = [
+                "-Archive",
+                str(archive),
+                "-InstallDir",
+                str(install_dir),
+                "-Executable",
+                executable.name,
+            ]
         helper: Optional[Path] = None
         try:
             fd, helper_name = tempfile.mkstemp(prefix="BlindPilot-update-", suffix=".ps1")
             os.close(fd)
             helper = Path(helper_name)
-            helper.write_text(_WINDOWS_HELPER, encoding="utf-8-sig")
+            helper.write_text(script, encoding="utf-8-sig")
             powershell = os.environ.get("SystemRoot", r"C:\Windows")
             powershell = str(
                 Path(powershell) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
@@ -407,12 +495,7 @@ def schedule_install(archive: Path) -> None:
                     str(helper),
                     "-ParentPid",
                     str(os.getpid()),
-                    "-Archive",
-                    str(archive),
-                    "-InstallDir",
-                    str(install_dir),
-                    "-Executable",
-                    executable.name,
+                    *arguments,
                 ],
                 creationflags=(
                     getattr(subprocess, "CREATE_NO_WINDOW", 0)

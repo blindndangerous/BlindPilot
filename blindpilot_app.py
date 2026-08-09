@@ -149,7 +149,7 @@ def announce(text: str) -> None:
 
 
 APP_NAME = "BlindPilot"
-APP_VERSION = "0.3.5"
+APP_VERSION = "0.3.6"
 ORIGINAL_APP_CREDIT = (
     "Based on the original Claude Code Reader application by doubletaponair.\n"
     "https://github.com/doubletaponair/claude-code-reader"
@@ -1368,6 +1368,48 @@ def _tool_result_text(content: object) -> str:
                 parts.append("[image]")
         return "\n".join(p for p in parts if p).strip()
     return ""
+
+
+def create_desktop_shortcut() -> str:
+    """Put a BlindPilot shortcut on the desktop. Returns where it was written.
+
+    An unpacked copy never went through an installer, so nothing has offered it
+    a shortcut; this is how it gets one. Raises OSError with a readable reason.
+    """
+    if platform.system() != "Windows":
+        raise OSError("Desktop shortcuts are created on Windows only.")
+    target = Path(sys.executable).resolve()
+    if not getattr(sys, "frozen", False):
+        raise OSError("A shortcut can only point at a packaged BlindPilot.")
+    desktop = Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Desktop"
+    if not desktop.is_dir():
+        raise OSError("The desktop folder could not be found.")
+    link = desktop / f"{APP_NAME}.lnk"
+    script = (
+        "$s = (New-Object -ComObject WScript.Shell).CreateShortcut("
+        f"'{str(link).replace(chr(39), chr(39) * 2)}'); "
+        f"$s.TargetPath = '{str(target).replace(chr(39), chr(39) * 2)}'; "
+        f"$s.WorkingDirectory = '{str(target.parent).replace(chr(39), chr(39) * 2)}'; "
+        f"$s.Description = '{APP_NAME}'; $s.Save()"
+    )
+    powershell = (
+        Path(os.environ.get("SystemRoot", r"C:\Windows"))
+        / "System32"
+        / "WindowsPowerShell"
+        / "v1.0"
+        / "powershell.exe"
+    )
+    result = subprocess.run(
+        [str(powershell), "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        stdin=subprocess.DEVNULL,
+        **_no_window_kwargs(),
+    )
+    if result.returncode != 0 or not link.exists():
+        raise OSError((result.stderr or "The shortcut could not be created.").strip())
+    return str(link)
 
 
 def _flatten(text: str) -> str:
@@ -2866,16 +2908,18 @@ class SessionPanel(wx.Panel):
             # answer, and it is not the answer.
             if not SETTINGS.show_thinking:
                 return
+            # Read as plain text: the word "Thinking" in front of every one of
+            # these lines is repeated far more often than it is informative.
             flat = " ".join(text.split())
             self._rows.append(
                 Row(
                     kind="thinking",
-                    label=f"Thinking: {flat}",
+                    label=flat,
                     payload=text,
                     response_number=n,
                 )
             )
-            self._say(f"Thinking. {flat}")
+            self._say(flat)
         else:
             # Reuse the Markdown segmenter; drop its header (index 0) since this
             # turn already has one. The first row of each incoming message is
@@ -3955,6 +3999,11 @@ class MainFrame(wx.Frame):
             "Set &Projects Folder…",
             "Choose the folder that contains your projects",
         )
+        desktop_item = file_menu.Append(
+            wx.ID_ANY,
+            "Create &Desktop Shortcut",
+            "Put a BlindPilot shortcut on the desktop",
+        )
         file_menu.AppendSeparator()
         stop_item = file_menu.Append(
             wx.ID_STOP,
@@ -4039,6 +4088,7 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, lambda _e: self._new_session(), new_item)
         self.Bind(wx.EVT_MENU, lambda _e: self._manage_backends(), manage_backends_item)
         self.Bind(wx.EVT_MENU, lambda _e: self._set_projects_folder(), set_pf_item)
+        self.Bind(wx.EVT_MENU, lambda _e: self._create_desktop_shortcut(), desktop_item)
         self.Bind(wx.EVT_MENU, lambda _e: self._stop_active(), stop_item)
         self.Bind(wx.EVT_MENU, lambda _e: self._find_active(), find_item)
         self.Bind(wx.EVT_MENU, lambda _e: self._close_current_session(), close_item)
@@ -4469,6 +4519,14 @@ class MainFrame(wx.Frame):
         page = self.notebook.GetCurrentPage()
         if isinstance(page, SessionPanel):
             page.open_find()
+
+    def _create_desktop_shortcut(self) -> None:
+        try:
+            link = create_desktop_shortcut()
+        except (OSError, subprocess.SubprocessError) as exc:
+            self._announce_setting(f"The desktop shortcut could not be created: {exc}")
+            return
+        self._announce_setting(f"Desktop shortcut created at {link}")
 
     def _stop_active(self) -> None:
         page = self.notebook.GetCurrentPage()
