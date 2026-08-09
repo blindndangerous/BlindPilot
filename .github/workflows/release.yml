@@ -58,7 +58,11 @@ jobs:
         if: matrix.kind == 'windows'
         shell: pwsh
         run: |
-          python -m PyInstaller --noconfirm --clean --windowed --onedir --name BlindPilot --add-data "EarCons;EarCons" --collect-submodules accessible_output2 --hidden-import winpty blind_pilot.py
+          # --collect-all winpty, not --hidden-import: pywinpty's ConPTY backend
+          # runs the child inside OpenConsole.exe, and a hidden import collects
+          # only the module and its DLLs. Without that executable no process can
+          # start under a pseudo-terminal, so FreeBuff never runs.
+          python -m PyInstaller --noconfirm --clean --windowed --onedir --name BlindPilot --add-data "EarCons;EarCons" --collect-submodules accessible_output2 --collect-all winpty blind_pilot.py
           $startupSmoke = Start-Process -FilePath .\dist\BlindPilot\BlindPilot.exe -ArgumentList "--startup-smoke" -PassThru -Wait
           if ($startupSmoke.ExitCode -ne 0) { throw "Packaged startup smoke test failed: $($startupSmoke.ExitCode)" }
           $guiSmoke = Start-Process -FilePath .\dist\BlindPilot\BlindPilot.exe -ArgumentList "--startup-gui-smoke" -PassThru -Wait

@@ -536,3 +536,25 @@ def test_answer_already_streamed_is_not_added_to_the_list_twice():
     app.SessionPanel._on_response_complete(panel, "One.Two.")
 
     assert len(panel._rows) == 1
+
+
+def test_reasoning_is_left_out_of_the_activity_by_default(monkeypatch):
+    """Reasoning is the backend talking to itself, and it is not the answer."""
+    import blindpilot_app as app
+
+    panel = _stub_panel(app)
+    panel._stream_response = 1
+    panel._response_count = 1
+    panel._begin_stream_response = lambda: 1
+    monkeypatch.setattr(app.SETTINGS, "live_rows", True)
+    monkeypatch.setattr(app.SETTINGS, "show_thinking", False)
+
+    app.SessionPanel._on_activity(panel, "thinking", "Considering the options")
+
+    assert panel._rows == []
+    assert panel.status == []
+
+    monkeypatch.setattr(app.SETTINGS, "show_thinking", True)
+    app.SessionPanel._on_activity(panel, "thinking", "Considering the options")
+
+    assert [row.kind for row in panel._rows] == ["thinking"]

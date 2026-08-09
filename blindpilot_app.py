@@ -149,7 +149,7 @@ def announce(text: str) -> None:
 
 
 APP_NAME = "BlindPilot"
-APP_VERSION = "0.3.4"
+APP_VERSION = "0.3.5"
 ORIGINAL_APP_CREDIT = (
     "Based on the original Claude Code Reader application by doubletaponair.\n"
     "https://github.com/doubletaponair/claude-code-reader"
@@ -1439,12 +1439,14 @@ class _Settings:
         self.live_rows = bool(cfg.get("live_rows", True))
         self.speak_live = bool(cfg.get("speak_live", True))
         self.text_view = bool(cfg.get("text_view", False))
+        self.show_thinking = bool(cfg.get("show_thinking", False))
 
     def save(self) -> None:
         cfg = _load_config()
         cfg["live_rows"] = self.live_rows
         cfg["speak_live"] = self.speak_live
         cfg["text_view"] = self.text_view
+        cfg["show_thinking"] = self.show_thinking
         _save_config(cfg)
 
 
@@ -2859,6 +2861,11 @@ class SessionPanel(wx.Panel):
             self._rows.append(Row(kind="tool", label=text, payload=text, response_number=n))
             self._say(text)
         elif kind == "thinking":
+            # Reasoning is the backend talking to itself. It is off by default:
+            # it roughly doubles what has to be listened through before the
+            # answer, and it is not the answer.
+            if not SETTINGS.show_thinking:
+                return
             flat = " ".join(text.split())
             self._rows.append(
                 Row(
@@ -3980,6 +3987,12 @@ class MainFrame(wx.Frame):
             "&Speak activity aloud",
             "Read each activity row out as it arrives",
         )
+        self._thinking_item = options_menu.AppendCheckItem(
+            wx.ID_ANY,
+            "Include the backend's &reasoning",
+            "Add the backend's own thinking to the activity. Off by default, "
+            "so only its actions and its answer are shown",
+        )
         options_menu.AppendSeparator()
         self._text_view_item = options_menu.AppendCheckItem(
             wx.ID_ANY,
@@ -3995,6 +4008,7 @@ class MainFrame(wx.Frame):
         )
         self._rows_item.Check(SETTINGS.live_rows)
         self._speak_item.Check(SETTINGS.speak_live)
+        self._thinking_item.Check(SETTINGS.show_thinking)
         self._text_view_item.Check(SETTINGS.text_view)
         menubar.Append(options_menu, "&Options")
 
@@ -4015,6 +4029,7 @@ class MainFrame(wx.Frame):
         self.SetMenuBar(menubar)
         self.Bind(wx.EVT_MENU, lambda _e: self._toggle_live_rows(), self._rows_item)
         self.Bind(wx.EVT_MENU, lambda _e: self._toggle_speak_live(), self._speak_item)
+        self.Bind(wx.EVT_MENU, lambda _e: self._toggle_show_thinking(), self._thinking_item)
         self.Bind(wx.EVT_MENU, lambda _e: self._toggle_text_view(), self._text_view_item)
         self.Bind(
             wx.EVT_MENU,
@@ -4325,6 +4340,12 @@ class MainFrame(wx.Frame):
         SETTINGS.save()
         state = "on" if SETTINGS.speak_live else "off"
         self._announce_setting(f"Speaking activity aloud {state}")
+
+    def _toggle_show_thinking(self) -> None:
+        SETTINGS.show_thinking = self._thinking_item.IsChecked()
+        SETTINGS.save()
+        state = "shown" if SETTINGS.show_thinking else "hidden"
+        self._announce_setting(f"The backend's reasoning is {state}")
 
     def _toggle_text_view(self) -> None:
         SETTINGS.text_view = self._text_view_item.IsChecked()

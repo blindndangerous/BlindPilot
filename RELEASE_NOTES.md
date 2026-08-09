@@ -1,8 +1,26 @@
-# BlindPilot 0.3.4
+# BlindPilot 0.3.5
 
 BlindPilot is an accessible desktop reader for Claude Code, Codex, and FreeBuff. It is
 based on Claude Code Reader and remains available under the MIT License, with credit to
 the original project throughout the application and documentation.
+
+## FreeBuff works in the installed application
+
+- FreeBuff never ran in the packaged build. It needs a pseudo-terminal, and the build was
+  missing the console host that runs a process inside one, so nothing started, nothing was
+  reported, and the turn sat silent. That console host is now included.
+- This was also a source of stray command windows: with no console host, Windows fell back
+  to giving the child a real terminal.
+- A terminal that closes before FreeBuff is ready is now reported as an error instead of
+  waiting for output that can never arrive.
+
+## Reasoning is no longer read out
+
+- The backend's own thinking is left out of the activity by default, so a turn reads as
+  what it did and what it answered.
+- Options, "Include the backend's reasoning" turns it back on.
+
+## Included from 0.3.4
 
 ## No console windows
 

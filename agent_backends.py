@@ -1131,6 +1131,8 @@ class FreebuffWorker(threading.Thread):
         self._accepting_input = threading.Event()
         self._write_lock = threading.Lock()
         self._pty = None
+        # Set once the terminal can produce no further output.
+        self._stream_ended = threading.Event()
 
     def accepting_input(self) -> bool:
         return self._accepting_input.is_set() and not self._cancelled
@@ -1250,6 +1252,16 @@ class FreebuffWorker(threading.Thread):
 
         while not self._cancelled and time.monotonic() < deadline:
             chunk = read(0.25)
+            if not chunk and self._stream_ended.is_set():
+                if not sent:
+                    self._on_failed(
+                        "FreeBuff's terminal closed before it was ready for a prompt. "
+                        "Reinstall BlindPilot, then try again."
+                    )
+                    return
+                # It ended mid-turn, so whatever was captured is the whole
+                # answer; fall through to report it rather than wait it out.
+                break
             if chunk:
                 stream.feed(chunk)
                 visible = "\n".join(line.rstrip() for line in screen.display).strip()
@@ -1461,13 +1473,19 @@ class FreebuffWorker(threading.Thread):
             chunks: queue.Queue[str] = queue.Queue()
 
             def pump() -> None:
-                while self._pty and self._pty.isalive():
-                    try:
-                        data = self._pty.read(4096)
-                    except Exception:
-                        break
-                    if data:
-                        chunks.put(data)
+                try:
+                    while self._pty and self._pty.isalive():
+                        try:
+                            data = self._pty.read(4096)
+                        except Exception:
+                            break
+                        if data:
+                            chunks.put(data)
+                finally:
+                    # Nothing more will ever arrive. Saying so turns a terminal
+                    # that died at startup into a reported failure instead of an
+                    # hour of silence.
+                    self._stream_ended.set()
 
             threading.Thread(target=pump, daemon=True).start()
 
@@ -1493,7 +1511,10 @@ class FreebuffWorker(threading.Thread):
         def read(timeout: float) -> str:
             try:
                 return self._pty.read_nonblocking(4096, timeout=timeout)
-            except (pexpect.TIMEOUT, pexpect.EOF):
+            except pexpect.TIMEOUT:
+                return ""
+            except pexpect.EOF:
+                self._stream_ended.set()
                 return ""
 
         return read

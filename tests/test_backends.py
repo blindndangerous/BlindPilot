@@ -444,3 +444,32 @@ def test_freebuff_keeps_pro_when_freebuff_resets_its_own_setting(monkeypatch, tm
     settings.write_text(json.dumps({"freebuffModel": "deepseek/deepseek-v4-pro"}), "utf-8")
     _models, _efforts, current, _effort, _error = freebuff_model_options()
     assert current == "deepseek/deepseek-v4-flash"
+
+
+def test_freebuff_reports_a_terminal_that_closes_before_it_is_ready(monkeypatch):
+    """A pseudo-terminal that cannot host a process must not read as silence.
+
+    The packaged build shipped without pywinpty's console host, so nothing ever
+    started and the worker sat waiting for output that could never arrive.
+    """
+    failures: list[str] = []
+    callbacks = _callbacks()
+    callbacks["on_failed"] = failures.append
+    worker = FreebuffWorker("do the work", None, ".", "default", **callbacks)
+
+    def fake_spawn(_args):
+        worker._stream_ended.set()
+        return lambda _timeout: ""
+
+    monkeypatch.setattr(agent_backends, "find_backend_cli", lambda _backend: "freebuff")
+    monkeypatch.setattr(
+        agent_backends,
+        "freebuff_model_options",
+        lambda: (["deepseek/deepseek-v4-pro"], [], "deepseek/deepseek-v4-pro", "", ""),
+    )
+    monkeypatch.setattr(agent_backends, "set_freebuff_model", lambda _model: None)
+    monkeypatch.setattr(FreebuffWorker, "_spawn_pty", staticmethod(fake_spawn))
+
+    worker._do_run()
+
+    assert failures and "closed before it was ready" in failures[0]
