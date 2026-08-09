@@ -227,7 +227,10 @@ def test_windows_helper_script_has_valid_powershell_syntax(tmp_path):
         check=False,
         capture_output=True,
         text=True,
-        timeout=15,
+        # A child with no console of its own must not be handed the parent's
+        # console as stdin: PowerShell blocks on reading it and never exits.
+        stdin=subprocess.DEVNULL,
+        timeout=60,
         creationflags=subprocess.CREATE_NO_WINDOW,
     )
 
@@ -255,6 +258,9 @@ def test_windows_helper_waits_for_old_process_then_replaces_and_launches(tmp_pat
         'fso.CreateTextFile(fso.BuildPath(home, "new-launched.txt"), True).WriteLine "launched"\r\n'
         'fso.CreateTextFile(fso.BuildPath(home, "new-running.txt"), True).WriteLine "running"\r\n'
         "WScript.Sleep 5000\r\n"
+        # Step out of the install directory before finishing, or the running
+        # process keeps a handle on it and the temporary tree cannot be removed.
+        'CreateObject("WScript.Shell").CurrentDirectory = fso.GetSpecialFolder(2)\r\n'
         'fso.DeleteFile fso.BuildPath(home, "new-running.txt")\r\n',
         encoding="ascii",
     )
@@ -297,6 +303,7 @@ def test_windows_helper_waits_for_old_process_then_replaces_and_launches(tmp_pat
                 "BlindPilot.vbs",
             ],
             cwd=tempfile.gettempdir(),
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,

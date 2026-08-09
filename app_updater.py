@@ -418,6 +418,11 @@ def schedule_install(archive: Path) -> None:
                     getattr(subprocess, "CREATE_NO_WINDOW", 0)
                     | getattr(subprocess, "DETACHED_PROCESS", 0)
                 ),
+                # The helper outlives BlindPilot and has no console of its own,
+                # so it must never be left holding an inherited console handle.
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
                 close_fds=True,
                 cwd=tempfile.gettempdir(),
             )
