@@ -9,7 +9,7 @@ the original project throughout the application and documentation.
 - Claude Code, Codex, and FreeBuff backends with matching conversation features.
 - Runtime model discovery for every backend; FreeBuff defaults to DeepSeek 4 Pro.
 - Automatic NVDA reading after submitting a message.
-- Silent until the response mode, replacing the former Classic view wording.
+- Silent until the response mode keeps activity quiet until the complete answer is ready.
 - Secure GitHub release updater with SHA-256 verification.
 - Lazy model discovery to avoid the large CPU spike during application startup.
 - Accessible Windows and macOS builds, including Intel and Apple Silicon Macs.

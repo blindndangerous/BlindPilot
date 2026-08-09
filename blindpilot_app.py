@@ -899,9 +899,9 @@ _FALLBACK_MODELS = ["default", "opus", "sonnet", "haiku", "fable", "opusplan"]
 _FALLBACK_EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 # Shown first in both combo boxes: leave the flag off and let the CLI decide.
 DEFAULT_CHOICE = "(CLI default)"
-# Probing costs a CLI start-up (~2 seconds), so results are reused for a while
-# and refreshed in the background. A tab warms its own cache when it opens, so
-# the first /model of a session is usually instant too.
+# Probing costs a CLI start-up, so results are reused for a while. Catalogs are
+# deliberately loaded only when /model or /models is opened, keeping normal
+# application startup fast and quiet.
 PROBE_TTL_SECONDS = 900
 
 
