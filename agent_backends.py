@@ -884,6 +884,87 @@ def _freebuff_chat_dirs(cwd: str) -> dict[str, float]:
     return found
 
 
+def _freebuff_chat_path(cwd: str, session_id: str) -> Optional[Path]:
+    """Locate one FreeBuff chat regardless of its Git-derived project bucket."""
+    if not session_id:
+        return None
+    root = Path.home() / ".config" / "manicode" / "projects"
+    candidates = [root / Path(cwd).name / "chats", root / "chats"]
+    try:
+        candidates.extend(path for path in root.glob("*/chats") if path not in candidates)
+    except OSError:
+        pass
+    for folder in candidates:
+        candidate = folder / session_id
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def _freebuff_chat_snapshot(chat: Optional[Path]) -> tuple[str, str, list[tuple[str, str, str]]]:
+    """Read reasoning, answer text, and agent states from FreeBuff's live chat file."""
+    if chat is None:
+        return "", "", []
+    try:
+        payload = json.loads((chat / "chat-messages.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "", "", []
+    if not isinstance(payload, list):
+        return "", "", []
+    message = next(
+        (
+            item
+            for item in reversed(payload)
+            if isinstance(item, dict) and item.get("variant") == "ai"
+        ),
+        None,
+    )
+    if not isinstance(message, dict):
+        return "", "", []
+
+    thinking: list[str] = []
+    answer: list[str] = []
+    agents: list[tuple[str, str, str]] = []
+    blocks = message.get("blocks")
+    if not isinstance(blocks, list):
+        blocks = []
+    for index, block in enumerate(blocks):
+        if not isinstance(block, dict):
+            continue
+        kind = block.get("type")
+        if kind == "text":
+            content = str(block.get("content") or "").strip()
+            if not content or content == "[response interrupted]":
+                continue
+            if block.get("textType") == "reasoning":
+                thinking.append(content)
+            else:
+                answer.append(content)
+        elif kind == "agent":
+            name = str(block.get("agentName") or block.get("agentType") or "agent").strip()
+            status = str(block.get("status") or "running").strip().casefold()
+            agent_id = str(block.get("agentId") or f"{index}:{name}")
+            agents.append((agent_id, name, status))
+    return "\n\n".join(thinking), "\n\n".join(answer), agents
+
+
+def _freebuff_run_status(chat: Optional[Path], offset: int = 0) -> str:
+    """Return complete/cancelled from FreeBuff's authoritative per-chat log."""
+    if chat is None:
+        return ""
+    try:
+        with (chat / "log.jsonl").open("rb") as handle:
+            handle.seek(max(0, offset))
+            tail = handle.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+    if "Agent run cancelled by user" in tail:
+        return "cancelled"
+    if "Main prompt finished" in tail:
+        return "complete"
+    return ""
+
+
 class FreebuffWorker(threading.Thread):
     """Drive FreeBuff's interactive TUI through a pseudo-terminal.
 
@@ -988,6 +1069,13 @@ class FreebuffWorker(threading.Thread):
             self._on_failed(f"Could not select the FreeBuff model: {exc}")
             return
         before = _freebuff_chat_dirs(self._cwd)
+        chat_path = _freebuff_chat_path(self._cwd, self._session_id or "")
+        log_offset = 0
+        if chat_path is not None:
+            try:
+                log_offset = (chat_path / "log.jsonl").stat().st_size
+            except OSError:
+                pass
         args = [binary, "--cwd", self._cwd]
         if self._session_id:
             args.extend(["--continue", self._session_id])
@@ -1016,10 +1104,18 @@ class FreebuffWorker(threading.Thread):
         last_visible = ""
         last_thinking = ""
         last_answer = ""
+        structured_thinking = ""
+        structured_answer = ""
+        agent_states: dict[str, str] = {}
         pending_sections: Optional[tuple[str, str]] = None
         screen_changed_at = time.monotonic()
         accepted_recommended_model = False
         saw_busy = False
+        session_reported = bool(self._session_id)
+        next_session_check = time.monotonic()
+        turn_started_at: Optional[float] = None
+        next_heartbeat = float("inf")
+        completion_seen_at: Optional[float] = None
         deadline = time.monotonic() + 60 * 60
 
         while not self._cancelled and time.monotonic() < deadline:
@@ -1051,6 +1147,8 @@ class FreebuffWorker(threading.Thread):
                     return
                 sent = True
                 started = True
+                turn_started_at = time.monotonic()
+                next_heartbeat = turn_started_at + 30
                 # A resumed TUI initially contains the previous turn. Treat it
                 # as a baseline so it is not announced again while the new
                 # prompt is being painted onto the screen.
@@ -1058,17 +1156,74 @@ class FreebuffWorker(threading.Thread):
                 self._accepting_input.set()
                 self._on_started()
                 continue
+
+            now = time.monotonic()
+            if sent and now >= next_session_check:
+                next_session_check = now + 1.0
+                if chat_path is None:
+                    after = _freebuff_chat_dirs(self._cwd)
+                    new_ids = set(after) - set(before)
+                    discovered = max(new_ids, key=after.get) if new_ids else self._session_id
+                    if discovered:
+                        self._session_id = discovered
+                        chat_path = _freebuff_chat_path(self._cwd, discovered)
+                        log_offset = 0
+                        # The terminal fallback may have emitted the first
+                        # settled frame just before the chat directory became
+                        # visible. Seed the structured trackers from that
+                        # frame so switching sources does not narrate it twice.
+                        structured_thinking = last_thinking
+                        structured_answer = last_answer
+                if self._session_id and not session_reported:
+                    self._on_session(self._session_id)
+                    session_reported = True
+
+            if sent and chat_path is not None:
+                thinking, answer, agents = _freebuff_chat_snapshot(chat_path)
+                if thinking:
+                    structured_thinking = self._emit_stable_delta(
+                        "thinking", structured_thinking, thinking
+                    )
+                if answer:
+                    structured_answer = self._emit_stable_delta(
+                        "assistant", structured_answer, answer
+                    )
+                for agent_id, name, status in agents:
+                    previous_status = agent_states.get(agent_id)
+                    if previous_status is None:
+                        self._on_activity("tool", f"FreeBuff started {name}")
+                    elif previous_status != status and status in ("complete", "completed"):
+                        self._on_activity("result", f"FreeBuff finished {name}")
+                    agent_states[agent_id] = status
+                run_status = _freebuff_run_status(chat_path, log_offset)
+                if run_status == "cancelled":
+                    self._on_failed("FreeBuff reported that the response was interrupted")
+                    return
+                if run_status == "complete":
+                    if completion_seen_at is None:
+                        completion_seen_at = now
+                    elif now - completion_seen_at >= 0.5:
+                        break
+
+            if sent and now >= next_heartbeat:
+                elapsed = max(1, int(now - (turn_started_at or now)))
+                self._on_activity("tool", f"FreeBuff is still working; {elapsed} seconds elapsed")
+                next_heartbeat = now + 30
             if (
                 started
                 and saw_busy
                 and pending_sections is not None
+                and not (structured_thinking or structured_answer)
                 and time.monotonic() - screen_changed_at >= 0.35
             ):
                 thinking, answer = pending_sections
                 last_thinking = self._emit_stable_delta("thinking", last_thinking, thinking)
                 last_answer = self._emit_stable_delta("assistant", last_answer, answer)
+                if chat_path is not None:
+                    structured_thinking = last_thinking
+                    structured_answer = last_answer
                 pending_sections = None
-            if sent and saw_busy and at_prompt and not busy:
+            if sent and saw_busy and at_prompt and not busy and chat_path is None:
                 if ready_since is None:
                     ready_since = time.monotonic()
                 elif time.monotonic() - ready_since >= 1.0:
@@ -1081,12 +1236,14 @@ class FreebuffWorker(threading.Thread):
             return
 
         self._accepting_input.clear()
-        _thinking, response = self._freebuff_sections(last_visible)
+        _thinking, screen_response = self._freebuff_sections(last_visible)
+        response = structured_answer or screen_response
         if response:
-            if response != last_answer:
+            announced_answer = structured_answer or last_answer
+            if response != announced_answer:
                 addition = (
-                    response[len(last_answer) :].strip()
-                    if response.startswith(last_answer)
+                    response[len(announced_answer) :].strip()
+                    if response.startswith(announced_answer)
                     else response
                 )
                 if addition:
@@ -1099,7 +1256,7 @@ class FreebuffWorker(threading.Thread):
         after = _freebuff_chat_dirs(self._cwd)
         new_ids = set(after) - set(before)
         session = max(new_ids, key=after.get) if new_ids else self._session_id
-        if session:
+        if session and not session_reported:
             self._on_session(session)
 
     def _emit_stable_delta(self, kind: str, previous: str, current: str) -> str:
@@ -1229,6 +1386,10 @@ class FreebuffWorker(threading.Thread):
             if stripped.startswith("⎘") or re.fullmatch(r"[⎘•△▽✕xs\d.\s]+", stripped):
                 continue
             if self._BUSY_RE.search(stripped):
+                continue
+            if stripped.startswith("│") and stripped.endswith("│"):
+                continue
+            if "▸" in stripped and re.search(r"\b(?:running|completed)\b", lower):
                 continue
 
             indent = len(raw) - len(raw.lstrip())

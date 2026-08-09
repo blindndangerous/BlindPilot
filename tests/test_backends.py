@@ -184,6 +184,10 @@ DeepSeek V3 unlimited ✕ End session
 │ Learn More mongodb.com │
 │ Start Monetizing  trygravity.ai │
 │ Get API Access  baseten.co │
+│ deduplication cuts backup storage costs by 50%. │
+│ ▸ basher ● running │
+│ command output that is not part of the answer │
+│ ▸ basher completed ✓ │
 Enter a coding task or / for commands
 """
 
@@ -224,3 +228,52 @@ def test_freebuff_chat_discovery_searches_all_project_buckets(monkeypatch, tmp_p
 
     assert "session-id" in found
     assert found["session-id"] == chat.stat().st_mtime
+    assert agent_backends._freebuff_chat_path(str(tmp_path / "workspace"), "session-id") == chat
+
+
+def test_freebuff_structured_chat_reports_progress_and_authoritative_completion(
+    monkeypatch, tmp_path
+):
+    chat = tmp_path / ".config" / "manicode" / "projects" / "project" / "chats" / "session-id"
+    chat.mkdir(parents=True)
+    monkeypatch.setattr(agent_backends.Path, "home", classmethod(lambda cls: tmp_path))
+    messages = [
+        {"variant": "user", "content": "Do the work"},
+        {
+            "variant": "ai",
+            "blocks": [
+                {"type": "text", "textType": "reasoning", "content": "Inspecting config"},
+                {
+                    "type": "agent",
+                    "agentId": "tool-1",
+                    "agentName": "basher",
+                    "status": "complete",
+                },
+                {"type": "text", "textType": "text", "content": "Configuration updated."},
+            ],
+        },
+    ]
+    (chat / "chat-messages.json").write_text(json.dumps(messages), encoding="utf-8")
+    log = chat / "log.jsonl"
+    log.write_text('{"msg":"old Main prompt finished"}\n', encoding="utf-8")
+    offset = log.stat().st_size
+    with log.open("a", encoding="utf-8") as handle:
+        handle.write('{"msg":"Main prompt finished"}\n')
+
+    thinking, answer, agents = agent_backends._freebuff_chat_snapshot(chat)
+
+    assert thinking == "Inspecting config"
+    assert answer == "Configuration updated."
+    assert agents == [("tool-1", "basher", "complete")]
+    assert agent_backends._freebuff_run_status(chat, offset) == "complete"
+    assert agent_backends._freebuff_run_status(chat, log.stat().st_size) == ""
+
+
+def test_freebuff_structured_chat_reports_interruption(tmp_path):
+    chat = tmp_path / "chat"
+    chat.mkdir()
+    (chat / "log.jsonl").write_text(
+        '{"msg":"Agent run cancelled by user (abort error)"}\n', encoding="utf-8"
+    )
+
+    assert agent_backends._freebuff_run_status(chat) == "cancelled"
