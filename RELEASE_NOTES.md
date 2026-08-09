@@ -44,6 +44,7 @@ the original project throughout the application and documentation.
 
 ## Downloads
 
+- Windows x64 setup: `BlindPilot-Setup-x64.exe`
 - Windows x64: `BlindPilot-Windows-x64.zip`
 - macOS Apple Silicon: `BlindPilot-macOS-arm64.zip`
 - macOS Intel: `BlindPilot-macOS-x64.zip`

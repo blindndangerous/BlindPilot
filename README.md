@@ -143,9 +143,14 @@ python -m pip install -r requirements-build.txt
 pyinstaller --onedir --windowed --name BlindPilot --add-data "EarCons;EarCons" blind_pilot.py
 ```
 
+Windows releases also include `BlindPilot-Setup-x64.exe`, a per-user installer
+that needs no administrator access. The installer creates Start menu shortcuts,
+supports silent deployment, and closes a running BlindPilot instance before
+replacing its files. It is built from [`installer/BlindPilot.iss`](installer/BlindPilot.iss).
+
 Pushing a `v*` tag runs [.github/workflows/release.yml](.github/workflows/release.yml),
-tests startup and the full suite, and publishes Windows x64 plus Intel and Apple
-Silicon macOS archives with SHA-256 files.
+tests startup and the full suite, and publishes the Windows installer, Windows x64
+archive, and Intel and Apple Silicon macOS archives with SHA-256 files.
 
 The original build document is retained as
 [`original-claude-code-reader-spec.html`](original-claude-code-reader-spec.html)

@@ -67,6 +67,21 @@ jobs:
           Compress-Archive -Path dist\BlindPilot -DestinationPath "artifacts\${{ matrix.asset }}" -CompressionLevel Optimal
           $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath "artifacts\${{ matrix.asset }}").Hash.ToLowerInvariant()
           Set-Content -Encoding ascii -NoNewline -LiteralPath "artifacts\${{ matrix.asset }}.sha256" -Value "$hash  ${{ matrix.asset }}"
+          choco install innosetup --no-progress -y
+          $appVersion = (Select-String -LiteralPath blindpilot_app.py -Pattern '^APP_VERSION = "([^"]+)"$').Matches[0].Groups[1].Value
+          $sourceDir = (Resolve-Path -LiteralPath dist\BlindPilot).Path
+          $outputDir = (Resolve-Path -LiteralPath artifacts).Path
+          $iscc = @(
+            "${env:LOCALAPPDATA}\Programs\Inno Setup 6\ISCC.exe"
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+            "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
+          ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $iscc) { throw "Inno Setup compiler was not found after installation" }
+          & $iscc "/DMyAppVersion=$appVersion" "/DMySourceDir=$sourceDir" "/DMyOutputDir=$outputDir" installer\BlindPilot.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup exited with code $LASTEXITCODE" }
+          $setupAsset = "BlindPilot-Setup-x64.exe"
+          $setupHash = (Get-FileHash -Algorithm SHA256 -LiteralPath "artifacts\$setupAsset").Hash.ToLowerInvariant()
+          Set-Content -Encoding ascii -NoNewline -LiteralPath "artifacts\$setupAsset.sha256" -Value "$setupHash  $setupAsset"
 
       - name: Build macOS application
         if: matrix.kind == 'macos'
