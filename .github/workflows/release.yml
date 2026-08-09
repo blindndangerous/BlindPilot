@@ -32,10 +32,10 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -45,6 +45,11 @@ jobs:
 
       - name: Run regression tests
         run: python -m pytest -q -W error
+
+      - name: Run static checks
+        run: |
+          python -m ruff check .
+          python -m ruff format --check .
 
       - name: Compile source
         run: python -m py_compile blind_pilot.py blindpilot_app.py app_updater.py claude_reader.py agent_backends.py markdown_rows.py
@@ -78,7 +83,7 @@ jobs:
           shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
 
       - name: Upload release files
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset }}
           path: artifacts/*
@@ -91,7 +96,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Download build outputs
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
