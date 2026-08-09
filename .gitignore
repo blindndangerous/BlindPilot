@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.venv/
+.test-cache/
+.pytest_cache/
+.pytest-tmp/
+.test-tmp/
+.tmp_*
+dist/
+build/
+*.spec
+NVIDIA Corporation/
+artifacts/

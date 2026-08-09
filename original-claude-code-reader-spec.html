@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>BlindPilot — Original Claude Code Reader Build Specification</title>
+</head>
+<body>
+
+<h1>BlindPilot — Original Claude Code Reader Build Specification</h1>
+
+<aside>
+<p><strong>Historical source credit:</strong> BlindPilot is based on the
+original <a href="https://github.com/doubletaponair/claude-code-reader">Claude
+Code Reader</a> by
+<a href="https://github.com/doubletaponair">doubletaponair</a>. This document
+is retained to credit and describe that original Claude-only design. It is not
+the specification for BlindPilot's current multi-backend release.</p>
+</aside>
+
+<p>This is a build specification for a small accessible desktop application that wraps the Claude Code CLI. The goal is to give a screen reader user (VoiceOver on Mac, NVDA or JAWS on Windows) a clean, keyboard-first interface for interacting with Claude Code, without the spinner animations, ANSI colour codes, and streaming text updates that make the standard terminal experience hostile to screen readers.</p>
+
+<h2>Project Goal</h2>
+
+<p>Build a single cross-platform Python application using PyQt6 that:</p>
+
+<ul>
+<li>Accepts a user prompt via a text input field</li>
+<li>Sends that prompt to Claude Code in headless mode</li>
+<li>Captures the assistant's response cleanly, ignoring tool-use noise</li>
+<li>Displays each response as one item in a navigable list</li>
+<li>Allows the user to filter the list by typing in a search field</li>
+<li>Maintains conversation continuity across multiple turns within a session</li>
+</ul>
+
+<h2>Target Platforms</h2>
+
+<ul>
+<li>macOS (current versions, tested with VoiceOver)</li>
+<li>Windows 10 and 11 (tested with NVDA and JAWS)</li>
+</ul>
+
+<p>One Python codebase should run on both platforms without modification.</p>
+
+<h2>Tech Stack</h2>
+
+<ul>
+<li>Python 3.10 or later</li>
+<li>PyQt6 for the GUI</li>
+<li>The standard library <code>subprocess</code> module for invoking Claude Code</li>
+<li>The standard library <code>json</code> module for parsing stream output</li>
+<li>No additional dependencies beyond PyQt6</li>
+</ul>
+
+<p>The Claude Code CLI must already be installed on the user's machine. The app shells out to it; it does not bundle it.</p>
+
+<h2>Window Layout</h2>
+
+<p>A single main window with the following controls stacked vertically from top to bottom:</p>
+
+<ol>
+<li><strong>Prompt input</strong> — A multi-line text field (<code>QPlainTextEdit</code>) where the user types their prompt to Claude. Accessible name: "Prompt". Approximately 4 lines tall by default; resizable.</li>
+<li><strong>Send button</strong> — A standard push button (<code>QPushButton</code>) labelled "Send". Pressing Enter while focused on the prompt input should also trigger send (Shift+Enter inserts a newline within the prompt).</li>
+<li><strong>Search field</strong> — A single-line text field (<code>QLineEdit</code>) labelled "Search responses". The user types a search term and presses Enter to filter the message list. Clearing the field and pressing Enter restores the full list.</li>
+<li><strong>Message list</strong> — A list view (<code>QListWidget</code>) that displays each assistant response as a single list item. Accessible name: "Responses". This is where the user spends most of their time reading.</li>
+<li><strong>Status bar</strong> — At the bottom of the window, a status line (<code>QStatusBar</code>) used to display state messages such as "Ready", "Sending...", "Receiving response...", "Error: Claude Code not found", and so on. Status bar text must be readable by screen readers when the user navigates to it.</li>
+</ol>
+
+<h2>Tab Order</h2>
+
+<p>Tab moves focus in this exact order, cycling at the end:</p>
+
+<ol>
+<li>Prompt input</li>
+<li>Send button</li>
+<li>Search field</li>
+<li>Message list</li>
+</ol>
+
+<p>Shift+Tab reverses the order. The status bar is not in the tab cycle; it is read on demand by the screen reader.</p>
+
+<h2>Keyboard Behaviour</h2>
+
+<ul>
+<li><strong>Enter in the prompt input</strong> sends the prompt. <strong>Shift+Enter</strong> inserts a newline.</li>
+<li><strong>Enter in the search field</strong> applies the filter to the message list. The list re-populates to show only matching items.</li>
+<li><strong>Up and Down arrows in the message list</strong> move between responses. The screen reader announces each response's text as focus moves.</li>
+<li><strong>Enter on a message list item</strong> opens that response in a separate read-only dialog (<code>QDialog</code> containing a <code>QPlainTextEdit</code> in read-only mode) for distraction-free reading. Escape closes the dialog and returns focus to the list.</li>
+<li><strong>Ctrl+L (Cmd+L on Mac)</strong> moves focus to the prompt input from anywhere in the app — a quick way to start a new prompt.</li>
+<li><strong>Ctrl+F (Cmd+F on Mac)</strong> moves focus to the search field.</li>
+</ul>
+
+<h2>Search Behaviour</h2>
+
+<ul>
+<li>Search filters the message list to only items whose <em>response text</em> contains the search term. It does not search prompts or metadata.</li>
+<li>Search is case-insensitive.</li>
+<li>Search is plain substring match — no regex, no wildcards, nothing clever.</li>
+<li>Search activates only when Enter is pressed in the search field. Live filtering as the user types is explicitly not wanted, because list count changes are noisy with a screen reader.</li>
+<li>Clearing the search field and pressing Enter restores the full list.</li>
+<li>When the filter is applied, the status bar should update to read something like "Showing 3 of 12 responses".</li>
+</ul>
+
+<h2>Claude Code Integration</h2>
+
+<p>The app invokes Claude Code as a subprocess. The exact command pattern:</p>
+
+<pre><code>claude -p "&lt;user prompt&gt;" --output-format stream-json --verbose</code></pre>
+
+<p>For follow-up turns within the same conversation, capture the <code>session_id</code> from the first response and pass it on subsequent calls:</p>
+
+<pre><code>claude -p "&lt;next prompt&gt;" --resume &lt;session_id&gt; --output-format stream-json --verbose</code></pre>
+
+<p>The <code>stream-json</code> format produces newline-delimited JSON events on stdout. The app must read stdout line by line as the subprocess runs. Each line is a JSON object with a <code>type</code> field. The app should:</p>
+
+<ul>
+<li>Parse each line as JSON</li>
+<li>Keep events where <code>type</code> is <code>"assistant"</code> and the message contains text content</li>
+<li>Concatenate text content blocks within a single assistant message into one string</li>
+<li>Append that string as a new item to the message list when the assistant turn completes</li>
+<li>Ignore events of type <code>"user"</code>, <code>"system"</code>, <code>"tool_use"</code>, <code>"tool_result"</code>, and any other type — these are the noise we are deliberately suppressing</li>
+<li>Capture the <code>session_id</code> from the first <code>"system"</code> event (subtype <code>"init"</code>) and store it for the lifetime of the session</li>
+<li>Detect the final event of type <code>"result"</code> as the signal that the turn is complete</li>
+</ul>
+
+<p>The subprocess call must run on a background thread (<code>QThread</code>) so the UI stays responsive. Use Qt signals to deliver new messages from the worker thread to the main thread, where they are added to the list widget.</p>
+
+<h2>Status and Feedback</h2>
+
+<p>The status bar should reflect the app's current state at all times:</p>
+
+<ul>
+<li><code>"Ready"</code> — when idle and no prompt is in progress</li>
+<li><code>"Sending..."</code> — immediately after the user presses Send</li>
+<li><code>"Receiving response..."</code> — once the first <code>assistant</code> event arrives</li>
+<li><code>"Response received"</code> — after the <code>result</code> event indicates completion</li>
+<li><code>"Showing N of M responses"</code> — when a search filter is active</li>
+<li><code>"Error: &lt;description&gt;"</code> — on any failure (see error handling below)</li>
+</ul>
+
+<p>When a new response is added to the list, the app should also emit a <code>QAccessible</code> announcement so the screen reader can speak "New response received" without the user having to navigate to find out. On Windows this uses <code>QAccessible.updateAccessibility</code> with an alert event; on Mac VoiceOver picks up posted notifications similarly. The exact API may need testing on both platforms.</p>
+
+<h2>Error Handling</h2>
+
+<p>The app must handle these failure modes gracefully, with the error surfaced in the status bar and announced to the screen reader:</p>
+
+<ul>
+<li>Claude Code CLI not found on PATH — show "Error: Claude Code not installed. Install from claude.com/claude-code"</li>
+<li>Subprocess exits with non-zero status — show "Error: Claude Code exited with code N"</li>
+<li>Malformed JSON on stdout — log it but do not crash; continue reading subsequent lines</li>
+<li>Empty prompt submitted — show "Error: Prompt is empty" and do not invoke the CLI</li>
+<li>No response received within a reasonable timeout (e.g. 5 minutes) — offer to cancel and show "Error: No response received"</li>
+</ul>
+
+<h2>Accessibility Requirements</h2>
+
+<p>These are not optional polish items; they are the reason the app exists.</p>
+
+<ul>
+<li>Every interactive control must have a meaningful <code>accessibleName</code> set explicitly. Do not rely on automatic name inference from labels.</li>
+<li>Every interactive control must have an <code>accessibleDescription</code> where the name alone is not self-explanatory.</li>
+<li>The message list must use <code>QListWidget</code> (not a custom widget) so that the standard list role is exposed to screen readers. Each item's text is set via <code>setText()</code> only — no rich text or HTML in list items, because this complicates screen reader output.</li>
+<li>Buttons must have visible text labels. No icon-only buttons.</li>
+<li>Focus indicators must be visible (PyQt6's defaults are fine).</li>
+<li>The window must support full keyboard operation. There must be no action that requires a mouse.</li>
+<li>When the response viewer dialog opens, focus moves to the read-only text field automatically. When it closes, focus returns to the list item it was opened from.</li>
+<li>The app should not steal focus when a new response arrives. The user may still be typing or reading. The screen reader announcement is sufficient notice.</li>
+</ul>
+
+<h2>Out of Scope for v1</h2>
+
+<p>To keep v1 small and shippable, deliberately exclude:</p>
+
+<ul>
+<li>Saving or loading sessions to disk</li>
+<li>Exporting responses to file</li>
+<li>Multiple concurrent sessions or tabs</li>
+<li>Settings or preferences dialog</li>
+<li>Themes, fonts, or appearance customisation</li>
+<li>Tool approval prompts (the app should run with default permissions; if a tool requires approval Claude Code will refuse it and the user will see that in the response)</li>
+<li>Streaming partial responses into the list as they arrive (wait for the full assistant turn to complete before appending one list item)</li>
+<li>Any kind of Markdown rendering — display the raw text from the response exactly as Claude returns it</li>
+<li>Rich text, HTML, or syntax highlighting in the response viewer</li>
+</ul>
+
+<h2>File Structure</h2>
+
+<p>A single Python file is preferred for v1, named <code>claude_reader.py</code>. If the implementation needs to grow beyond roughly 600 lines, split into:</p>
+
+<ul>
+<li><code>claude_reader.py</code> — entry point and main window</li>
+<li><code>worker.py</code> — the QThread that runs the Claude Code subprocess</li>
+<li><code>response_dialog.py</code> — the read-only viewer dialog</li>
+</ul>
+
+<h2>Acceptance Criteria</h2>
+
+<p>The build is complete when all of the following are true:</p>
+
+<ol>
+<li>Running <code>python claude_reader.py</code> opens the main window on both Mac and Windows.</li>
+<li>Typing a prompt and pressing Enter sends it to Claude Code; the response appears as a new item in the message list within a reasonable time.</li>
+<li>Sending a follow-up prompt continues the same conversation (verified by referring back to earlier context, e.g. "what did I just ask you?").</li>
+<li>Tab moves focus through the four controls in the specified order.</li>
+<li>Up and Down arrows in the list cause VoiceOver (Mac) and NVDA (Windows) to read each response.</li>
+<li>Pressing Enter on a list item opens the response in a read-only dialog; Escape returns to the list.</li>
+<li>Typing a search term in the search field and pressing Enter filters the list to matching items only.</li>
+<li>The status bar reflects the app's state at all times.</li>
+<li>Killing the Claude Code subprocess (e.g. closing the window mid-response) does not leave orphan processes.</li>
+<li>No control is operable only by mouse.</li>
+</ol>
+
+<h2>Notes for the Builder</h2>
+
+<p>If you (Claude Code) are uncertain about any of these requirements, ask before guessing. The user is a blind developer who relies on this kind of tooling for daily work, so correctness on accessibility points matters more than speed of delivery. When in doubt, prefer the simpler, more standard PyQt6 widget over a custom solution — standard widgets get accessibility right by default; custom ones rarely do.</p>
+
+</body>
+</html>
