@@ -125,6 +125,8 @@ def test_windows_candidates_cover_winget_and_npm():
 
 
 def test_same_dir_ignores_case_slashes_and_quotes():
+    if not WINDOWS:
+        return
     assert _same_dir("C:\\Users\\x\\.local\\bin", "C:/Users/x/.local/bin")
     assert _same_dir('"C:\\Tools"', "C:\\tools")
     assert _same_dir("  C:\\Tools\\  ", "C:\\Tools")
@@ -137,6 +139,8 @@ def test_same_dir_expands_environment_variables():
 
     Comparing them literally would add a duplicate entry every launch.
     """
+    if not WINDOWS:
+        return
     os.environ["_CCR_TEST_HOME"] = "C:\\Users\\tester"
     try:
         assert _same_dir("%_CCR_TEST_HOME%\\bin", "C:\\Users\\tester\\bin")
@@ -148,12 +152,16 @@ def test_same_dir_expands_environment_variables():
 
 
 def test_path_entry_is_appended_when_missing():
+    if not WINDOWS:
+        return
     current = os.pathsep.join(["C:\\Windows", "C:\\Windows\\System32"])
     updated = _path_with_entry(current, "C:\\Users\\x\\.local\\bin")
     assert updated == current + os.pathsep + "C:\\Users\\x\\.local\\bin"
 
 
 def test_path_entry_not_duplicated():
+    if not WINDOWS:
+        return
     current = os.pathsep.join(["C:\\Windows", "C:/Users/x/.local/bin/"])
     assert _path_with_entry(current, "C:\\Users\\x\\.local\\bin") is None
 
@@ -164,6 +172,8 @@ def test_path_entry_preserves_variable_references():
     Expanding %USERPROFILE% on the way through would bake one user's home
     directory into a value the registry is supposed to keep dynamic.
     """
+    if not WINDOWS:
+        return
     current = os.pathsep.join(["%USERPROFILE%\\bin", "%JAVA_HOME%\\bin"])
     updated = _path_with_entry(current, "C:\\new")
     assert updated is not None
@@ -172,6 +182,8 @@ def test_path_entry_preserves_variable_references():
 
 def test_path_entry_drops_empty_segments():
     """A trailing semicolon is common and must not become a blank entry."""
+    if not WINDOWS:
+        return
     updated = _path_with_entry("C:\\Windows" + os.pathsep + os.pathsep, "C:\\new")
     assert updated == "C:\\Windows" + os.pathsep + "C:\\new"
 
