@@ -59,10 +59,10 @@ jobs:
         shell: pwsh
         run: |
           python -m PyInstaller --noconfirm --clean --windowed --onedir --name BlindPilot --add-data "EarCons;EarCons" --collect-submodules accessible_output2 --hidden-import winpty blind_pilot.py
-          & .\dist\BlindPilot\BlindPilot.exe --startup-smoke
-          if ($LASTEXITCODE -ne 0) { throw "Packaged startup smoke test failed: $LASTEXITCODE" }
-          & .\dist\BlindPilot\BlindPilot.exe --startup-gui-smoke
-          if ($LASTEXITCODE -ne 0) { throw "Packaged GUI startup smoke test failed: $LASTEXITCODE" }
+          $startupSmoke = Start-Process -FilePath .\dist\BlindPilot\BlindPilot.exe -ArgumentList "--startup-smoke" -PassThru -Wait
+          if ($startupSmoke.ExitCode -ne 0) { throw "Packaged startup smoke test failed: $($startupSmoke.ExitCode)" }
+          $guiSmoke = Start-Process -FilePath .\dist\BlindPilot\BlindPilot.exe -ArgumentList "--startup-gui-smoke" -PassThru -Wait
+          if ($guiSmoke.ExitCode -ne 0) { throw "Packaged GUI startup smoke test failed: $($guiSmoke.ExitCode)" }
           New-Item -ItemType Directory -Force -Path artifacts | Out-Null
           Compress-Archive -Path dist\BlindPilot -DestinationPath "artifacts\${{ matrix.asset }}" -CompressionLevel Optimal
           $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath "artifacts\${{ matrix.asset }}").Hash.ToLowerInvariant()

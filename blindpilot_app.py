@@ -4416,7 +4416,10 @@ def main() -> int:
     app = wx.App(False)
 
     cfg = _load_config()
-    if not cfg.get("setup_complete"):
+    # A packaged GUI smoke test runs with a clean temporary profile in CI. It
+    # must exercise the real main window without waiting in the interactive
+    # first-run wizard.
+    if not cfg.get("setup_complete") and not gui_startup_smoke:
         wizard = SetupWizard(
             None,
             cfg.get("projects_folder"),
