@@ -1,8 +1,22 @@
-# BlindPilot 0.3.6
+# BlindPilot 0.3.7
 
 BlindPilot is an accessible desktop reader for Claude Code, Codex, and FreeBuff. It is
 based on Claude Code Reader and remains available under the MIT License, with credit to
 the original project throughout the application and documentation.
+
+## FreeBuff answers arrive whole
+
+- FreeBuff saves its chat file as the words arrive, and BlindPilot read it on every pass,
+  so activity rows were cut off mid-sentence. It now waits for the text to settle and
+  reads out only finished sentences, with whatever is left released when the turn ends.
+
+## Less of the FreeBuff terminal
+
+- BlindPilot claims its console at startup, hidden and parked off screen, so creating a
+  terminal has none left to put on screen. A console raised while the terminal is torn
+  down is moved off screen as well as hidden, rather than only hidden.
+
+## Included from 0.3.6
 
 ## The FreeBuff terminal no longer appears
 

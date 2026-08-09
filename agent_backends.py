@@ -45,6 +45,50 @@ def no_window_kwargs() -> dict:
 _CONSOLE_WINDOW_CLASSES = ("ConsoleWindowClass", "PseudoConsoleWindow")
 
 
+def reserve_hidden_console() -> bool:
+    """Take a console for this process now, hidden, and keep it.
+
+    Creating a pseudo-terminal gives a windowed application a console whether
+    it wants one or not, and that console arrives visible. Claiming one up
+    front, before any terminal is created, means there is nothing left to
+    create later: the console already exists and is already hidden.
+    """
+    if platform.system() != "Windows":
+        return False
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32
+    try:
+        handle = kernel32.GetConsoleWindow()
+        if not handle:
+            if not kernel32.AllocConsole():
+                return False
+            handle = kernel32.GetConsoleWindow()
+        if handle:
+            _banish_window(handle)
+        return bool(handle)
+    except OSError:
+        return False
+
+
+def _banish_window(handle: int) -> None:
+    """Hide a window, and park it off-screen in case it is shown again.
+
+    Hiding alone leaves a window that something else can show, and the console
+    is shown again while the terminal is torn down. Off-screen and sized to
+    nothing, being shown costs nothing that can be seen.
+    """
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    try:
+        user32.ShowWindow(handle, 0)  # SW_HIDE
+        # SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER
+        user32.SetWindowPos(handle, 0, -32000, -32000, 0, 0, 0x0010 | 0x0004 | 0x0200)
+    except OSError:
+        pass
+
+
 def _descendant_pids(roots: set[int]) -> set[int]:
     """Every process descended from ``roots``, so only our own are touched."""
     import ctypes
@@ -111,7 +155,7 @@ def hide_console_windows(roots: Optional[set[int]] = None) -> int:
     try:
         own = kernel32.GetConsoleWindow()
         if own and user32.IsWindowVisible(own):
-            user32.ShowWindow(own, 0)  # SW_HIDE
+            _banish_window(own)
             hidden += 1
     except OSError:
         pass
@@ -149,7 +193,7 @@ def hide_console_windows(roots: Optional[set[int]] = None) -> int:
     for handle, owner in candidates:
         if owner in family:
             try:
-                user32.ShowWindow(handle, 0)  # SW_HIDE
+                _banish_window(handle)
                 hidden += 1
             except Exception:
                 pass
@@ -1103,6 +1147,21 @@ def _freebuff_chat_path(cwd: str, session_id: str) -> Optional[Path]:
 
 _FREEBUFF_INTERRUPTED = "[response interrupted]"
 
+# How long the chat file must stop changing before what it holds is narrated.
+# Long enough that a streamed sentence arrives whole, short enough that the run
+# still reads as it happens.
+_FREEBUFF_SETTLE_SECONDS = 0.7
+
+# Sentence-ending punctuation, or the end of a paragraph, either of which is a
+# place a listener expects the reading to stop.
+_SENTENCE_END_RE = re.compile(r"(?s)^.*(?:[.!?:;…][\"'”’)\]]*(?=\s|$)|\n)")
+
+
+def _complete_sentences(text: str) -> str:
+    """The part of ``text`` that reads as finished, or nothing yet."""
+    match = _SENTENCE_END_RE.search(text)
+    return match.group(0).rstrip() if match else ""
+
 
 def _freebuff_answer_message(payload: object) -> Optional[dict]:
     """Return the newest AI message that actually carries a reply.
@@ -1349,6 +1408,10 @@ class FreebuffWorker(threading.Thread):
         last_answer = ""
         structured_thinking = ""
         structured_answer = ""
+        # What the chat file last held, and when it may be narrated.
+        seen_thinking = ""
+        seen_answer = ""
+        settle_deadline = 0.0
         # A resumed chat already holds the previous turn's answer. Remember its
         # id so it is never mistaken for this turn's, and so the real answer is
         # recognised as new the moment FreeBuff writes it.
@@ -1486,14 +1549,30 @@ class FreebuffWorker(threading.Thread):
                     structured_thinking = ""
                     structured_answer = ""
                     agent_states.clear()
-                if thinking:
-                    structured_thinking = self._emit_stable_delta(
-                        "thinking", structured_thinking, thinking
-                    )
-                if answer:
-                    structured_answer = self._emit_stable_delta(
-                        "assistant", structured_answer, answer
-                    )
+                    seen_thinking = ""
+                    seen_answer = ""
+                # FreeBuff saves the chat file as the text arrives, so reading
+                # it on every pass catches sentences mid-word and reads out
+                # fragments. Let the text stop growing first, then narrate the
+                # whole of what was added.
+                if (thinking, answer) != (seen_thinking, seen_answer):
+                    seen_thinking, seen_answer = thinking, answer
+                    settle_deadline = now + _FREEBUFF_SETTLE_SECONDS
+                elif settle_deadline and now >= settle_deadline:
+                    settle_deadline = 0.0
+                    # Only whole sentences are read out. A pause in the middle
+                    # of one is still the middle of one, and hearing half a
+                    # sentence is what makes a run sound broken.
+                    ready = _complete_sentences(thinking)
+                    if ready:
+                        structured_thinking = self._emit_stable_delta(
+                            "thinking", structured_thinking, ready
+                        )
+                    ready = _complete_sentences(answer)
+                    if ready:
+                        structured_answer = self._emit_stable_delta(
+                            "assistant", structured_answer, ready
+                        )
                 for agent_id, name, status in agents:
                     previous_status = agent_states.get(agent_id)
                     if previous_status is None:
@@ -1543,6 +1622,14 @@ class FreebuffWorker(threading.Thread):
             return
 
         self._accepting_input.clear()
+        # The turn can end inside the settling window, holding text that was
+        # read but never narrated. Nothing arrives after this, so release it.
+        if seen_thinking and seen_thinking != structured_thinking:
+            structured_thinking = self._emit_stable_delta(
+                "thinking", structured_thinking, seen_thinking
+            )
+        if seen_answer and seen_answer != structured_answer:
+            structured_answer = self._emit_stable_delta("assistant", structured_answer, seen_answer)
         _thinking, screen_response = self._freebuff_sections(last_visible)
         response = structured_answer or screen_response
         if response:
@@ -1586,8 +1673,10 @@ class FreebuffWorker(threading.Thread):
         if platform.system() == "Windows":
             from winpty import PtyProcess
 
-            # The console appears while the terminal is being created, so the
-            # watcher has to be running before that call, not after it.
+            # Own the console before the terminal asks for one, so none is
+            # created on screen. The watcher below is the safety net for the
+            # consoles FreeBuff's own tools can still raise.
+            reserve_hidden_console()
             roots = {os.getpid()}
 
             def hide_terminal() -> None:

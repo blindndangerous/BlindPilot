@@ -66,6 +66,7 @@ from agent_backends import (
     freebuff_model_options,
     invalidate_backend_cache,
     normalize_backend,
+    reserve_hidden_console,
     set_freebuff_model,
     worker_class,
 )
@@ -149,7 +150,7 @@ def announce(text: str) -> None:
 
 
 APP_NAME = "BlindPilot"
-APP_VERSION = "0.3.6"
+APP_VERSION = "0.3.7"
 ORIGINAL_APP_CREDIT = (
     "Based on the original Claude Code Reader application by doubletaponair.\n"
     "https://github.com/doubletaponair/claude-code-reader"
@@ -4593,6 +4594,10 @@ def main() -> int:
             return 3
         return 0
     gui_startup_smoke = "--startup-gui-smoke" in sys.argv
+    # Claim the console before anything can create one on screen. Doing it here,
+    # rather than when a terminal is first needed, keeps it out of the way of
+    # the first message as well as every later one.
+    reserve_hidden_console()
     app = wx.App(False)
 
     cfg = _load_config()

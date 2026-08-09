@@ -473,3 +473,13 @@ def test_freebuff_reports_a_terminal_that_closes_before_it_is_ready(monkeypatch)
     worker._do_run()
 
     assert failures and "closed before it was ready" in failures[0]
+
+
+def test_freebuff_narrates_only_finished_sentences():
+    """Half a sentence read aloud is what makes a streamed run sound broken."""
+    assert agent_backends._complete_sentences("Maple Ridge is a city. Known for its") == (
+        "Maple Ridge is a city."
+    )
+    assert agent_backends._complete_sentences("The user is asking about") == ""
+    assert agent_backends._complete_sentences("First line\nsecond half") == "First line"
+    assert agent_backends._complete_sentences('He said "go." Then') == 'He said "go."'
