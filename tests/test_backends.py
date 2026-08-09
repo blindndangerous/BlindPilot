@@ -165,6 +165,26 @@ def test_freebuff_catalog_is_discovered_at_runtime_and_pro_is_default(monkeypatc
     assert settings["freebuffModel"] == "openai/gpt-next"
 
 
+def test_freebuff_picker_navigation_uses_runtime_model_order():
+    visible = """
+│   DeepSeek V4 Pro          Deep reasoning │
+│   GPT-5.6 Luna             Thinks hard    │
+│   MiniMax M3               Fastest        │
+│ › DeepSeek V4 Flash 07/31  Recommended    │
+"""
+    models = [
+        "deepseek/deepseek-v4-pro",
+        "openai/gpt-5.6-luna",
+        "minimax/minimax-m3",
+        "deepseek/deepseek-v4-flash",
+    ]
+
+    options, focused = agent_backends._freebuff_picker_options(visible, models)
+
+    assert options == models
+    assert focused == 3
+
+
 def test_freebuff_screen_parser_returns_reasoning_and_clean_answer():
     worker = FreebuffWorker(
         "Reply with exactly: BlindPilot FreeBuff adapter ready.",

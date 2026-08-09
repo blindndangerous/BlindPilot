@@ -1,4 +1,4 @@
-# BlindPilot 0.3.1
+# BlindPilot 0.3.2
 
 BlindPilot is an accessible desktop reader for Claude Code, Codex, and FreeBuff. It is
 based on Claude Code Reader and remains available under the MIT License, with credit to
@@ -16,6 +16,8 @@ the original project throughout the application and documentation.
   resumed.
 - Ads and terminal tool cards are no longer misidentified as assistant responses.
 - Switching from terminal fallback to structured data no longer narrates text twice.
+- BlindPilot now navigates FreeBuff's runtime model picker to the requested model instead
+  of accepting its highlighted Flash recommendation; DeepSeek 4 Pro remains selected.
 
 ## Included from 0.3.0
 

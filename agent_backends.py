@@ -426,6 +426,29 @@ def freebuff_model_options() -> tuple[list[str], list[str], str, str, str]:
     return models, [], current, "", error
 
 
+def _freebuff_picker_options(visible: str, models: list[str]) -> tuple[list[str], int]:
+    """Return the model IDs painted by FreeBuff's picker and its focused index."""
+    options: list[str] = []
+    focused = -1
+    for raw in visible.splitlines():
+        if "│" not in raw:
+            continue
+        words = set(re.findall(r"[a-z0-9]+", raw.casefold()))
+        matched = ""
+        for model in models:
+            leaf = model.rsplit("/", 1)[-1]
+            tokens = re.findall(r"[a-z0-9]+", leaf.casefold())
+            if tokens and all(token in words for token in tokens):
+                matched = model
+                break
+        if not matched or matched in options:
+            continue
+        options.append(matched)
+        if "›" in raw or re.search(r"(?:^|│)\s*>\s*", raw):
+            focused = len(options) - 1
+    return options, focused
+
+
 def invalidate_backend_cache(backend: str | None = None) -> None:
     """Drop version-derived provider data before an explicit runtime refresh."""
     global _freebuff_catalog_cache
@@ -1064,6 +1087,8 @@ class FreebuffWorker(threading.Thread):
             self._on_failed("FreeBuff is not installed. Run: npm install -g freebuff")
             return
         try:
+            models, _efforts, current_model, _effort, _error = freebuff_model_options()
+            self._model = self._model or current_model or FREEBUFF_PREFERRED_MODEL
             set_freebuff_model(self._model)
         except OSError as exc:
             self._on_failed(f"Could not select the FreeBuff model: {exc}")
@@ -1110,6 +1135,8 @@ class FreebuffWorker(threading.Thread):
         pending_sections: Optional[tuple[str, str]] = None
         screen_changed_at = time.monotonic()
         accepted_recommended_model = False
+        picker_expanded = False
+        picker_expanded_at = 0.0
         saw_busy = False
         session_reported = bool(self._session_id)
         next_session_check = time.monotonic()
@@ -1133,9 +1160,38 @@ class FreebuffWorker(threading.Thread):
             # Accept its highlighted recommended model so the hidden terminal
             # reaches the composer; later launches remember the selection.
             if not accepted_recommended_model and not sent and "RECOMMENDED" in last_visible:
-                self._write("\r")
-                accepted_recommended_model = True
-                continue
+                picker_models, focused = _freebuff_picker_options(last_visible, models)
+                if (
+                    self._model in picker_models
+                    and focused >= 0
+                    and picker_models[focused] == self._model
+                ):
+                    self._write("\r")
+                    accepted_recommended_model = True
+                    continue
+                if not picker_expanded:
+                    # Move from the recommended card to "See all models" and
+                    # open it. The expanded picker is then navigated from its
+                    # actual runtime ordering, so model catalog changes do not
+                    # require a BlindPilot update.
+                    self._write("\x1b[B")
+                    time.sleep(0.05)
+                    self._write("\r")
+                    picker_expanded = True
+                    picker_expanded_at = time.monotonic()
+                    continue
+                if self._model in picker_models and focused >= 0:
+                    target = picker_models.index(self._model)
+                    arrow = "\x1b[B" if target > focused else "\x1b[A"
+                    for _step in range(abs(target - focused)):
+                        self._write(arrow)
+                        time.sleep(0.05)
+                    self._write("\r")
+                    accepted_recommended_model = True
+                    continue
+                if time.monotonic() - picker_expanded_at >= 5:
+                    self._on_failed(f"FreeBuff's model picker did not offer {self._model}")
+                    return
 
             at_prompt = bool(self._PROMPT_RE.search(last_visible))
             busy = bool(self._BUSY_RE.search(last_visible))
