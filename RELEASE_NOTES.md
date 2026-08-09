@@ -1,10 +1,24 @@
-# BlindPilot 0.3.2
+# BlindPilot 0.3.3
 
 BlindPilot is an accessible desktop reader for Claude Code, Codex, and FreeBuff. It is
 based on Claude Code Reader and remains available under the MIT License, with credit to
 the original project throughout the application and documentation.
 
-## FreeBuff reliability update
+## Updater reliability
+
+- BlindPilot now forces its main window through the normal shutdown path after an update
+  is verified, so the installed application releases its files before replacement.
+- The Windows updater stages a complete new installation, waits for the old process to
+  exit, swaps directories, and then launches and checks the new version.
+- If shutdown stalls, the helper uses a bounded forced-close fallback without replacing
+  files while the old process is still running.
+- Failed replacement or startup restores and reopens the previous version instead of
+  leaving a partial installation.
+- Obsolete files from older PyInstaller builds are removed by the full-directory swap.
+- Installer startup failures are now reported through BlindPilot's accessible update
+  error dialog.
+
+## Included from 0.3.2
 
 - Long-running FreeBuff tasks now report agent/tool activity and a progress heartbeat
   every 30 seconds instead of appearing frozen.

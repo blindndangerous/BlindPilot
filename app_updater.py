@@ -242,18 +242,90 @@ _WINDOWS_HELPER = r"""param(
     [Parameter(Mandatory=$true)][string]$Executable
 )
 $ErrorActionPreference = "Stop"
-Wait-Process -Id $ParentPid -ErrorAction SilentlyContinue
 $stage = Join-Path ([IO.Path]::GetTempPath()) ("BlindPilot-stage-" + [guid]::NewGuid())
+$installParent = Split-Path -Parent $InstallDir
+$installName = Split-Path -Leaf $InstallDir
+$token = [guid]::NewGuid().ToString("N")
+$incoming = Join-Path $installParent ($installName + ".update-new-" + $token)
+$backup = Join-Path $installParent ($installName + ".update-backup-" + $token)
+$oldMoved = $false
+$replacementActive = $false
+$parent = Get-Process -Id $ParentPid -ErrorAction SilentlyContinue
+$parentStarted = if ($null -ne $parent) { $parent.StartTime } else { $null }
 try {
     New-Item -ItemType Directory -Path $stage | Out-Null
     Expand-Archive -LiteralPath $Archive -DestinationPath $stage -Force
     $source = Join-Path $stage "BlindPilot"
-    if (-not (Test-Path -LiteralPath (Join-Path $source "BlindPilot.exe"))) {
-        throw "The update archive does not contain BlindPilot.exe"
+    if (-not (Test-Path -LiteralPath (Join-Path $source $Executable) -PathType Leaf)) {
+        throw "The update archive does not contain $Executable"
     }
-    Get-ChildItem -LiteralPath $source -Force | Copy-Item -Destination $InstallDir -Recurse -Force
-    Start-Process -FilePath (Join-Path $InstallDir $Executable)
+
+    # Prepare a complete sibling installation before touching the live one.
+    # Keeping it on the install volume makes both directory moves atomic.
+    Copy-Item -LiteralPath $source -Destination $incoming -Recurse -Force
+
+    # Give BlindPilot time to run its normal close handler. If a worker or
+    # window prevents shutdown, stop this exact PID before replacing files.
+    $parent = Get-Process -Id $ParentPid -ErrorAction SilentlyContinue
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    while ($null -ne $parent) {
+        if ($null -ne $parentStarted -and $parent.StartTime -ne $parentStarted) {
+            break
+        }
+        if ([DateTime]::UtcNow -ge $deadline) {
+            Stop-Process -Id $ParentPid -Force -ErrorAction SilentlyContinue
+            Wait-Process -Id $ParentPid -ErrorAction SilentlyContinue
+            break
+        }
+        Start-Sleep -Milliseconds 200
+        $parent = Get-Process -Id $ParentPid -ErrorAction SilentlyContinue
+    }
+
+    if (Test-Path -LiteralPath $InstallDir) {
+        Move-Item -LiteralPath $InstallDir -Destination $backup
+        $oldMoved = $true
+    }
+    Move-Item -LiteralPath $incoming -Destination $InstallDir
+    $replacementActive = $true
+
+    $newProcess = Start-Process `
+        -FilePath (Join-Path $InstallDir $Executable) `
+        -WorkingDirectory $InstallDir `
+        -PassThru
+    Start-Sleep -Seconds 2
+    $newProcess.Refresh()
+    if ($newProcess.HasExited) {
+        throw "The new BlindPilot version exited during startup"
+    }
+
+    # A successful process creation completes the handoff. Backup cleanup is
+    # deliberately best-effort so it cannot roll back a running new version.
+    Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue
+    $oldMoved = $false
+} catch {
+    $failure = $_
+    if ($replacementActive -and (Test-Path -LiteralPath $InstallDir)) {
+        Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if ($oldMoved -and (Test-Path -LiteralPath $backup)) {
+        Move-Item -LiteralPath $backup -Destination $InstallDir -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath (Join-Path $InstallDir $Executable) -PathType Leaf) {
+            Start-Process `
+                -FilePath (Join-Path $InstallDir $Executable) `
+                -WorkingDirectory $InstallDir `
+                -ErrorAction SilentlyContinue
+        }
+    } elseif (-not (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue)) {
+        if (Test-Path -LiteralPath (Join-Path $InstallDir $Executable) -PathType Leaf) {
+            Start-Process `
+                -FilePath (Join-Path $InstallDir $Executable) `
+                -WorkingDirectory $InstallDir `
+                -ErrorAction SilentlyContinue
+        }
+    }
+    throw $failure
 } finally {
+    Remove-Item -LiteralPath $incoming -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $Archive -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
@@ -266,7 +338,25 @@ set -eu
 parent_pid="$1"
 archive="$2"
 app_path="$3"
-while kill -0 "$parent_pid" 2>/dev/null; do sleep 1; done
+waited=0
+while kill -0 "$parent_pid" 2>/dev/null; do
+    if [ "$waited" -ge 30 ]; then
+        kill -TERM "$parent_pid" 2>/dev/null || true
+        sleep 2
+        kill -KILL "$parent_pid" 2>/dev/null || true
+        forced_wait=0
+        while kill -0 "$parent_pid" 2>/dev/null && [ "$forced_wait" -lt 10 ]; do
+            sleep 1
+            forced_wait=$((forced_wait + 1))
+        done
+        if kill -0 "$parent_pid" 2>/dev/null; then
+            exit 1
+        fi
+        break
+    fi
+    sleep 1
+    waited=$((waited + 1))
+done
 stage="$(mktemp -d "${TMPDIR:-/tmp}/BlindPilot-stage.XXXXXX")"
 backup="${app_path}.update-backup"
 cleanup() { rm -rf "$stage" "$archive" "$0"; }
@@ -294,40 +384,47 @@ def schedule_install(archive: Path) -> None:
     executable = Path(sys.executable).resolve()
     if platform.system() == "Windows":
         install_dir = executable.parent
-        fd, helper_name = tempfile.mkstemp(prefix="BlindPilot-update-", suffix=".ps1")
-        os.close(fd)
-        helper = Path(helper_name)
-        helper.write_text(_WINDOWS_HELPER, encoding="utf-8-sig")
-        powershell = os.environ.get("SystemRoot", r"C:\Windows")
-        powershell = str(
-            Path(powershell) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
-        )
-        subprocess.Popen(
-            [
-                powershell,
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-WindowStyle",
-                "Hidden",
-                "-File",
-                str(helper),
-                "-ParentPid",
-                str(os.getpid()),
-                "-Archive",
-                str(archive),
-                "-InstallDir",
-                str(install_dir),
-                "-Executable",
-                executable.name,
-            ],
-            creationflags=(
-                getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                | getattr(subprocess, "DETACHED_PROCESS", 0)
-            ),
-            close_fds=True,
-        )
+        helper: Optional[Path] = None
+        try:
+            fd, helper_name = tempfile.mkstemp(prefix="BlindPilot-update-", suffix=".ps1")
+            os.close(fd)
+            helper = Path(helper_name)
+            helper.write_text(_WINDOWS_HELPER, encoding="utf-8-sig")
+            powershell = os.environ.get("SystemRoot", r"C:\Windows")
+            powershell = str(
+                Path(powershell) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+            )
+            subprocess.Popen(
+                [
+                    powershell,
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-WindowStyle",
+                    "Hidden",
+                    "-File",
+                    str(helper),
+                    "-ParentPid",
+                    str(os.getpid()),
+                    "-Archive",
+                    str(archive),
+                    "-InstallDir",
+                    str(install_dir),
+                    "-Executable",
+                    executable.name,
+                ],
+                creationflags=(
+                    getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                    | getattr(subprocess, "DETACHED_PROCESS", 0)
+                ),
+                close_fds=True,
+                cwd=tempfile.gettempdir(),
+            )
+        except (OSError, ValueError) as exc:
+            if helper is not None:
+                helper.unlink(missing_ok=True)
+            raise UpdateError(f"Could not start the update installer: {exc}") from exc
         return
     if platform.system() == "Darwin":
         app_path = next(
@@ -336,15 +433,22 @@ def schedule_install(archive: Path) -> None:
         )
         if app_path is None:
             raise UpdateError("BlindPilot is not running from an application bundle.")
-        fd, helper_name = tempfile.mkstemp(prefix="BlindPilot-update-", suffix=".sh")
-        os.close(fd)
-        helper = Path(helper_name)
-        helper.write_text(_MACOS_HELPER, encoding="utf-8")
-        helper.chmod(0o700)
-        subprocess.Popen(
-            ["/bin/sh", str(helper), str(os.getpid()), str(archive), str(app_path)],
-            start_new_session=True,
-            close_fds=True,
-        )
+        helper = None
+        try:
+            fd, helper_name = tempfile.mkstemp(prefix="BlindPilot-update-", suffix=".sh")
+            os.close(fd)
+            helper = Path(helper_name)
+            helper.write_text(_MACOS_HELPER, encoding="utf-8")
+            helper.chmod(0o700)
+            subprocess.Popen(
+                ["/bin/sh", str(helper), str(os.getpid()), str(archive), str(app_path)],
+                start_new_session=True,
+                close_fds=True,
+                cwd=tempfile.gettempdir(),
+            )
+        except (OSError, ValueError) as exc:
+            if helper is not None:
+                helper.unlink(missing_ok=True)
+            raise UpdateError(f"Could not start the update installer: {exc}") from exc
         return
     raise UpdateError("Automatic installation is not supported on this platform.")

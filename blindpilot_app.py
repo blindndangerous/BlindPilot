@@ -148,7 +148,7 @@ def announce(text: str) -> None:
 
 
 APP_NAME = "BlindPilot"
-APP_VERSION = "0.3.2"
+APP_VERSION = "0.3.3"
 ORIGINAL_APP_CREDIT = (
     "Based on the original Claude Code Reader application by doubletaponair.\n"
     "https://github.com/doubletaponair/claude-code-reader"
@@ -4159,7 +4159,10 @@ class MainFrame(wx.Frame):
         self._announce_setting(
             f"BlindPilot {release.version} is verified. Restarting to install it."
         )
-        wx.CallAfter(self.Close)
+        # Force the top-level frame through its normal close handler now. The
+        # detached installer waits for this process and has a bounded forced
+        # shutdown fallback before it replaces any application files.
+        self.Close(force=True)
 
     def _show_update_error(self, message: str) -> None:
         self._announce_setting(f"Update error: {message}")
