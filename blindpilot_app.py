@@ -62,10 +62,12 @@ from agent_backends import (
     backend_label,
     blindpilot_config_dir,
     codex_model_options,
+    discard_freebuff_prewarm,
     find_backend_cli,
     freebuff_model_options,
     invalidate_backend_cache,
     normalize_backend,
+    prewarm_freebuff,
     reserve_hidden_console,
     set_freebuff_model,
     worker_class,
@@ -150,7 +152,7 @@ def announce(text: str) -> None:
 
 
 APP_NAME = "BlindPilot"
-APP_VERSION = "0.3.7"
+APP_VERSION = "0.3.8"
 ORIGINAL_APP_CREDIT = (
     "Based on the original Claude Code Reader application by doubletaponair.\n"
     "https://github.com/doubletaponair/claude-code-reader"
@@ -1414,12 +1416,14 @@ def create_desktop_shortcut() -> str:
 
 
 def _flatten(text: str) -> str:
-    """Drop all whitespace, for comparing two copies of the same answer.
+    """Reduce to letters and digits, for comparing two copies of one answer.
 
     Backends assemble their final text from the same pieces they streamed, but
-    not always with the same joins, so only the characters can be compared.
+    not always with the same joins, and one that streams from a rendered
+    terminal streams the text without its Markdown, so neither the whitespace
+    nor the punctuation can be relied on to match.
     """
-    return "".join(text.split())
+    return "".join(character.casefold() for character in text if character.isalnum())
 
 
 def _result_label(text: str) -> str:
@@ -2400,6 +2404,11 @@ class SessionPanel(wx.Panel):
         if selected != self._session_backend and self._session_id:
             suffix = " — new conversation on next send"
         self.backend_status.SetLabel(f"Backend: {backend_label(selected)}{suffix}")
+        if selected == BACKEND_FREEBUFF:
+            # FreeBuff's terminal takes seconds to reach the point where it can
+            # be given a message. Start one now, so the first message of the
+            # conversation does not spend that wait in silence.
+            prewarm_freebuff(self.cwd, self._session_id, self.model)
         supports_permissions = selected != BACKEND_FREEBUFF
         self.mode_picker.Enable(supports_permissions)
         if supports_permissions:
@@ -2489,6 +2498,10 @@ class SessionPanel(wx.Panel):
         if self.selected_backend() == BACKEND_FREEBUFF and model != self.model:
             self._session_id = None
             self._announce("FreeBuff model changed; the next message starts a new conversation.")
+            # Whatever terminal was waiting was started on the old model, and
+            # FreeBuff reads that at launch, so it cannot serve the new one.
+            discard_freebuff_prewarm()
+            prewarm_freebuff(self.cwd, None, model)
         self.model = model
         self.effort = effort
         self._announce(f"Using {self._model_summary()} from your next message.")

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import platform
+import threading
+import time
 from types import SimpleNamespace
 
 import agent_backends
@@ -221,25 +224,143 @@ Enter a coding task or / for commands
     assert answer == "BlindPilot FreeBuff adapter ready."
 
 
-def test_freebuff_live_delta_ignores_terminal_redraw_replacements():
+def test_freebuff_reads_the_answer_as_the_terminal_paints_it():
+    """The chat file is only saved once the reply is finished.
+
+    Everything read out while a turn is running therefore comes off the screen,
+    one finished sentence at a time, and each frame must add to the reading
+    rather than repeat it.
+    """
     events = []
     callbacks = _callbacks()
     callbacks["on_activity"] = lambda kind, value: events.append((kind, value))
-    worker = FreebuffWorker(
-        "test",
-        None,
-        ".",
-        "default",
-        **callbacks,
+    worker = FreebuffWorker("test", None, ".", "default", **callbacks)
+
+    spoken = worker._emit_screen_delta("assistant", "", "The sky is blue. Sunlight is")
+    assert events == [("assistant", "The sky is blue.")]
+    assert spoken == "The sky is blue."
+
+    # The rest of that sentence is still half-written, so nothing new is read.
+    spoken = worker._emit_screen_delta("assistant", spoken, "The sky is blue. Sunlight is made")
+    assert len(events) == 1
+
+    spoken = worker._emit_screen_delta(
+        "assistant", spoken, "The sky is blue. Sunlight is made of many colors. And"
+    )
+    assert events[-1] == ("assistant", "Sunlight is made of many colors.")
+
+    # The terminal repaints from nothing between frames; that is not an answer.
+    assert worker._emit_screen_delta("assistant", spoken, "The sky is") == spoken
+    assert len(events) == 2
+
+    # The turn ends holding a sentence that never finished. It is still the
+    # answer, so it is released whole.
+    worker._emit_screen_delta(
+        "assistant",
+        spoken,
+        "The sky is blue. Sunlight is made of many colors. And blue scatters most",
+        whole=True,
+    )
+    assert events[-1] == ("assistant", "And blue scatters most")
+
+
+def test_freebuff_rejoins_lines_the_terminal_wrapped():
+    """A wrapped line is not the end of a sentence, and must not read as one."""
+    wrapped = (
+        "Sunlight is made of many colors, and blue scatters more than the\n"
+        "others do.\n"
+        "That is the whole of it."
     )
 
-    assert worker._emit_stable_delta("assistant", "Old answer", "New answer") == "New answer"
-    assert events == []
-    assert (
-        worker._emit_stable_delta("assistant", "New answer", "New answer continued")
-        == "New answer continued"
+    assert agent_backends._unwrap_screen_text(wrapped) == (
+        "Sunlight is made of many colors, and blue scatters more than the others do.\n"
+        "That is the whole of it."
     )
-    assert events == [("assistant", "continued")]
+
+
+def test_freebuff_keeps_reading_where_it_left_off_after_the_screen_scrolls():
+    """Once the answer is taller than the terminal, the top scrolls away."""
+    assert agent_backends._append_delta("one two three", "one two three four") == "four"
+    assert agent_backends._append_delta("one two three", "two three four") == "four"
+    assert agent_backends._append_delta("one two three", "one two three") == ""
+    assert agent_backends._append_delta("", "one two") == "one two"
+    # The terminal revises where it broke a line as the text below it grows.
+    # The same words rewrapped are not new words.
+    assert agent_backends._append_delta("Tips: 1.", "Tips:\n1.") == ""
+    assert agent_backends._append_delta("Tips: 1.", "Tips:\n1. Be clear.") == "Be clear."
+
+
+def test_freebuff_finishes_reading_an_answer_that_scrolled_out_of_view():
+    """The saved chat is the whole answer; the screen only ever held part.
+
+    What was read came off the terminal, without the Markdown the answer was
+    written in, so the two are compared by their letters and digits alone.
+    """
+    answer = "**Rain** falls. It waters the fields. Then it stops."
+
+    assert agent_backends._unspoken_tail("Rain falls. It waters the fields.", answer) == (
+        "Then it stops."
+    )
+    assert agent_backends._unspoken_tail(answer, answer) == ""
+    assert agent_backends._unspoken_tail("", answer) == answer
+
+
+def test_freebuff_prewarmed_terminal_is_only_taken_for_the_message_it_fits():
+    """A terminal started ahead of time is bound to one conversation.
+
+    FreeBuff is told which chat to resume and which model to use when it starts,
+    so a waiting terminal cannot serve a different one. It also keeps the record
+    of which chats existed before it started, because it creates the chat for a
+    new conversation as it starts, and that record is what identifies it.
+    """
+    killed: list[str] = []
+    holding = {
+        "key": (os.path.abspath("work"), "chat-1", "deepseek/deepseek-v4-pro"),
+        "pty": "terminal",
+        "read": lambda _timeout: "",
+        "ended": threading.Event(),
+        "before": {"chat-0": 1.0},
+        "expires": time.monotonic() + 60,
+    }
+    agent_backends._freebuff_prewarm = holding
+    try:
+        assert (
+            agent_backends._take_freebuff_prewarm("work", "chat-2", "deepseek/deepseek-v4-pro")
+            is None
+        )
+        assert agent_backends._freebuff_prewarm is None
+        assert holding["ended"].is_set()
+
+        holding["ended"] = threading.Event()
+        agent_backends._freebuff_prewarm = holding
+        taken = agent_backends._take_freebuff_prewarm("work", "chat-1", "deepseek/deepseek-v4-pro")
+        assert taken is not None
+        assert taken["pty"] == "terminal"
+        assert taken["before"] == {"chat-0": 1.0}
+        assert not taken["ended"].is_set()
+        assert agent_backends._freebuff_prewarm is None
+    finally:
+        agent_backends._freebuff_prewarm = None
+    assert killed == []
+
+
+def test_freebuff_prewarmed_terminal_is_dropped_once_it_is_too_old():
+    holding = {
+        "key": (os.path.abspath("work"), "", "deepseek/deepseek-v4-pro"),
+        "pty": "terminal",
+        "read": lambda _timeout: "",
+        "ended": threading.Event(),
+        "before": {},
+        "expires": time.monotonic() - 1,
+    }
+    agent_backends._freebuff_prewarm = holding
+    try:
+        assert (
+            agent_backends._take_freebuff_prewarm("work", None, "deepseek/deepseek-v4-pro") is None
+        )
+        assert holding["ended"].is_set()
+    finally:
+        agent_backends._freebuff_prewarm = None
 
 
 def test_freebuff_chat_discovery_searches_all_project_buckets(monkeypatch, tmp_path):

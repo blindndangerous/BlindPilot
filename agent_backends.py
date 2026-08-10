@@ -12,6 +12,7 @@ SPDX-License-Identifier: MIT
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import platform
@@ -502,6 +503,50 @@ def _write_freebuff_choice(model: str) -> None:
         pass
 
 
+def _freebuff_catalog_cache_path() -> Path:
+    return blindpilot_config_dir() / "freebuff-catalog.json"
+
+
+def _read_freebuff_catalog_cache(stamp: tuple[str, float, int]) -> list[str]:
+    """The catalog last read out of this exact FreeBuff release, if any.
+
+    Discovering the catalog means scanning a hundred megabytes of compiled
+    FreeBuff, which takes seconds.  Doing that once per installed release rather
+    than once per run of BlindPilot is the difference between a message that
+    sends immediately and one that waits on a file scan first.
+    """
+    try:
+        payload = json.loads(_freebuff_catalog_cache_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(payload, dict):
+        return []
+    if payload.get("path") != stamp[0] or payload.get("size") != stamp[2]:
+        return []
+    if abs(float(payload.get("mtime") or 0.0) - stamp[1]) > 0.001:
+        return []
+    models = payload.get("models")
+    if not isinstance(models, list):
+        return []
+    return [model for model in models if isinstance(model, str) and model]
+
+
+def _write_freebuff_catalog_cache(stamp: tuple[str, float, int], models: list[str]) -> None:
+    path = _freebuff_catalog_cache_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {"path": stamp[0], "mtime": stamp[1], "size": stamp[2], "models": models},
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
 def _freebuff_package_readme(binary: Optional[str]) -> Optional[Path]:
     if not binary:
         return None
@@ -565,6 +610,10 @@ def _freebuff_models_from_install(binary: Optional[str]) -> list[str]:
     global _freebuff_catalog_cache
     if _freebuff_catalog_cache and _freebuff_catalog_cache[0] == stamp:
         return list(_freebuff_catalog_cache[1])
+    remembered = _read_freebuff_catalog_cache(stamp)
+    if remembered:
+        _freebuff_catalog_cache = (stamp, list(remembered))
+        return list(remembered)
 
     try:
         source = executable.read_bytes().decode("latin-1", errors="ignore")
@@ -605,6 +654,7 @@ def _freebuff_models_from_install(binary: Optional[str]) -> list[str]:
         models.remove(FREEBUFF_PREFERRED_MODEL)
         models.insert(0, FREEBUFF_PREFERRED_MODEL)
     _freebuff_catalog_cache = (stamp, list(models))
+    _write_freebuff_catalog_cache(stamp, list(models))
     return models
 
 
@@ -673,6 +723,10 @@ def invalidate_backend_cache(backend: str | None = None) -> None:
     global _freebuff_catalog_cache
     if backend is None or normalize_backend(backend) == BACKEND_FREEBUFF:
         _freebuff_catalog_cache = None
+        try:
+            _freebuff_catalog_cache_path().unlink()
+        except OSError:
+            pass
 
 
 def set_freebuff_model(model: str) -> None:
@@ -1147,10 +1201,14 @@ def _freebuff_chat_path(cwd: str, session_id: str) -> Optional[Path]:
 
 _FREEBUFF_INTERRUPTED = "[response interrupted]"
 
-# How long the chat file must stop changing before what it holds is narrated.
-# Long enough that a streamed sentence arrives whole, short enough that the run
-# still reads as it happens.
-_FREEBUFF_SETTLE_SECONDS = 0.7
+# How long a frame must hold still before it is read out. The terminal repaints
+# in bursts, so this is only long enough to let one burst land whole.
+_FREEBUFF_FRAME_SECONDS = 0.1
+
+# Never wait longer than this to read out a finished sentence, however busy the
+# repainting is. Text that arrives faster than the frames settle would otherwise
+# never reach the listener until the turn ended.
+_FREEBUFF_MAX_LAG_SECONDS = 0.4
 
 # Sentence-ending punctuation, or the end of a paragraph, either of which is a
 # place a listener expects the reading to stop.
@@ -1161,6 +1219,108 @@ def _complete_sentences(text: str) -> str:
     """The part of ``text`` that reads as finished, or nothing yet."""
     match = _SENTENCE_END_RE.search(text)
     return match.group(0).rstrip() if match else ""
+
+
+def _unwrap_screen_text(text: str) -> str:
+    """Rejoin the lines the terminal broke, keeping the ones the answer meant.
+
+    A captured frame is text laid out to the width of FreeBuff's box, so most of
+    its newlines belong to the terminal rather than the answer.  Left in, every
+    one of them reads as the end of a sentence, and the reading stops in the
+    middle of a clause.  A line that runs the full width was broken because it
+    ran out of room and continues below; a short one ended because the text did.
+    """
+    lines = [line.rstrip() for line in text.splitlines()]
+    if len(lines) < 2:
+        return text.strip()
+    width = max(len(line) for line in lines)
+    if width < 24:
+        return text.strip()
+    pieces: list[str] = []
+    for index, line in enumerate(lines[:-1]):
+        pieces.append(line)
+        following = lines[index + 1]
+        wrapped = bool(line) and bool(following) and len(line) >= width - 12
+        pieces.append(" " if wrapped else "\n")
+    pieces.append(lines[-1])
+    return "".join(pieces).strip()
+
+
+def _keyed(text: str, letters_only: bool = False) -> tuple[str, list[int]]:
+    """A comparable form of ``text``, and where each kept character came from.
+
+    Whitespace always goes, because the terminal decides where the answer
+    breaks its lines and revises that as the text grows: the same words can be
+    one line in one frame and two in the next. Dropping everything except
+    letters and digits goes further, and makes the answer as the terminal drew
+    it comparable with the Markdown it was drawn from.
+    """
+    kept: list[str] = []
+    positions: list[int] = []
+    for index, character in enumerate(text):
+        if character.isspace() or (letters_only and not character.isalnum()):
+            continue
+        kept.append(character.casefold() if letters_only else character)
+        positions.append(index)
+    positions.append(len(text))
+    return "".join(kept), positions
+
+
+def _unspoken_tail(narrated: str, answer: str) -> str:
+    """The part of the finished answer that was never read out.
+
+    What was read came off the screen, laid out for a terminal; the finished
+    answer comes from the saved chat, written as Markdown. Comparing only the
+    letters and digits is what makes the two comparable, so that an answer
+    which scrolled out of view while it was being written is still finished
+    aloud, and one that was read in full is not read twice.
+    """
+    spoken_key, _spoken_positions = _keyed(narrated, letters_only=True)
+    answer_key, positions = _keyed(answer, letters_only=True)
+    if not answer_key:
+        return ""
+    if not spoken_key:
+        return answer.strip()
+    if answer_key.startswith(spoken_key):
+        return answer[positions[len(spoken_key)] :].strip()
+    if answer_key in spoken_key:
+        return ""
+    # The two do not line up at all, which means the reading was of something
+    # else. Reading the answer again is better than never reading it.
+    return answer.strip()
+
+
+def _append_delta(spoken: str, current: str) -> str:
+    """The part of ``current`` that has not been read out yet.
+
+    The screen is a window onto the answer, not the whole of it: once the answer
+    is taller than the terminal, the top scrolls away and a frame becomes a
+    continuation rather than an extension.  Matching the longest overlap between
+    the end of what was read and the start of what is on screen keeps the
+    reading in one piece across that scroll, instead of repeating a paragraph or
+    silently dropping one.
+    """
+    if not current:
+        return ""
+    if not spoken:
+        return current
+    spoken_key, _spoken_positions = _keyed(spoken)
+    current_key, positions = _keyed(current)
+    if not current_key:
+        return ""
+    if current_key.startswith(spoken_key):
+        return current[positions[len(spoken_key)] :]
+    # The tail of what was read is normally still on screen, so find it there
+    # first; that is one string search rather than a scan over every overlap.
+    anchor = spoken_key[-160:]
+    if anchor:
+        position = current_key.rfind(anchor)
+        if position >= 0:
+            return current[positions[position + len(anchor)] :]
+    for size in range(min(len(spoken_key), len(current_key), 400), 0, -1):
+        if spoken_key.endswith(current_key[:size]):
+            return current[positions[size] :]
+    return current
 
 
 def _freebuff_answer_message(payload: object) -> Optional[dict]:
@@ -1246,6 +1406,25 @@ def _freebuff_chat_snapshot(
     return message_id, "\n\n".join(thinking), "\n\n".join(answer), agents
 
 
+def _freebuff_chat_stamp(chat: Optional[Path]) -> tuple:
+    """A cheap fingerprint of a chat's files, to skip re-reading them.
+
+    The loop looks at the chat many times a second so that the end of a turn is
+    noticed the moment it happens; asking the filesystem what changed is orders
+    of magnitude cheaper than parsing the whole conversation to find out.
+    """
+    if chat is None:
+        return ()
+    marks: list[tuple[int, int]] = []
+    for name in ("chat-messages.json", "log.jsonl"):
+        try:
+            stat = (chat / name).stat()
+            marks.append((stat.st_mtime_ns, stat.st_size))
+        except OSError:
+            marks.append((0, 0))
+    return tuple(marks)
+
+
 def _freebuff_run_status(chat: Optional[Path], offset: int = 0) -> str:
     """Return complete/cancelled from FreeBuff's authoritative per-chat log."""
     if chat is None:
@@ -1261,6 +1440,225 @@ def _freebuff_run_status(chat: Optional[Path], offset: int = 0) -> str:
     if "Main prompt finished" in tail:
         return "complete"
     return ""
+
+
+def _spawn_freebuff_pty(
+    args: list[str], cwd: str, stream_ended: threading.Event
+) -> tuple[object, Callable[[float], str]]:
+    """Start FreeBuff under a pseudo-terminal, off screen, and read it.
+
+    Returns the terminal and a call that yields whatever it has produced.
+    Output is pumped into a queue by a thread of its own, so a terminal that
+    started before anyone asked for its output keeps every byte of it.
+    """
+    if platform.system() == "Windows":
+        from winpty import PtyProcess
+
+        # Own the console before the terminal asks for one, so none is
+        # created on screen. The watcher below is the safety net for the
+        # consoles FreeBuff's own tools can still raise.
+        reserve_hidden_console()
+        roots = {os.getpid()}
+        holder: dict[str, object] = {}
+
+        def hide_terminal() -> None:
+            # Poll hard while the terminal is starting, then slowly: the
+            # tools FreeBuff itself starts can each raise a console of
+            # their own, and any of them would take the reader's focus.
+            # Tearing the terminal down raises one last console, after the
+            # output has stopped, so this outlives the stream it guards.
+            started = time.monotonic()
+            grace_until: Optional[float] = None
+            while True:
+                now = time.monotonic()
+                if stream_ended.is_set():
+                    if grace_until is None:
+                        grace_until = now + 5
+                    elif now > grace_until:
+                        return
+                try:
+                    hide_console_windows(roots)
+                except Exception:
+                    # Never let this thread die: it is the only thing
+                    # keeping the terminal off the screen for the whole run.
+                    pass
+                quick = now - started < 8 or grace_until is not None
+                time.sleep(0.005 if quick else 0.25)
+
+        threading.Thread(target=hide_terminal, daemon=True).start()
+
+        # pywinpty accepts an argv list and supplies a real ConPTY console.
+        pty = PtyProcess.spawn(args, dimensions=(60, 180), cwd=cwd)
+        holder["pty"] = pty
+        pty_pid = getattr(pty, "pid", 0)
+        if pty_pid:
+            roots.add(int(pty_pid))
+        chunks: queue.Queue[str] = queue.Queue()
+
+        def pump() -> None:
+            try:
+                while pty.isalive():
+                    try:
+                        data = pty.read(4096)
+                    except Exception:
+                        break
+                    if data:
+                        chunks.put(data)
+            finally:
+                # Nothing more will ever arrive. Saying so turns a terminal
+                # that died at startup into a reported failure instead of an
+                # hour of silence.
+                stream_ended.set()
+
+        threading.Thread(target=pump, daemon=True).start()
+
+        def read(timeout: float) -> str:
+            try:
+                return chunks.get(timeout=timeout)
+            except queue.Empty:
+                return ""
+
+        return pty, read
+
+    import pexpect
+
+    child = pexpect.spawn(
+        args[0],
+        args[1:],
+        cwd=cwd,
+        encoding="utf-8",
+        dimensions=(60, 180),
+        timeout=0.25,
+    )
+
+    def read_posix(timeout: float) -> str:
+        try:
+            return child.read_nonblocking(4096, timeout=timeout)
+        except pexpect.TIMEOUT:
+            return ""
+        except pexpect.EOF:
+            stream_ended.set()
+            return ""
+
+    return child, read_posix
+
+
+# A FreeBuff terminal takes seconds to reach its composer, and that wait is the
+# largest part of how long a message takes to start answering. One is therefore
+# started ahead of time, for the conversation the next message will most likely
+# continue, and handed to the run that claims it.
+_FREEBUFF_PREWARM_LOCK = threading.Lock()
+_freebuff_prewarm: Optional[dict] = None
+# Long enough to cover thinking time between messages, short enough that an
+# abandoned terminal does not sit there all day.
+_FREEBUFF_PREWARM_TTL = 15 * 60
+
+
+def _kill_pty(pty: object) -> None:
+    for method, arguments in (("terminate", (True,)), ("close", (True,))):
+        call = getattr(pty, method, None)
+        if call is None:
+            continue
+        try:
+            call(*arguments)
+            return
+        except Exception:
+            continue
+
+
+def discard_freebuff_prewarm() -> None:
+    """Throw away any terminal held for the next message."""
+    global _freebuff_prewarm
+    with _FREEBUFF_PREWARM_LOCK:
+        holding, _freebuff_prewarm = _freebuff_prewarm, None
+    if holding is not None:
+        holding["ended"].set()
+        _kill_pty(holding["pty"])
+
+
+def prewarm_freebuff(cwd: str, session_id: Optional[str], model: str, delay: float = 0.0) -> None:
+    """Start the terminal the next FreeBuff message will use.
+
+    Doing nothing here is always safe: a message that finds no terminal waiting,
+    or one started for a different conversation, simply starts its own.
+    """
+    binary = find_backend_cli(BACKEND_FREEBUFF)
+    if not binary:
+        return
+    key = (os.path.abspath(cwd), session_id or "", model or _read_freebuff_choice())
+    with _FREEBUFF_PREWARM_LOCK:
+        holding = _freebuff_prewarm
+        if holding is not None and holding["key"] == key and not holding["ended"].is_set():
+            # One is already waiting for exactly this. Starting another would
+            # throw away a terminal that has finished starting for one that has
+            # not, which is the opposite of the point.
+            return
+
+    def work() -> None:
+        if delay:
+            time.sleep(delay)
+        # FreeBuff reads the selected model once, at launch, and rewrites the
+        # setting to its own recommendation after a turn. Applying the choice
+        # before the terminal starts is what makes a waiting one usable.
+        try:
+            set_freebuff_model(key[2])
+        except OSError:
+            return
+        args = [binary, "--cwd", cwd]
+        if session_id:
+            args.extend(["--continue", session_id])
+        # A new conversation's chat is created when the terminal starts, not
+        # when it is given a message, so the record of which chats existed
+        # beforehand has to be taken here. Taken later it would already include
+        # this one, and the message would finish without ever learning the id of
+        # the conversation it had just had.
+        before = _freebuff_chat_dirs(cwd)
+        ended = threading.Event()
+        try:
+            pty, read = _spawn_freebuff_pty(args, cwd, ended)
+        except Exception:
+            return
+        holding = {
+            "key": key,
+            "pty": pty,
+            "read": read,
+            "ended": ended,
+            "before": before,
+            "expires": time.monotonic() + _FREEBUFF_PREWARM_TTL,
+        }
+        stale = None
+        with _FREEBUFF_PREWARM_LOCK:
+            global _freebuff_prewarm
+            stale, _freebuff_prewarm = _freebuff_prewarm, holding
+        if stale is not None:
+            stale["ended"].set()
+            _kill_pty(stale["pty"])
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+def _take_freebuff_prewarm(cwd: str, session_id: Optional[str], model: str) -> Optional[dict]:
+    """Claim the waiting terminal, if it is the one this message needs."""
+    key = (os.path.abspath(cwd), session_id or "", model)
+    global _freebuff_prewarm
+    with _FREEBUFF_PREWARM_LOCK:
+        holding = _freebuff_prewarm
+        if holding is None:
+            return None
+        expired = time.monotonic() > holding["expires"]
+        if holding["key"] != key or expired or holding["ended"].is_set():
+            # Whatever is waiting cannot serve this message. Drop it rather
+            # than leave a terminal running for a conversation nobody resumed.
+            _freebuff_prewarm = None
+        else:
+            _freebuff_prewarm = None
+            return holding
+    holding["ended"].set()
+    _kill_pty(holding["pty"])
+    return None
+
+
+atexit.register(discard_freebuff_prewarm)
 
 
 class FreebuffWorker(threading.Thread):
@@ -1310,6 +1708,10 @@ class FreebuffWorker(threading.Thread):
         self._pty = None
         # Set once the terminal can produce no further output.
         self._stream_ended = threading.Event()
+        # Everything read out this turn, and the frame each kind is waiting to
+        # see a second time before believing it.
+        self._narrated: dict[str, str] = {}
+        self._pending_frame: dict[str, str] = {}
 
     def accepting_input(self) -> bool:
         return self._accepting_input.is_set() and not self._cancelled
@@ -1363,13 +1765,17 @@ class FreebuffWorker(threading.Thread):
         if not binary:
             self._on_failed("FreeBuff is not installed. Run: npm install -g freebuff")
             return
+        # Reading the model catalog means scanning the whole of FreeBuff, which
+        # is far too slow to do before sending a message. The recorded choice is
+        # all that is needed here; the catalog is only fetched if the model
+        # picker actually appears, which happens on a first launch.
         try:
-            models, _efforts, current_model, _effort, _error = freebuff_model_options()
-            self._model = self._model or current_model or FREEBUFF_PREFERRED_MODEL
+            self._model = self._model or _read_freebuff_choice() or FREEBUFF_PREFERRED_MODEL
             set_freebuff_model(self._model)
         except OSError as exc:
             self._on_failed(f"Could not select the FreeBuff model: {exc}")
             return
+        models: list[str] = []
         before = _freebuff_chat_dirs(self._cwd)
         chat_path = _freebuff_chat_path(self._cwd, self._session_id or "")
         log_offset = 0
@@ -1381,17 +1787,31 @@ class FreebuffWorker(threading.Thread):
         args = [binary, "--cwd", self._cwd]
         if self._session_id:
             args.extend(["--continue", self._session_id])
-        try:
-            read = self._spawn_pty(args)
-        except ImportError:
-            package = "pywinpty" if platform.system() == "Windows" else "pexpect"
-            self._on_failed(
-                f"FreeBuff support needs {package} and pyte. Reinstall BlindPilot dependencies."
-            )
-            return
-        except Exception as exc:
-            self._on_failed(f"Failed to launch FreeBuff: {exc}")
-            return
+        waiting = _take_freebuff_prewarm(self._cwd, self._session_id, self._model)
+        adopted = waiting is not None
+        if waiting is not None:
+            # A terminal was started for this conversation while the message was
+            # being typed, and has been buffering its output ever since. Taking
+            # it saves the whole of FreeBuff's start-up. Its own record of the
+            # chats that existed before it started is what identifies the new
+            # conversation, since it created that chat when it started.
+            self._pty = waiting["pty"]
+            read = waiting["read"]
+            self._stream_ended = waiting["ended"]
+            before = waiting["before"]
+        else:
+            try:
+                read = self._spawn_pty(args)
+            except ImportError:
+                package = "pywinpty" if platform.system() == "Windows" else "pexpect"
+                self._on_failed(
+                    f"FreeBuff support needs {package} and pyte. Reinstall BlindPilot dependencies."
+                )
+                return
+            except Exception as exc:
+                self._on_failed(f"Failed to launch FreeBuff: {exc}")
+                return
+        adopted_at = time.monotonic()
 
         try:
             import pyte
@@ -1404,21 +1824,21 @@ class FreebuffWorker(threading.Thread):
         started = False
         ready_since: Optional[float] = None
         last_visible = ""
-        last_thinking = ""
-        last_answer = ""
-        structured_thinking = ""
+        # What has been read out already, in the shape the screen paints it, so
+        # the next frame can be compared against it.
+        spoken_thinking = ""
+        spoken_answer = ""
+        last_emit_at = 0.0
         structured_answer = ""
-        # What the chat file last held, and when it may be narrated.
-        seen_thinking = ""
-        seen_answer = ""
-        settle_deadline = 0.0
         # A resumed chat already holds the previous turn's answer. Remember its
         # id so it is never mistaken for this turn's, and so the real answer is
         # recognised as new the moment FreeBuff writes it.
         baseline_answer_id = _freebuff_answer_id(chat_path)
         structured_answer_id = ""
+        chat_stamp: tuple = ()
+        run_status = ""
         agent_states: dict[str, str] = {}
-        pending_sections: Optional[tuple[str, str]] = None
+        screen_dirty = False
         screen_changed_at = time.monotonic()
         accepted_recommended_model = False
         picker_expanded = False
@@ -1431,8 +1851,49 @@ class FreebuffWorker(threading.Thread):
         completion_seen_at: Optional[float] = None
         deadline = time.monotonic() + 60 * 60
 
+        def restart() -> Optional[Callable[[float], str]]:
+            """Replace a terminal that was waiting and is no longer usable.
+
+            One started ahead of time can have been sitting for a quarter of an
+            hour, and can have died or moved on in that time. Starting again
+            costs the usual wait; refusing to would cost the message.
+            """
+            nonlocal before
+            _kill_pty(self._pty)
+            before = _freebuff_chat_dirs(self._cwd)
+            self._stream_ended = threading.Event()
+            try:
+                return self._spawn_pty(args)
+            except Exception as exc:
+                self._on_failed(f"Failed to launch FreeBuff: {exc}")
+                return None
+
         while not self._cancelled and time.monotonic() < deadline:
-            chunk = read(0.25)
+            # Short enough that a frame is picked up as soon as it lands. The
+            # answer is read off the screen, so this interval is the floor on
+            # how quickly a finished sentence can reach the listener.
+            chunk = read(0.03)
+            if chunk:
+                # Take everything already waiting as one frame. A repaint
+                # arrives as a burst of small writes, and feeding them one at a
+                # time would mean laying out the screen over and over.
+                for _ in range(256):
+                    more = read(0)
+                    if not more:
+                        break
+                    chunk += more
+            stale = adopted and not sent and time.monotonic() - adopted_at >= 12
+            if stale or (not chunk and self._stream_ended.is_set() and not sent and adopted):
+                adopted = False
+                replacement = restart()
+                if replacement is None:
+                    return
+                read = replacement
+                screen = pyte.HistoryScreen(180, 60, history=4000)
+                stream = pyte.Stream(screen)
+                last_visible = ""
+                screen_dirty = False
+                continue
             if not chunk and self._stream_ended.is_set():
                 if not sent:
                     self._on_failed(
@@ -1450,12 +1911,14 @@ class FreebuffWorker(threading.Thread):
                     last_visible = visible
                     ready_since = None
                     screen_changed_at = time.monotonic()
-                    pending_sections = self._freebuff_sections(visible)
+                    screen_dirty = True
 
             # The first FreeBuff launch opens an accessible model chooser.
             # Accept its highlighted recommended model so the hidden terminal
             # reaches the composer; later launches remember the selection.
             if not accepted_recommended_model and not sent and "RECOMMENDED" in last_visible:
+                if not models:
+                    models = freebuff_model_options()[0]
                 picker_models, focused = _freebuff_picker_options(last_visible, models)
                 if (
                     self._model in picker_models
@@ -1504,7 +1967,9 @@ class FreebuffWorker(threading.Thread):
                 # A resumed TUI initially contains the previous turn. Treat it
                 # as a baseline so it is not announced again while the new
                 # prompt is being painted onto the screen.
-                last_thinking, last_answer = self._freebuff_sections(last_visible)
+                previous_thinking, previous_answer = self._freebuff_sections(last_visible)
+                spoken_thinking = _complete_sentences(_unwrap_screen_text(previous_thinking))
+                spoken_answer = _complete_sentences(_unwrap_screen_text(previous_answer))
                 self._accepting_input.set()
                 self._on_started()
                 continue
@@ -1520,95 +1985,69 @@ class FreebuffWorker(threading.Thread):
                         self._session_id = discovered
                         chat_path = _freebuff_chat_path(self._cwd, discovered)
                         log_offset = 0
-                        # The terminal fallback may have emitted the first
-                        # settled frame just before the chat directory became
-                        # visible. Seed the structured trackers from that
-                        # frame so switching sources does not narrate it twice,
-                        # and claim the message it belongs to so the switch is
-                        # not treated as a brand new answer either.
-                        structured_thinking = last_thinking
-                        structured_answer = last_answer
-                        if last_thinking or last_answer:
-                            structured_answer_id = _freebuff_answer_id(chat_path)
                 if self._session_id and not session_reported:
                     self._on_session(self._session_id)
                     session_reported = True
 
             if sent and chat_path is not None:
-                answer_id, thinking, answer, agents = _freebuff_chat_snapshot(chat_path)
-                if answer_id and answer_id == baseline_answer_id:
-                    # Still the answer this turn was resumed from; nothing of
-                    # this turn has been written yet.
-                    answer_id, thinking, answer, agents = "", "", "", []
-                elif answer_id and answer_id != structured_answer_id:
-                    # FreeBuff opened this turn's answer. Everything tracked so
-                    # far belonged to an earlier message, so start from nothing
-                    # and let the whole new answer be narrated.
-                    structured_answer_id = answer_id
-                    baseline_answer_id = ""
-                    structured_thinking = ""
-                    structured_answer = ""
-                    agent_states.clear()
-                    seen_thinking = ""
-                    seen_answer = ""
-                # FreeBuff saves the chat file as the text arrives, so reading
-                # it on every pass catches sentences mid-word and reads out
-                # fragments. Let the text stop growing first, then narrate the
-                # whole of what was added.
-                if (thinking, answer) != (seen_thinking, seen_answer):
-                    seen_thinking, seen_answer = thinking, answer
-                    settle_deadline = now + _FREEBUFF_SETTLE_SECONDS
-                elif settle_deadline and now >= settle_deadline:
-                    settle_deadline = 0.0
-                    # Only whole sentences are read out. A pause in the middle
-                    # of one is still the middle of one, and hearing half a
-                    # sentence is what makes a run sound broken.
-                    ready = _complete_sentences(thinking)
-                    if ready:
-                        structured_thinking = self._emit_stable_delta(
-                            "thinking", structured_thinking, ready
-                        )
-                    ready = _complete_sentences(answer)
-                    if ready:
-                        structured_answer = self._emit_stable_delta(
-                            "assistant", structured_answer, ready
-                        )
-                for agent_id, name, status in agents:
-                    previous_status = agent_states.get(agent_id)
-                    if previous_status is None:
-                        self._on_activity("tool", f"FreeBuff started {name}")
-                    elif previous_status != status and status in ("complete", "completed"):
-                        self._on_activity("result", f"FreeBuff finished {name}")
-                    agent_states[agent_id] = status
-                run_status = _freebuff_run_status(chat_path, log_offset)
+                # Parsing the chat costs far more than looking at it, and it is
+                # looked at many times a second, so it is only read when
+                # FreeBuff has actually written to it.
+                stamp = _freebuff_chat_stamp(chat_path)
+                if stamp != chat_stamp:
+                    chat_stamp = stamp
+                    answer_id, _thinking, answer, agents = _freebuff_chat_snapshot(chat_path)
+                    if answer_id and answer_id == baseline_answer_id:
+                        # Still the answer this turn was resumed from; nothing
+                        # of this turn has been written yet.
+                        answer_id, answer, agents = "", "", []
+                    elif answer_id and answer_id != structured_answer_id:
+                        # FreeBuff opened this turn's answer. Everything tracked
+                        # so far belonged to an earlier message.
+                        structured_answer_id = answer_id
+                        baseline_answer_id = ""
+                        agent_states.clear()
+                    # The file is written whole, once the reply is finished, so
+                    # it is the authoritative text of the answer rather than a
+                    # source to read from: the reading happens off the screen.
+                    if answer:
+                        structured_answer = answer
+                    for agent_id, name, status in agents:
+                        previous_status = agent_states.get(agent_id)
+                        if previous_status is None:
+                            self._on_activity("tool", f"FreeBuff started {name}")
+                        elif previous_status != status and status in ("complete", "completed"):
+                            self._on_activity("result", f"FreeBuff finished {name}")
+                        agent_states[agent_id] = status
+                    run_status = _freebuff_run_status(chat_path, log_offset)
                 if run_status == "cancelled":
                     self._on_failed("FreeBuff reported that the response was interrupted")
                     return
                 if run_status == "complete":
                     if completion_seen_at is None:
                         completion_seen_at = now
-                    elif now - completion_seen_at >= 0.5:
+                    elif now - completion_seen_at >= 0.2:
                         break
 
             if sent and now >= next_heartbeat:
                 elapsed = max(1, int(now - (turn_started_at or now)))
                 self._on_activity("tool", f"FreeBuff is still working; {elapsed} seconds elapsed")
                 next_heartbeat = now + 30
-            # Reading the screen is the fallback for the window before the chat
-            # file exists. Once it does, that file is the only source: narrating
-            # from both makes every line arrive twice, because the redrawn
-            # screen and the saved message are the same text.
-            if (
-                started
-                and saw_busy
-                and chat_path is None
-                and pending_sections is not None
-                and time.monotonic() - screen_changed_at >= 0.35
-            ):
-                thinking, answer = pending_sections
-                last_thinking = self._emit_stable_delta("thinking", last_thinking, thinking)
-                last_answer = self._emit_stable_delta("assistant", last_answer, answer)
-                pending_sections = None
+            # The screen is the only place the answer appears as it is written:
+            # the chat file is not saved until the reply is finished. So the
+            # reading follows the terminal, one finished sentence at a time.
+            # A frame is taken once it has held still for a moment, or, if the
+            # text is arriving faster than that, as soon as the wait would start
+            # to be audible.
+            if started and screen_dirty:
+                settled = now - screen_changed_at >= _FREEBUFF_FRAME_SECONDS
+                overdue = now - last_emit_at >= _FREEBUFF_MAX_LAG_SECONDS
+                if settled or overdue:
+                    thinking, answer = self._freebuff_sections(last_visible)
+                    spoken_thinking = self._emit_screen_delta("thinking", spoken_thinking, thinking)
+                    spoken_answer = self._emit_screen_delta("assistant", spoken_answer, answer)
+                    screen_dirty = False
+                    last_emit_at = now
             if sent and saw_busy and at_prompt and not busy and chat_path is None:
                 if ready_since is None:
                     ready_since = time.monotonic()
@@ -1622,26 +2061,22 @@ class FreebuffWorker(threading.Thread):
             return
 
         self._accepting_input.clear()
-        # The turn can end inside the settling window, holding text that was
-        # read but never narrated. Nothing arrives after this, so release it.
-        if seen_thinking and seen_thinking != structured_thinking:
-            structured_thinking = self._emit_stable_delta(
-                "thinking", structured_thinking, seen_thinking
-            )
-        if seen_answer and seen_answer != structured_answer:
-            structured_answer = self._emit_stable_delta("assistant", structured_answer, seen_answer)
-        _thinking, screen_response = self._freebuff_sections(last_visible)
-        response = structured_answer or screen_response
+        # The turn ends holding the last sentence, which never became "finished
+        # text" while the answer was still growing. Nothing arrives after this,
+        # so release the rest of the frame whole.
+        screen_thinking, screen_response = self._freebuff_sections(last_visible)
+        self._emit_screen_delta("thinking", spoken_thinking, screen_thinking, whole=True)
+        self._emit_screen_delta("assistant", spoken_answer, screen_response, whole=True)
+        # The saved chat is the answer as FreeBuff wrote it, rather than as the
+        # terminal laid it out, so it is what the transcript keeps.
+        response = structured_answer or _unwrap_screen_text(screen_response)
         if response:
-            announced_answer = structured_answer or last_answer
-            if response != announced_answer:
-                addition = (
-                    response[len(announced_answer) :].strip()
-                    if response.startswith(announced_answer)
-                    else response
-                )
-                if addition:
-                    self._on_activity("assistant", addition)
+            # An answer taller than the terminal scrolls its own beginning off
+            # the screen, and the reading stops there. The saved chat is the
+            # whole of it, so whatever was never read is read now.
+            tail = _unspoken_tail(self._narrated.get("assistant", ""), response)
+            if tail:
+                self._on_activity("assistant", tail)
             self._on_complete(response)
         else:
             self._on_failed("No response received from FreeBuff")
@@ -1652,119 +2087,64 @@ class FreebuffWorker(threading.Thread):
         session = max(new_ids, key=after.get) if new_ids else self._session_id
         if session and not session_reported:
             self._on_session(session)
+        # The next message in this conversation should not have to wait for a
+        # terminal to start, so start one now, while nobody is waiting on it.
+        if session:
+            prewarm_freebuff(self._cwd, session, self._model, delay=1.0)
 
-    def _emit_stable_delta(self, kind: str, previous: str, current: str) -> str:
-        """Emit only append-only text from a settled TUI frame.
+    def _emit_screen_delta(self, kind: str, spoken: str, current: str, whole: bool = False) -> str:
+        """Read out whatever the screen has gained since the last frame.
 
-        OpenTUI redraws wrapped lines in place. Announcing a transient frame
-        produces duplicated or corrupted speech, so replacements become a new
-        baseline and only stable appended text is narrated.
+        Only finished sentences are released while the answer is still being
+        written: the live edge of a frame is a half-written word, and half a
+        sentence read aloud is what makes a run sound broken. At the end of the
+        turn nothing more is coming, so the rest is released as it stands.
         """
-        if not current or current == previous:
-            return current
-        if previous and not current.startswith(previous):
-            return current
-        addition = current[len(previous) :].strip()
+        text = _unwrap_screen_text(current)
+        ready = text if whole else _complete_sentences(text)
+        if not ready:
+            return spoken
+        addition = _append_delta(spoken, ready)
+        unrelated = bool(spoken) and addition == ready and len(ready) < len(spoken)
+        if unrelated and not whole:
+            # This frame shares nothing with what was read and holds less of it,
+            # which is what a half-drawn repaint looks like. Wait to see it
+            # again before reading it, rather than read a torn frame aloud —
+            # but do not wait forever, because it is also what the start of a
+            # genuinely shorter answer looks like.
+            if self._pending_frame.get(kind) != ready:
+                self._pending_frame[kind] = ready
+                return spoken
+        self._pending_frame.pop(kind, None)
+        addition = addition.strip()
         if addition:
             self._on_activity(kind, addition)
-        return current
+            narrated = self._narrated.get(kind, "")
+            self._narrated[kind] = f"{narrated}\n{addition}" if narrated else addition
+        return ready
 
     def _spawn_pty(self, args: list[str]) -> Callable[[float], str]:
-        if platform.system() == "Windows":
-            from winpty import PtyProcess
-
-            # Own the console before the terminal asks for one, so none is
-            # created on screen. The watcher below is the safety net for the
-            # consoles FreeBuff's own tools can still raise.
-            reserve_hidden_console()
-            roots = {os.getpid()}
-
-            def hide_terminal() -> None:
-                # Poll hard while the terminal is starting, then slowly: the
-                # tools FreeBuff itself starts can each raise a console of
-                # their own, and any of them would take the reader's focus.
-                # Tearing the terminal down raises one last console, after the
-                # output has stopped, so this outlives the stream it guards.
-                started = time.monotonic()
-                grace_until: Optional[float] = None
-                while True:
-                    now = time.monotonic()
-                    if self._stream_ended.is_set():
-                        if grace_until is None:
-                            grace_until = now + 5
-                        elif now > grace_until:
-                            return
-                    try:
-                        hide_console_windows(roots)
-                    except Exception:
-                        # Never let this thread die: it is the only thing
-                        # keeping the terminal off the screen for the whole run.
-                        pass
-                    quick = now - started < 8 or grace_until is not None
-                    time.sleep(0.005 if quick else 0.25)
-
-            threading.Thread(target=hide_terminal, daemon=True).start()
-
-            # pywinpty accepts an argv list and supplies a real ConPTY console.
-            self._pty = PtyProcess.spawn(args, dimensions=(60, 180), cwd=self._cwd)
-            pty_pid = getattr(self._pty, "pid", 0)
-            if pty_pid:
-                roots.add(int(pty_pid))
-            chunks: queue.Queue[str] = queue.Queue()
-
-            def pump() -> None:
-                try:
-                    while self._pty and self._pty.isalive():
-                        try:
-                            data = self._pty.read(4096)
-                        except Exception:
-                            break
-                        if data:
-                            chunks.put(data)
-                finally:
-                    # Nothing more will ever arrive. Saying so turns a terminal
-                    # that died at startup into a reported failure instead of an
-                    # hour of silence.
-                    self._stream_ended.set()
-
-            threading.Thread(target=pump, daemon=True).start()
-
-            def read(timeout: float) -> str:
-                try:
-                    return chunks.get(timeout=timeout)
-                except queue.Empty:
-                    return ""
-
-            return read
-
-        import pexpect
-
-        self._pty = pexpect.spawn(
-            args[0],
-            args[1:],
-            cwd=self._cwd,
-            encoding="utf-8",
-            dimensions=(60, 180),
-            timeout=0.25,
-        )
-
-        def read(timeout: float) -> str:
-            try:
-                return self._pty.read_nonblocking(4096, timeout=timeout)
-            except pexpect.TIMEOUT:
-                return ""
-            except pexpect.EOF:
-                self._stream_ended.set()
-                return ""
-
+        self._pty, read = _spawn_freebuff_pty(args, self._cwd, self._stream_ended)
         return read
 
     def _freebuff_sections(self, visible: str) -> tuple[str, str]:
         """Extract reasoning and answer text from FreeBuff's rendered screen."""
         raw_lines = _strip_terminal_noise(visible).splitlines()
+        # This turn's output is whatever follows the echo of this turn's prompt.
+        # A resumed conversation paints the turn before it above that, reasoning
+        # and all, and none of that is an answer to what was just asked.
+        needle = next((line.strip() for line in self._prompt.splitlines() if line.strip()), "")[:60]
+        prompt_index = -1
+        if needle:
+            for index, raw in enumerate(raw_lines):
+                if needle in raw:
+                    prompt_index = index
+        start = prompt_index + 1 if prompt_index >= 0 else 0
+
         thinking_index = -1
         thinking_indent = 0
-        for index, raw in enumerate(raw_lines):
+        for index in range(start, len(raw_lines)):
+            raw = raw_lines[index]
             if re.fullmatch(r"\s*[•*]\s*Thinking\s*", raw, re.IGNORECASE):
                 thinking_index = index
                 thinking_indent = len(raw) - len(raw.lstrip())
@@ -1772,9 +2152,14 @@ class FreebuffWorker(threading.Thread):
         if thinking_index >= 0:
             candidates = raw_lines[thinking_index + 1 :]
             in_thinking = True
+        elif prompt_index >= 0:
+            candidates = raw_lines[start:]
+            in_thinking = False
         else:
-            prompt_indexes = [index for index, raw in enumerate(raw_lines) if self._prompt in raw]
-            candidates = raw_lines[prompt_indexes[-1] + 1 :] if prompt_indexes else []
+            # The prompt has scrolled off the top, so there is no way to tell
+            # this turn's output from the conversation above it. What is missed
+            # here is read out from the saved chat once the turn ends.
+            candidates = []
             in_thinking = False
 
         thinking: list[str] = []
@@ -1786,7 +2171,12 @@ class FreebuffWorker(threading.Thread):
             lower = stripped.lower()
             if self._PROMPT_RE.search(stripped):
                 break
-            if re.search(r"\bunlimited\b.*(?:end session|[✕x])", lower):
+            # The status bar sits between the answer and the composer, and
+            # carries the model, what is left of the session, and the control
+            # that ends it. None of that is the answer.
+            if lower.endswith("end session") or re.search(
+                r"\bunlimited\b.*(?:end session|[✕x])", lower
+            ):
                 break
             if lower.startswith(
                 (

@@ -1,14 +1,31 @@
-# BlindPilot 0.3.7
+# BlindPilot 0.3.8
 
 BlindPilot is an accessible desktop reader for Claude Code, Codex, and FreeBuff. It is
 based on Claude Code Reader and remains available under the MIT License, with credit to
 the original project throughout the application and documentation.
 
-## FreeBuff answers arrive whole
+## FreeBuff answers are read as they are written
 
-- FreeBuff saves its chat file as the words arrive, and BlindPilot read it on every pass,
-  so activity rows were cut off mid-sentence. It now waits for the text to settle and
-  reads out only finished sentences, with whatever is left released when the turn ends.
+- FreeBuff does not save its chat file until a reply has finished, so reading from that
+  file meant waiting out the whole answer in silence and then hearing it at once. The
+  answer is now read off FreeBuff's own screen, a finished sentence at a time, as it is
+  written. Anything that scrolled out of view before it could be read is read out from
+  the saved chat when the turn ends, so a long answer is still heard in full and never
+  heard twice.
+
+## FreeBuff starts answering straight away
+
+- A FreeBuff terminal takes several seconds to reach the point where it can be given a
+  message, and every message waited for that. One is now started ahead of time — when a
+  FreeBuff tab opens, and again after each answer for the conversation it belongs to —
+  so sending a message reaches FreeBuff in well under a second. Only one is ever held,
+  it is dropped after fifteen minutes unused, and a message that finds none simply
+  starts its own.
+- Choosing a FreeBuff model no longer reads its model catalogue out of the hundred and
+  odd megabytes of installed FreeBuff on the way to sending. The catalogue is remembered
+  between runs, and is only read again when FreeBuff itself is updated.
+
+## Included from 0.3.7
 
 ## Less of the FreeBuff terminal
 
