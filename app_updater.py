@@ -16,6 +16,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -267,144 +268,320 @@ def download_update(
         raise UpdateError(f"Could not download the update: {exc}") from exc
 
 
-_WINDOWS_HELPER = r"""param(
+# Everything the two Windows helpers share. An update runs with no application
+# left to report to, so the rules here are: write down what happened, be sure
+# nothing is still holding the files before touching them, and never leave the
+# user without a working BlindPilot.
+_WINDOWS_PRELUDE = r"""
+$ErrorActionPreference = "Stop"
+
+function Write-Log([string]$Message) {
+    $stamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+    try { Add-Content -LiteralPath $LogFile -Value "$stamp  $Message" } catch { }
+}
+
+function Save-Failure([string]$Message) {
+    # BlindPilot is not running to be told, so the reason is left where its next
+    # start will find it. Without this a failed update is silent forever, which
+    # is exactly how this went unnoticed before.
+    try { Set-Content -LiteralPath $StatusFile -Value @($Message, $LogFile) } catch { }
+}
+
+function Get-Blockers([int]$TargetPid, [string]$Folder) {
+    # Waiting for the one process id is not enough. Anything still running out
+    # of the folder being replaced keeps its files mapped, and BlindPilot leaves
+    # descendants behind: the agent command-line tools it starts, and the
+    # console host bundled in _internal for FreeBuff's terminal.
+    $root = ([IO.Path]::GetFullPath($Folder)).TrimEnd('\') + '\'
+    $found = @()
+    if ($TargetPid -gt 0) {
+        $one = Get-Process -Id $TargetPid -ErrorAction SilentlyContinue
+        if ($one) { $found += $one }
+    }
+    foreach ($item in (Get-Process -ErrorAction SilentlyContinue)) {
+        try {
+            $path = $item.Path
+            if ($path) {
+                $full = [IO.Path]::GetFullPath($path)
+                if ($full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { $found += $item }
+            }
+        } catch { }
+    }
+    return @($found | Sort-Object Id -Unique)
+}
+
+function Wait-ForExit([int]$TargetPid, [string]$Folder) {
+    $stages = @(30, 10, 10)
+    for ($stage = 0; $stage -lt $stages.Count; $stage++) {
+        $deadline = [DateTime]::UtcNow.AddSeconds($stages[$stage])
+        while ([DateTime]::UtcNow -lt $deadline) {
+            if ((Get-Blockers $TargetPid $Folder).Count -eq 0) {
+                # Give Windows a moment to release the image mappings of a
+                # process that has only just gone.
+                Start-Sleep -Milliseconds 1500
+                return $true
+            }
+            Start-Sleep -Milliseconds 250
+        }
+        $blockers = Get-Blockers $TargetPid $Folder
+        if ($blockers.Count -eq 0) { Start-Sleep -Milliseconds 1500; return $true }
+        Write-Log ("Still running: " + (($blockers | ForEach-Object { $_.Id }) -join ", "))
+        foreach ($item in $blockers) {
+            try {
+                if ($stage -eq 0) { $item.CloseMainWindow() | Out-Null }
+                else { Stop-Process -Id $item.Id -Force -ErrorAction SilentlyContinue }
+            } catch { }
+        }
+    }
+    return ((Get-Blockers $TargetPid $Folder).Count -eq 0)
+}
+
+function Wait-Unlocked([string]$Folder) {
+    # A process that has just exited can leave its libraries mapped a moment
+    # longer, and a virus scanner reading the new files holds them too. Opening
+    # each one with no sharing allowed is the only way to know the swap can go
+    # ahead rather than fail halfway.
+    $targets = @()
+    $exe = Join-Path $Folder $Executable
+    if (Test-Path -LiteralPath $exe -PathType Leaf) { $targets += $exe }
+    $internal = Join-Path $Folder "_internal"
+    if (Test-Path -LiteralPath $internal -PathType Container) {
+        $targets += @(
+            Get-ChildItem -LiteralPath $internal -File -Filter *.dll -ErrorAction SilentlyContinue |
+                ForEach-Object { $_.FullName }
+        )
+        $targets += @(
+            Get-ChildItem -LiteralPath $internal -File -Filter *.exe -Recurse -ErrorAction SilentlyContinue |
+                ForEach-Object { $_.FullName }
+        )
+    }
+    $locked = @()
+    foreach ($path in $targets) {
+        $opened = $false
+        for ($attempt = 0; $attempt -lt 10 -and -not $opened; $attempt++) {
+            try {
+                $handle = [IO.File]::Open(
+                    $path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None
+                )
+                $handle.Close()
+                $opened = $true
+            } catch { Start-Sleep -Milliseconds 500 }
+        }
+        if (-not $opened) { $locked += $path }
+    }
+    if ($locked.Count -gt 0) {
+        Write-Log ("Locked after waiting: " + ($locked -join "; "))
+        return $false
+    }
+    return $true
+}
+
+function Invoke-Robocopy([string]$From, [string]$To, [bool]$Move) {
+    $arguments = @($From, $To, "/E", "/R:10", "/W:3", "/NFL", "/NDL", "/NP", "/NJH", "/NJS")
+    if ($Move) { $arguments += "/MOVE" }
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $output = & robocopy.exe @arguments 2>&1
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    foreach ($line in $output) {
+        $text = "$line".Trim()
+        if ($text) { Write-Log ("robocopy: " + $text) }
+    }
+    # Robocopy reports through a bit mask: anything under 8 copied cleanly.
+    return $code
+}
+
+function Test-Drained([string]$Folder) {
+    if (-not (Test-Path -LiteralPath $Folder -PathType Container)) { return $true }
+    $left = @(Get-ChildItem -LiteralPath $Folder -Recurse -Force -File -ErrorAction SilentlyContinue)
+    if ($left.Count -eq 0) { return $true }
+    Write-Log ("Folder still holds " + $left.Count + " file(s), first: " + $left[0].FullName)
+    return $false
+}
+
+function Start-BlindPilot([string]$Folder) {
+    $exe = Join-Path $Folder $Executable
+    if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+        Write-Log ("Cannot restart: " + $exe + " is missing.")
+        return $false
+    }
+    # Never start it with the install folder as its working directory. That
+    # directory handle is what stops the *next* update from replacing it.
+    try {
+        Start-Process -FilePath $exe -WorkingDirectory $HOME -ErrorAction Stop | Out-Null
+        return $true
+    } catch {
+        Write-Log ("Could not restart BlindPilot: " + $_.Exception.Message)
+        return $false
+    }
+}
+"""
+
+
+_WINDOWS_HELPER = (
+    r"""param(
     [Parameter(Mandatory=$true)][int]$ParentPid,
     [Parameter(Mandatory=$true)][string]$Archive,
     [Parameter(Mandatory=$true)][string]$InstallDir,
-    [Parameter(Mandatory=$true)][string]$Executable
+    [Parameter(Mandatory=$true)][string]$Executable,
+    [Parameter(Mandatory=$true)][string]$LogFile,
+    [Parameter(Mandatory=$true)][string]$StatusFile
 )
-$ErrorActionPreference = "Stop"
-$stage = Join-Path ([IO.Path]::GetTempPath()) ("BlindPilot-stage-" + [guid]::NewGuid())
-$installParent = Split-Path -Parent $InstallDir
-$installName = Split-Path -Leaf $InstallDir
+"""
+    + _WINDOWS_PRELUDE
+    + r"""
 $token = [guid]::NewGuid().ToString("N")
-$incoming = Join-Path $installParent ($installName + ".update-new-" + $token)
-$backup = Join-Path $installParent ($installName + ".update-backup-" + $token)
-$oldMoved = $false
-$replacementActive = $false
-$parent = Get-Process -Id $ParentPid -ErrorAction SilentlyContinue
-$parentStarted = if ($null -ne $parent) { $parent.StartTime } else { $null }
+$stage = Join-Path ([IO.Path]::GetTempPath()) ("BlindPilot-stage-" + $token)
+$backup = (Join-Path (Split-Path -Parent $InstallDir) (Split-Path -Leaf $InstallDir)) +
+    ".update-backup-" + $token
+$movedAside = $false
+$replaced = $false
+$handedOver = $false
 try {
+    Write-Log ("Updating " + $InstallDir)
     New-Item -ItemType Directory -Path $stage | Out-Null
     Expand-Archive -LiteralPath $Archive -DestinationPath $stage -Force
     $source = Join-Path $stage "BlindPilot"
     if (-not (Test-Path -LiteralPath (Join-Path $source $Executable) -PathType Leaf)) {
-        throw "The update archive does not contain $Executable"
+        throw "The update archive does not contain $Executable."
     }
 
-    # Prepare a complete sibling installation before touching the live one.
-    # Keeping it on the install volume makes both directory moves atomic.
-    Copy-Item -LiteralPath $source -Destination $incoming -Recurse -Force
+    if (-not (Wait-ForExit $ParentPid $InstallDir)) {
+        throw "BlindPilot is still running, so its files could not be replaced."
+    }
+    if (-not (Wait-Unlocked $InstallDir)) {
+        throw "Some BlindPilot files are still in use, so they could not be replaced."
+    }
 
-    # Give BlindPilot time to run its normal close handler. If a worker or
-    # window prevents shutdown, stop this exact PID before replacing files.
-    $parent = Get-Process -Id $ParentPid -ErrorAction SilentlyContinue
-    $deadline = [DateTime]::UtcNow.AddSeconds(30)
-    while ($null -ne $parent) {
-        if ($null -ne $parentStarted -and $parent.StartTime -ne $parentStarted) {
-            break
+    # Move what is *inside* the folder rather than renaming the folder itself.
+    # The folder can be held open by a shortcut's working directory or a file
+    # sync client, and a rename fails where moving its contents succeeds.
+    New-Item -ItemType Directory -Path $backup -Force | Out-Null
+    # Set before the first move, not after a successful one: the moment
+    # robocopy starts, files may already have left the install folder, and a
+    # failure from here on has to put them back.
+    $movedAside = $true
+    $drained = $false
+    for ($attempt = 1; $attempt -le 5 -and -not $drained; $attempt++) {
+        $code = Invoke-Robocopy $InstallDir $backup $true
+        if ($code -ge 8) { throw "Could not move the current version aside (robocopy $code)." }
+        $drained = Test-Drained $InstallDir
+        if (-not $drained) {
+            # Robocopy retries a copy that fails, but not the delete that
+            # follows it, so one briefly locked file leaves the folder
+            # half-emptied. Waiting and repeating the whole move clears it.
+            Write-Log ("Move left files behind; retrying (attempt " + $attempt + ").")
+            Start-Sleep -Seconds 2
         }
-        if ([DateTime]::UtcNow -ge $deadline) {
-            Stop-Process -Id $ParentPid -Force -ErrorAction SilentlyContinue
-            Wait-Process -Id $ParentPid -ErrorAction SilentlyContinue
-            break
-        }
-        Start-Sleep -Milliseconds 200
-        $parent = Get-Process -Id $ParentPid -ErrorAction SilentlyContinue
+    }
+    if (-not $drained) { throw "The current version could not be moved aside." }
+
+    $code = Invoke-Robocopy $source $InstallDir $true
+    if ($code -ge 8) { throw "Could not put the new version in place (robocopy $code)." }
+    $replaced = $true
+    if (-not (Test-Path -LiteralPath (Join-Path $InstallDir $Executable) -PathType Leaf)) {
+        throw "The installed folder is missing $Executable after the update."
     }
 
-    if (Test-Path -LiteralPath $InstallDir) {
-        Move-Item -LiteralPath $InstallDir -Destination $backup
-        $oldMoved = $true
-    }
-    Move-Item -LiteralPath $incoming -Destination $InstallDir
-    $replacementActive = $true
-
-    $newProcess = Start-Process `
-        -FilePath (Join-Path $InstallDir $Executable) `
-        -WorkingDirectory $InstallDir `
-        -PassThru
-    Start-Sleep -Seconds 2
-    $newProcess.Refresh()
-    if ($newProcess.HasExited) {
-        throw "The new BlindPilot version exited during startup"
-    }
-
-    # A successful process creation completes the handoff. Backup cleanup is
-    # deliberately best-effort so it cannot roll back a running new version.
+    Write-Log "Update applied. Restarting BlindPilot."
+    Start-BlindPilot $InstallDir | Out-Null
+    $handedOver = $true
     Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue
-    $oldMoved = $false
+    Write-Log "Done."
 } catch {
-    $failure = $_
-    if ($replacementActive -and (Test-Path -LiteralPath $InstallDir)) {
-        Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
-    }
-    if ($oldMoved -and (Test-Path -LiteralPath $backup)) {
-        Move-Item -LiteralPath $backup -Destination $InstallDir -ErrorAction SilentlyContinue
-        if (Test-Path -LiteralPath (Join-Path $InstallDir $Executable) -PathType Leaf) {
-            Start-Process `
-                -FilePath (Join-Path $InstallDir $Executable) `
-                -WorkingDirectory $InstallDir `
-                -ErrorAction SilentlyContinue
+    $message = $_.Exception.Message
+    Write-Log ("Update failed: " + $message)
+    if (-not $handedOver -and $movedAside -and (Test-Path -LiteralPath $backup)) {
+        Write-Log "Putting the previous version back."
+        if ($replaced) {
+            Get-ChildItem -LiteralPath $InstallDir -Force -ErrorAction SilentlyContinue |
+                Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
         }
-    } elseif (-not (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue)) {
-        if (Test-Path -LiteralPath (Join-Path $InstallDir $Executable) -PathType Leaf) {
-            Start-Process `
-                -FilePath (Join-Path $InstallDir $Executable) `
-                -WorkingDirectory $InstallDir `
-                -ErrorAction SilentlyContinue
+        # Copy the backup back rather than moving it. Whatever caused the
+        # failure must not be able to consume the only remaining copy of the
+        # version that was working a minute ago.
+        $code = Invoke-Robocopy $backup $InstallDir $false
+        if ($code -ge 8) {
+            Write-Log ("Restore reported robocopy " + $code + "; the backup is kept at " + $backup)
+        } else {
+            Write-Log ("Previous version restored; its backup is kept at " + $backup)
         }
     }
-    throw $failure
-} finally {
-    Remove-Item -LiteralPath $incoming -Recurse -Force -ErrorAction SilentlyContinue
+    if (-not $handedOver) { Start-BlindPilot $InstallDir | Out-Null }
+    Save-Failure $message
     Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $Archive -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+    exit 1
 }
+Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $Archive -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $LogFile -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
 """
+)
 
 
-_WINDOWS_SETUP_HELPER = r"""param(
+_WINDOWS_SETUP_HELPER = (
+    r"""param(
     [Parameter(Mandatory=$true)][int]$ParentPid,
     [Parameter(Mandatory=$true)][string]$Installer,
-    [Parameter(Mandatory=$true)][string]$Executable
+    [Parameter(Mandatory=$true)][string]$InstallDir,
+    [Parameter(Mandatory=$true)][string]$Executable,
+    [Parameter(Mandatory=$true)][string]$LogFile,
+    [Parameter(Mandatory=$true)][string]$StatusFile
 )
-$ErrorActionPreference = "Stop"
+"""
+    + _WINDOWS_PRELUDE
+    + r"""
 try {
-    # Give BlindPilot time to close on its own before the installer replaces
-    # its files. Same bounded forced-close fallback as the portable updater.
-    $parent = Get-Process -Id $ParentPid -ErrorAction SilentlyContinue
-    $parentStarted = if ($null -ne $parent) { $parent.StartTime } else { $null }
-    $deadline = [DateTime]::UtcNow.AddSeconds(30)
-    while ($null -ne $parent) {
-        if ($null -ne $parentStarted -and $parent.StartTime -ne $parentStarted) {
-            break
-        }
-        if ([DateTime]::UtcNow -ge $deadline) {
-            Stop-Process -Id $ParentPid -Force -ErrorAction SilentlyContinue
-            Wait-Process -Id $ParentPid -ErrorAction SilentlyContinue
-            break
-        }
-        Start-Sleep -Milliseconds 200
-        $parent = Get-Process -Id $ParentPid -ErrorAction SilentlyContinue
+    Write-Log ("Updating the installed copy in " + $InstallDir)
+    if (-not (Wait-ForExit $ParentPid $InstallDir)) {
+        throw "BlindPilot is still running, so the installer could not replace its files."
     }
 
     # The setup program owns this installation: it keeps the uninstaller and
     # the Add or Remove Programs entry correct, and it remembers the shortcuts
-    # chosen last time. Silent, because there is no one at the keyboard.
+    # chosen last time. Silent, because there is no one at the keyboard, and
+    # pointed at the existing folder so an update never moves the application.
     $run = Start-Process -FilePath $Installer -ArgumentList @(
-        "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/NOCANCEL"
+        "/VERYSILENT",
+        "/SUPPRESSMSGBOXES",
+        "/NORESTART",
+        "/NOCANCEL",
+        "/CLOSEAPPLICATIONS",
+        ("/DIR=" + $InstallDir)
     ) -Wait -PassThru
     if ($run.ExitCode -ne 0) {
-        throw "The BlindPilot installer exited with code $($run.ExitCode)"
+        throw "The BlindPilot installer exited with code $($run.ExitCode)."
     }
-    Start-Process -FilePath $Executable -WorkingDirectory (Split-Path -Parent $Executable)
-} finally {
+    Write-Log "Installer finished. Restarting BlindPilot."
+    # The installer's own run entry is skipped when it runs silently, so
+    # restarting is this script's job.
+    if (-not (Start-BlindPilot $InstallDir)) {
+        throw "BlindPilot was updated but could not be restarted."
+    }
+    Write-Log "Done."
+} catch {
+    $message = $_.Exception.Message
+    Write-Log ("Update failed: " + $message)
+    # The installer either succeeded or left the old copy alone, so there is
+    # nothing to undo — but the user must not be left with no application.
+    Start-BlindPilot $InstallDir | Out-Null
+    Save-Failure $message
     Remove-Item -LiteralPath $Installer -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+    exit 1
 }
+Remove-Item -LiteralPath $Installer -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $LogFile -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
 """
+)
 
 
 _MACOS_HELPER = r"""#!/bin/sh
@@ -451,6 +628,103 @@ fi
 """
 
 
+TEMPORARY_PREFIX = "BlindPilot-update-"
+STATUS_FILE_NAME = "BlindPilot-update-status.txt"
+
+
+def _status_path() -> Path:
+    return Path(tempfile.gettempdir()) / STATUS_FILE_NAME
+
+
+def pending_failure() -> tuple[str, str]:
+    """(reason, log path) from an update that failed after BlindPilot closed.
+
+    An update runs with no application to report to, so the helper writes the
+    reason down and this is read on the next start. Returns empty strings when
+    the last update did not fail.
+    """
+    try:
+        lines = _status_path().read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return "", ""
+    reason = lines[0].strip() if lines else ""
+    log = lines[1].strip() if len(lines) > 1 else ""
+    return reason, log
+
+
+def clear_pending_failure() -> None:
+    _status_path().unlink(missing_ok=True)
+
+
+def sweep_temporary_files(minimum_age_seconds: float = 6 * 60 * 60) -> int:
+    """Delete abandoned update downloads and helpers, returning how many went.
+
+    A failed update leaves its archive behind, and those are tens of megabytes
+    each. Only files old enough to belong to a finished attempt are touched, so
+    this can never delete the download of an update that is running right now.
+    """
+    removed = 0
+    now = time.time()
+    try:
+        candidates = list(Path(tempfile.gettempdir()).glob(f"{TEMPORARY_PREFIX}*"))
+    except OSError:
+        return 0
+    for path in candidates:
+        if path.name == STATUS_FILE_NAME or path.suffix.casefold() == ".log":
+            continue
+        try:
+            if not path.is_file() or now - path.stat().st_mtime < minimum_age_seconds:
+                continue
+            path.unlink()
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def _windows_helper_flags() -> int:
+    """Creation flags for a helper that must outlive the process starting it.
+
+    DETACHED_PROCESS must never be used here. It leaves PowerShell with no
+    console at all, and Windows PowerShell then exits reporting success without
+    ever running the script — which is why no BlindPilot update since 0.3.0 has
+    installed. CREATE_NO_WINDOW already gives the helper a console of its own
+    that is never shown, which is what was actually wanted.
+    """
+    return (
+        getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+    )
+
+
+def _spawn_detached(command: list[str], flags: int) -> None:
+    subprocess.Popen(
+        command,
+        creationflags=flags,
+        # The helper outlives BlindPilot, so it is left holding nothing of it.
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        cwd=tempfile.gettempdir(),
+    )
+
+
+def _start_windows_helper(command: list[str]) -> None:
+    flags = _windows_helper_flags()
+    try:
+        _spawn_detached(command, flags)
+    except OSError:
+        # Breaking out of a job object is refused when the job forbids it, and
+        # BlindPilot can be started from inside one. Staying in the job is
+        # better than not updating at all.
+        breakaway = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+        if not breakaway:
+            raise
+        _spawn_detached(command, flags & ~breakaway)
+
+
 def schedule_install(archive: Path) -> None:
     """Install the verified archive after this packaged process exits."""
     if not getattr(sys, "frozen", False):
@@ -458,23 +732,29 @@ def schedule_install(archive: Path) -> None:
     executable = Path(sys.executable).resolve()
     if platform.system() == "Windows":
         install_dir = executable.parent
-        setup = install_kind(executable) == INSTALL_SETUP
-        if setup:
+        log = Path(tempfile.gettempdir()) / f"{TEMPORARY_PREFIX}{os.getpid()}.log"
+        shared = [
+            "-InstallDir",
+            str(install_dir),
+            "-Executable",
+            executable.name,
+            "-LogFile",
+            str(log),
+            "-StatusFile",
+            str(_status_path()),
+        ]
+        if install_kind(executable) == INSTALL_SETUP:
             script = _WINDOWS_SETUP_HELPER
-            arguments = ["-Installer", str(archive), "-Executable", str(executable)]
+            arguments = ["-Installer", str(archive), *shared]
         else:
             script = _WINDOWS_HELPER
-            arguments = [
-                "-Archive",
-                str(archive),
-                "-InstallDir",
-                str(install_dir),
-                "-Executable",
-                executable.name,
-            ]
+            arguments = ["-Archive", str(archive), *shared]
+        # A stale reason from a previous attempt must not be reported as this
+        # one's outcome.
+        clear_pending_failure()
         helper: Optional[Path] = None
         try:
-            fd, helper_name = tempfile.mkstemp(prefix="BlindPilot-update-", suffix=".ps1")
+            fd, helper_name = tempfile.mkstemp(prefix=TEMPORARY_PREFIX, suffix=".ps1")
             os.close(fd)
             helper = Path(helper_name)
             helper.write_text(script, encoding="utf-8-sig")
@@ -482,7 +762,7 @@ def schedule_install(archive: Path) -> None:
             powershell = str(
                 Path(powershell) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
             )
-            subprocess.Popen(
+            _start_windows_helper(
                 [
                     powershell,
                     "-NoProfile",
@@ -496,18 +776,7 @@ def schedule_install(archive: Path) -> None:
                     "-ParentPid",
                     str(os.getpid()),
                     *arguments,
-                ],
-                creationflags=(
-                    getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                    | getattr(subprocess, "DETACHED_PROCESS", 0)
-                ),
-                # The helper outlives BlindPilot and has no console of its own,
-                # so it must never be left holding an inherited console handle.
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                close_fds=True,
-                cwd=tempfile.gettempdir(),
+                ]
             )
         except (OSError, ValueError) as exc:
             if helper is not None:

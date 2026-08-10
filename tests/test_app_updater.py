@@ -164,17 +164,143 @@ def test_windows_installer_waits_swaps_and_relaunches(monkeypatch, tmp_path):
         assert argv[argv.index("-Archive") + 1] == str(archive)
         assert argv[argv.index("-InstallDir") + 1] == str(install_dir.resolve())
         assert argv[argv.index("-Executable") + 1] == "BlindPilot.exe"
+        # The helper reports to a file because there is no application left to
+        # report to by the time it runs.
+        assert argv[argv.index("-LogFile") + 1].endswith(".log")
+        assert argv[argv.index("-StatusFile") + 1].endswith(app_updater.STATUS_FILE_NAME)
         assert launched["kwargs"]["cwd"] == tempfile.gettempdir()
         assert launched["kwargs"]["close_fds"] is True
-        assert "Stop-Process -Id $ParentPid -Force" in script
-        assert script.index("Get-Process -Id $ParentPid") < script.index(
-            "Move-Item -LiteralPath $InstallDir"
+
+        # Nothing may be touched until everything running from the folder has
+        # gone and its files can actually be opened.
+        assert script.index("Wait-ForExit $ParentPid $InstallDir") < script.index(
+            "Invoke-Robocopy $InstallDir $backup $true"
         )
-        assert script.index("Move-Item -LiteralPath $incoming") < script.index("Start-Process")
-        assert "-WorkingDirectory $InstallDir" in script
-        assert "Move-Item -LiteralPath $backup -Destination $InstallDir" in script
+        assert script.index("Wait-Unlocked $InstallDir") < script.index(
+            "Invoke-Robocopy $InstallDir $backup $true"
+        )
+        assert script.index("Invoke-Robocopy $source $InstallDir $true") < script.index(
+            "Start-BlindPilot $InstallDir"
+        )
+        # Rolling back copies the backup rather than moving it.
+        assert "Invoke-Robocopy $backup $InstallDir $false" in script
+        # Restarting must not hand the new copy the install folder as its
+        # working directory, or the next update cannot replace it.
+        assert "-WorkingDirectory $HOME" in script
+        assert "-WorkingDirectory $InstallDir" not in script
     finally:
         helper.unlink(missing_ok=True)
+
+
+def test_the_update_helper_is_never_started_detached(monkeypatch, tmp_path):
+    """DETACHED_PROCESS is why no update installed between 0.3.0 and 0.3.9.
+
+    It leaves PowerShell with no console at all, and Windows PowerShell then
+    exits reporting success without ever running the script it was given. The
+    update looked like it had started and nothing happened, every time.
+    """
+    detached = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+    no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+    flags = app_updater._windows_helper_flags()
+
+    assert not flags & detached
+    assert flags & no_window
+
+    install_dir = tmp_path / "installed"
+    install_dir.mkdir()
+    archive = tmp_path / "update.zip"
+    archive.write_bytes(b"archive")
+    launched: dict = {}
+
+    def popen(argv, **kwargs):
+        launched["kwargs"] = kwargs
+        return object()
+
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(install_dir / "BlindPilot.exe"))
+    monkeypatch.setattr("app_updater.platform.system", lambda: "Windows")
+    monkeypatch.setattr("app_updater.subprocess.Popen", popen)
+
+    schedule_install(archive)
+
+    assert not launched["kwargs"]["creationflags"] & detached
+
+
+def test_a_helper_that_cannot_leave_its_job_object_still_starts(monkeypatch, tmp_path):
+    """Breaking out of a job is refused when the job forbids it.
+
+    BlindPilot can be started from inside one, and staying in the job is far
+    better than not updating at all.
+    """
+    breakaway = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+    attempts: list[int] = []
+
+    def popen(argv, **kwargs):
+        attempts.append(kwargs["creationflags"])
+        if len(attempts) == 1:
+            raise OSError(87, "The parameter is incorrect")
+        return object()
+
+    install_dir = tmp_path / "installed"
+    install_dir.mkdir()
+    archive = tmp_path / "update.zip"
+    archive.write_bytes(b"archive")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(install_dir / "BlindPilot.exe"))
+    monkeypatch.setattr("app_updater.platform.system", lambda: "Windows")
+    monkeypatch.setattr("app_updater.subprocess.Popen", popen)
+
+    schedule_install(archive)
+
+    assert len(attempts) == 2
+    assert attempts[0] & breakaway
+    assert not attempts[1] & breakaway
+
+
+def test_a_failed_update_leaves_its_reason_for_the_next_start(monkeypatch, tmp_path):
+    """The update finishes after BlindPilot has closed, so this is the only
+    way its failure can ever reach the user."""
+    monkeypatch.setattr("app_updater.tempfile.gettempdir", lambda: str(tmp_path))
+
+    assert app_updater.pending_failure() == ("", "")
+
+    status = tmp_path / app_updater.STATUS_FILE_NAME
+    status.write_text("Could not move the current version aside.\nC:\\temp\\u.log\n", "utf-8")
+
+    assert app_updater.pending_failure() == (
+        "Could not move the current version aside.",
+        "C:\\temp\\u.log",
+    )
+
+    app_updater.clear_pending_failure()
+
+    assert app_updater.pending_failure() == ("", "")
+
+
+def test_abandoned_downloads_are_swept_but_a_running_one_is_left_alone(monkeypatch, tmp_path):
+    monkeypatch.setattr("app_updater.tempfile.gettempdir", lambda: str(tmp_path))
+    old = tmp_path / f"{app_updater.TEMPORARY_PREFIX}old.zip"
+    fresh = tmp_path / f"{app_updater.TEMPORARY_PREFIX}fresh.zip"
+    log = tmp_path / f"{app_updater.TEMPORARY_PREFIX}old.log"
+    status = tmp_path / app_updater.STATUS_FILE_NAME
+    unrelated = tmp_path / "something-else.zip"
+    for path in (old, fresh, log, status, unrelated):
+        path.write_bytes(b"x")
+    stale = time.time() - 24 * 60 * 60
+    os.utime(old, (stale, stale))
+    os.utime(log, (stale, stale))
+
+    removed = app_updater.sweep_temporary_files()
+
+    assert removed == 1
+    assert not old.exists()
+    # A download in flight belongs to an update that is running right now.
+    assert fresh.exists()
+    # The log and the recorded reason are what the next start reads.
+    assert log.exists()
+    assert status.exists()
+    assert unrelated.exists()
 
 
 def test_windows_installer_spawn_error_is_accessible_and_cleans_helper(monkeypatch, tmp_path):
@@ -244,6 +370,8 @@ def test_windows_helper_waits_for_old_process_then_replaces_and_launches(tmp_pat
     payload = tmp_path / "payload" / "BlindPilot"
     archive = tmp_path / "BlindPilot update.zip"
     helper = tmp_path / "updater.ps1"
+    log_file = tmp_path / "updater.log"
+    status_file = tmp_path / "updater-status.txt"
     marker = install_dir / "new-launched.txt"
     running_marker = install_dir / "new-running.txt"
     install_dir.mkdir()
@@ -302,6 +430,10 @@ def test_windows_helper_waits_for_old_process_then_replaces_and_launches(tmp_pat
                 str(install_dir),
                 "-Executable",
                 "BlindPilot.vbs",
+                "-LogFile",
+                str(log_file),
+                "-StatusFile",
+                str(status_file),
             ],
             cwd=tempfile.gettempdir(),
             stdin=subprocess.DEVNULL,
@@ -310,13 +442,8 @@ def test_windows_helper_waits_for_old_process_then_replaces_and_launches(tmp_pat
             text=True,
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            if list(tmp_path.glob("installed BlindPilot.update-new-*")):
-                break
-            if updater.poll() is not None:
-                break
-            time.sleep(0.05)
+        # Nothing may be replaced while the old process is still alive.
+        time.sleep(3)
 
         assert blocker.poll() is None
         assert (install_dir / "obsolete.txt").read_text(encoding="ascii") == "old"
@@ -324,8 +451,11 @@ def test_windows_helper_waits_for_old_process_then_replaces_and_launches(tmp_pat
 
         blocker.terminate()
         blocker.wait(timeout=10)
-        stdout, stderr = updater.communicate(timeout=20)
-        assert updater.returncode == 0, stdout + stderr
+        stdout, stderr = updater.communicate(timeout=120)
+        detail = stdout + stderr
+        if log_file.exists():
+            detail += log_file.read_text(encoding="utf-8", errors="replace")
+        assert updater.returncode == 0, detail
 
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline and not marker.exists():
@@ -336,6 +466,9 @@ def test_windows_helper_waits_for_old_process_then_replaces_and_launches(tmp_pat
         assert not archive.exists()
         assert not helper.exists()
         assert not list(tmp_path.glob("installed BlindPilot.update-*"))
+        # A clean run leaves neither a reason to report nor a log to read.
+        assert not status_file.exists()
+        assert not log_file.exists()
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline and running_marker.exists():
             time.sleep(0.05)

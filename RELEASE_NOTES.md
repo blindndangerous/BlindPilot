@@ -1,8 +1,45 @@
-# BlindPilot 0.3.9
+# BlindPilot 0.3.10
 
 BlindPilot is an accessible desktop reader for Claude Code, Codex, and FreeBuff. It is
 based on Claude Code Reader and remains available under the MIT License, with credit to
 the original project throughout the application and documentation.
+
+## Updates install
+
+- No BlindPilot update has ever installed. The helper that replaces the files was
+  started detached from any console, and Windows PowerShell responds to that by exiting
+  without running the script it was given — reporting success as it goes. So every
+  update downloaded, verified, announced that it was restarting to install, and then
+  quietly did nothing. That has been true since 0.3.0.
+- **This one has to be installed by hand.** The copy you are running now cannot install
+  it, because installing it is the thing that was broken. Every update after this one
+  installs on its own.
+
+## An update that fails now says so
+
+- An update finishes after BlindPilot has closed, so a failure had nowhere to be
+  reported and was never seen. The reason is now written down as it happens, and read
+  out the next time BlindPilot starts, along with where to find the log.
+- Abandoned downloads are deleted at startup. A failed update left tens of megabytes
+  behind every time it was tried.
+
+## An update no longer has to be lucky
+
+- The contents of the installed folder are replaced rather than the folder renamed, so
+  a shortcut, a file sync client, or the application's own working directory can no
+  longer block an update.
+- BlindPilot waits for everything running out of the installed folder — the agent
+  command-line tools it started, and FreeBuff's console host — rather than only the one
+  process that asked for the update, and then checks that each file can actually be
+  opened before replacing it.
+- A move that leaves files behind is retried, which is what a virus scanner reading a
+  freshly written file causes.
+- If anything goes wrong part way through, the previous version is copied back and its
+  backup is kept. BlindPilot is restarted either way.
+- BlindPilot is never restarted with the installed folder as its working directory,
+  which is what stopped the *following* update from replacing it.
+
+## Included from 0.3.9
 
 ## Past conversations come back
 

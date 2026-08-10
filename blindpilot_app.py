@@ -45,9 +45,12 @@ import wx
 from app_updater import (
     ReleaseInfo,
     UpdateError,
+    clear_pending_failure,
     download_update,
     fetch_latest_release,
+    pending_failure,
     schedule_install,
+    sweep_temporary_files,
     version_tuple,
 )
 from agent_backends import (
@@ -160,7 +163,7 @@ def announce(text: str) -> None:
 
 
 APP_NAME = "BlindPilot"
-APP_VERSION = "0.3.9"
+APP_VERSION = "0.3.10"
 ORIGINAL_APP_CREDIT = (
     "Based on the original Claude Code Reader application by doubletaponair.\n"
     "https://github.com/doubletaponair/claude-code-reader"
@@ -4551,6 +4554,27 @@ class MainFrame(wx.Frame):
         """Startup entry point: report only an available update, never network noise."""
         self._check_for_updates(silent=True)
 
+    def report_failed_update(self) -> None:
+        """Say why the last update did not install, if it did not.
+
+        An update finishes after BlindPilot has closed, so a failure has no
+        window to report to. The helper writes the reason down and this is the
+        one place it gets read out — otherwise a failed update is silent, which
+        is exactly how a broken updater went unnoticed for nine releases.
+        """
+        reason, log = pending_failure()
+        clear_pending_failure()
+        if not reason:
+            return
+        message = f"The last update did not install: {reason}"
+        if log:
+            message += f"\n\nWhat happened is written down in:\n{log}"
+        announce(message)
+        with wx.MessageDialog(
+            self, message, "BlindPilot Update", style=wx.OK | wx.ICON_WARNING
+        ) as dialog:
+            dialog.ShowModal()
+
     def _on_update_checked(self, release: Optional[ReleaseInfo], error: str, silent: bool) -> None:
         self._update_checking = False
         if error:
@@ -5009,7 +5033,12 @@ def main() -> int:
     if gui_startup_smoke:
         wx.CallLater(1500, frame.Close)
     else:
+        # An update that failed did so with no window to report to, so its
+        # reason is read out here, before anything else competes for attention.
+        wx.CallLater(1200, frame.report_failed_update)
         wx.CallLater(5000, frame.check_for_updates_silently)
+        # Abandoned downloads are tens of megabytes each.
+        wx.CallLater(8000, sweep_temporary_files)
     app.MainLoop()
     return 0
 

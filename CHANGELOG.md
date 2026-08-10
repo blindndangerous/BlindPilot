@@ -4,6 +4,18 @@ Readable release history for BlindPilot. When adjacent releases were part of the
 same fix stream, they are combined with a version range such as
 `v0.3.6-v0.3.7`.
 
+## v0.3.10 - 2026-08-10
+
+- Install updates at all. No update since 0.3.0 has ever been applied: the helper that does the work was started in a way that made Windows PowerShell exit without running it, and report success while doing so.
+- Replace the contents of the installed folder rather than renaming the folder, so a shortcut, a sync client, or the application's own working directory cannot block an update.
+- Wait for everything running out of the installed folder, not just the one process that asked for the update, and confirm each file can be opened before replacing it.
+- Retry a move that leaves files behind, which is what a virus scanner reading a freshly written file causes.
+- Put the previous version back, by copy rather than by move, if anything goes wrong part way through, and keep the backup.
+- Say why an update failed. An update finishes after BlindPilot has closed, so the reason is written down and read out at the next start, with the path to a log.
+- Update an installed copy into its existing location, and restart it even when the installer reports a problem.
+- Never restart BlindPilot with the installed folder as its working directory, which is what stopped the following update from replacing it.
+- Delete abandoned update downloads at startup; a failed update used to leave tens of megabytes behind every time.
+
 ## v0.3.9 - 2026-08-10
 
 - Reopen a past conversation from any backend and carry on with it, from File, Recent Conversations (Ctrl+H).
