@@ -97,7 +97,9 @@ def test_claude_injected_records_never_become_the_title(home: Path) -> None:
         CLAUDE_CWD,
         "22222222-2222-2222-2222-222222222222",
         [
-            _claude_user("<local-command-caveat>Ignore this</local-command-caveat>", cwd=CLAUDE_CWD),
+            _claude_user(
+                "<local-command-caveat>Ignore this</local-command-caveat>", cwd=CLAUDE_CWD
+            ),
             _claude_user(
                 "<command-name>/clear</command-name>\n<command-args></command-args>",
                 cwd=CLAUDE_CWD,
@@ -308,7 +310,9 @@ def test_freebuff_title_comes_from_its_own_metadata(home: Path) -> None:
         first_prompt="testing with a recipe for honey garlic chicken...",
     )
 
-    entries = list_history("freebuff", str(Path("C:/work/demo") if Path("C:/").drive else "/work/demo"))
+    entries = list_history(
+        "freebuff", str(Path("C:/work/demo") if Path("C:/").drive else "/work/demo")
+    )
 
     assert len(entries) == 1
     # FreeBuff's stored preview is elided; the title must not be cut twice.
@@ -355,7 +359,9 @@ def test_every_backend_appears_newest_first(home: Path) -> None:
 
 def test_the_list_is_capped(home: Path) -> None:
     for index in range(5):
-        _write_claude(home, CLAUDE_CWD, f"session-{index}", [_claude_user(f"Ask {index}", cwd=CLAUDE_CWD)])
+        _write_claude(
+            home, CLAUDE_CWD, f"session-{index}", [_claude_user(f"Ask {index}", cwd=CLAUDE_CWD)]
+        )
 
     assert len(list_history("claude", CLAUDE_CWD, limit=3)) == 3
 

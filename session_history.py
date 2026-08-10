@@ -104,9 +104,7 @@ _INJECTED_BLOCK = re.compile(r"<([A-Za-z][\w.:-]*)>[\s\S]*?</\1>")
 
 # Injected preamble that is not wrapped in an element of its own. Codex writes
 # this heading above the instructions it loaded from AGENTS.md.
-_INJECTED_MARKERS = (
-    re.compile(r"^#\s*AGENTS\.md instructions.*$", re.IGNORECASE | re.MULTILINE),
-)
+_INJECTED_MARKERS = (re.compile(r"^#\s*AGENTS\.md instructions.*$", re.IGNORECASE | re.MULTILINE),)
 
 
 def _home() -> Path:

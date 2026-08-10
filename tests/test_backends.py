@@ -656,7 +656,10 @@ class _ScriptedCodexServer:
         yield json.dumps({"method": "item/started", "params": {"item": item}})
         yield json.dumps({"method": "item/completed", "params": {"item": item}})
         yield json.dumps(
-            {"method": "turn/completed", "params": {"turn": {"id": "turn-1", "status": "completed"}}}
+            {
+                "method": "turn/completed",
+                "params": {"turn": {"id": "turn-1", "status": "completed"}},
+            }
         )
 
 

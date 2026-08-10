@@ -110,6 +110,7 @@ Before opening a pull request:
 ```powershell
 python -m pytest -q
 python -m ruff check .
+python -m ruff format --check .
 ```
 
 ## Contributing

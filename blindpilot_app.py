@@ -3129,7 +3129,9 @@ class SessionPanel(wx.Panel):
         # Picks up the restored session: relabels the backend line, and gives
         # FreeBuff's terminal a head start on the conversation being resumed.
         self.backend_changed()
-        responses = "1 response" if self._response_count == 1 else f"{self._response_count} responses"
+        responses = (
+            "1 response" if self._response_count == 1 else f"{self._response_count} responses"
+        )
         self._set_status(f"Resumed: {entry.title} — {responses}")
 
     def _on_session_started(self, session_id: str) -> None:
