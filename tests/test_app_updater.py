@@ -192,6 +192,7 @@ def test_windows_installer_waits_swaps_and_relaunches(monkeypatch, tmp_path):
         helper.unlink(missing_ok=True)
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="creation flags are a Windows concept")
 def test_the_update_helper_is_never_started_detached(monkeypatch, tmp_path):
     """DETACHED_PROCESS is why no update installed between 0.3.0 and 0.3.9.
 
@@ -227,6 +228,7 @@ def test_the_update_helper_is_never_started_detached(monkeypatch, tmp_path):
     assert not launched["kwargs"]["creationflags"] & detached
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="job objects are a Windows concept")
 def test_a_helper_that_cannot_leave_its_job_object_still_starts(monkeypatch, tmp_path):
     """Breaking out of a job is refused when the job forbids it.
 
