@@ -558,3 +558,66 @@ def test_reasoning_is_left_out_of_the_activity_by_default(monkeypatch):
     app.SessionPanel._on_activity(panel, "thinking", "Considering the options")
 
     assert [row.kind for row in panel._rows] == ["thinking"]
+
+
+# ----- Compaction and starting over -----
+def _compaction_panel(backend, session_id):
+    """A panel stub with just the state compaction looks at."""
+    import claude_reader
+
+    calls = {"announced": [], "sent": [], "prompt": ""}
+    panel = type(
+        "PanelStub",
+        (),
+        {
+            "_worker": None,
+            "_session_id": session_id,
+            "_session_backend": backend,
+            "selected_backend": lambda self: backend,
+            "_announce": lambda self, text: calls["announced"].append(text),
+            "_on_send": lambda self, worker_extra=None: calls["sent"].append(worker_extra),
+            "prompt": type(
+                "PromptStub", (), {"SetValue": lambda self, text: calls.update(prompt=text)}
+            )(),
+        },
+    )()
+    return claude_reader.SessionPanel.compact_conversation, panel, calls
+
+
+def test_compacting_claude_sends_it_as_an_ordinary_message():
+    compact, panel, calls = _compaction_panel("claude", "session-1")
+
+    compact(panel)
+
+    assert calls["prompt"] == "/compact"
+    # Claude Code needs no extra worker arguments — the message is the command.
+    assert calls["sent"] == [{}]
+
+
+def test_compacting_codex_tells_its_worker_rather_than_typing_a_command():
+    compact, panel, calls = _compaction_panel("codex", "thread-1")
+
+    compact(panel)
+
+    assert calls["sent"] == [{"compact": True}]
+
+
+def test_freebuff_says_plainly_that_it_cannot_compact():
+    """Silence here would read as a broken command rather than a missing one."""
+    compact, panel, calls = _compaction_panel("freebuff", "chat-1")
+
+    compact(panel)
+
+    assert calls["sent"] == []
+    assert calls["announced"] == [
+        "Error: FreeBuff cannot compact a conversation. Start a new conversation instead"
+    ]
+
+
+def test_there_is_nothing_to_compact_before_the_first_message():
+    compact, panel, calls = _compaction_panel("claude", None)
+
+    compact(panel)
+
+    assert calls["sent"] == []
+    assert calls["announced"] == ["Error: There is no conversation to compact yet"]

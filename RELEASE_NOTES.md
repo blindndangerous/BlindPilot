@@ -1,8 +1,36 @@
-# BlindPilot 0.3.8
+# BlindPilot 0.3.9
 
 BlindPilot is an accessible desktop reader for Claude Code, Codex, and FreeBuff. It is
 based on Claude Code Reader and remains available under the MIT License, with credit to
 the original project throughout the application and documentation.
+
+## Past conversations come back
+
+- Every backend already stored its conversations and could resume one by id, but there
+  was no way to find one again: a conversation existed only while its tab was open.
+  File, Recent Conversations (Ctrl+H) now lists them, newest first, each titled by the
+  message that started it — which is the only thing that tells two of them apart when
+  they are read out.
+- Opening one rebuilds it into the same navigable rows a live answer produces, adopts
+  the backend's own session id so the next message continues it, and names the tab after
+  its first message.
+- The list can be filtered as you type, and widened from this folder to every folder, or
+  from one backend to all three.
+- The context each CLI writes into its own transcript — plugin listings, environment
+  blocks, slash-command wrappers — is left out, so a title is what the person typed.
+
+## Compacting, and starting over
+
+- File, Compact Conversation (Ctrl+Shift+K) summarises the conversation so far so the
+  backend has room to keep going. Claude Code takes it as its own command; Codex has a
+  separate app-server request for it, which BlindPilot now makes.
+- FreeBuff's command-line interface has no compaction at all. The command is greyed out
+  for it and says so, rather than failing quietly.
+- File, Start New Conversation (Ctrl+Shift+N) forgets the current conversation and starts
+  a fresh one in the same tab. The old one is still there in Recent Conversations.
+- The FreeBuff slash-command list now matches the commands FreeBuff actually has.
+
+## Included from 0.3.8
 
 ## FreeBuff answers are read as they are written
 

@@ -604,3 +604,107 @@ def test_freebuff_narrates_only_finished_sentences():
     assert agent_backends._complete_sentences("The user is asking about") == ""
     assert agent_backends._complete_sentences("First line\nsecond half") == "First line"
     assert agent_backends._complete_sentences('He said "go." Then') == 'He said "go."'
+
+
+# ----- Compaction -----
+
+
+class _ScriptedCodexServer:
+    """A stand-in app server that answers whatever the worker actually asks.
+
+    Its stdout is a generator, so each line is produced only when the worker
+    reads it — by which point the request that line replies to has already been
+    written. That is what lets the script assert on real ordering rather than
+    on a fixed transcript.
+    """
+
+    def __init__(self, thread_id: str = "thread-1") -> None:
+        self.sent: list[dict] = []
+        self.stdin = self
+        self.stderr = None
+        self.stdout = self._script()
+
+    def write(self, data: str) -> None:
+        self.sent.append(json.loads(data))
+
+    def flush(self) -> None:
+        pass
+
+    def poll(self):
+        return None
+
+    def kill(self) -> None:
+        pass
+
+    def methods(self) -> list[str]:
+        return [message.get("method", "") for message in self.sent]
+
+    def _last(self, method: str) -> dict:
+        for message in reversed(self.sent):
+            if message.get("method") == method:
+                return message
+        raise AssertionError(f"the worker never sent {method}: {self.methods()}")
+
+    def _script(self):
+        resume = self._last("thread/resume")
+        yield json.dumps({"id": resume["id"], "result": {"thread": {"id": "thread-1"}}})
+        compact = self._last("thread/compact/start")
+        self.compact_params = compact.get("params")
+        yield json.dumps({"id": compact["id"], "result": {}})
+        yield json.dumps({"method": "turn/started", "params": {"turn": {"id": "turn-1"}}})
+        item = {"type": "contextCompaction", "id": "compaction-1"}
+        yield json.dumps({"method": "item/started", "params": {"item": item}})
+        yield json.dumps({"method": "item/completed", "params": {"item": item}})
+        yield json.dumps(
+            {"method": "turn/completed", "params": {"turn": {"id": "turn-1", "status": "completed"}}}
+        )
+
+
+def test_codex_compaction_is_a_request_of_its_own_not_a_message(monkeypatch):
+    """Codex has no /compact message, so sending one as text would do nothing."""
+    server = _ScriptedCodexServer()
+    monkeypatch.setattr(agent_backends, "find_backend_cli", lambda _backend: "codex")
+    monkeypatch.setattr(agent_backends.subprocess, "Popen", lambda *_a, **_k: server)
+    completed: list[str] = []
+    failures: list[str] = []
+    callbacks = _callbacks()
+    callbacks["on_complete"] = completed.append
+    callbacks["on_failed"] = failures.append
+    worker = CodexWorker("/compact", "thread-1", ".", "default", compact=True, **callbacks)
+
+    worker._do_run()
+
+    assert not failures
+    assert "thread/compact/start" in server.methods()
+    assert server.compact_params == {"threadId": "thread-1"}
+    # The prompt text is never sent: a compaction turn is not a message.
+    assert "turn/start" not in server.methods()
+    # A compaction turn produces no answer, so it has to say so itself.
+    assert completed == ["Conversation compacted."]
+
+
+def test_codex_will_not_compact_a_conversation_that_has_not_started(monkeypatch):
+    monkeypatch.setattr(agent_backends, "find_backend_cli", lambda _backend: "codex")
+    failures: list[str] = []
+    callbacks = _callbacks()
+    callbacks["on_failed"] = failures.append
+    worker = CodexWorker("/compact", None, ".", "default", compact=True, **callbacks)
+
+    worker._do_run()
+
+    assert failures == ["There is no Codex conversation to compact yet"]
+
+
+def test_only_the_backends_with_a_compaction_command_offer_one():
+    from agent_backends import BACKENDS, compaction_request
+
+    assert BACKENDS[BACKEND_CLAUDE].supports_compaction is True
+    assert BACKENDS[BACKEND_CODEX].supports_compaction is True
+    # FreeBuff's CLI has no compaction command at all.
+    assert BACKENDS[BACKEND_FREEBUFF].supports_compaction is False
+
+    # Claude Code acts on "/compact" as an ordinary message; Codex needs its
+    # worker told, because the text alone would mean nothing to it.
+    assert compaction_request(BACKEND_CLAUDE) == ("/compact", {})
+    assert compaction_request(BACKEND_CODEX) == ("/compact", {"compact": True})
+    assert compaction_request(BACKEND_FREEBUFF) is None

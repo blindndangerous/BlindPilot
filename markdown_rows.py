@@ -133,6 +133,11 @@ def _strip_noise(text: str) -> str:
     return "".join(ch for ch in text if not _is_noise(ord(ch)))
 
 
+# Public name for the same thing: `session_history` titles past conversations
+# with their first message, which has to be cleaned the way row labels are.
+strip_noise = _strip_noise
+
+
 def _flatten(text: str) -> str:
     """Collapse whitespace/newlines so a block reads as one logical line.
 

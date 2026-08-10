@@ -1,87 +1,65 @@
 # BlindPilot
 
-BlindPilot is an accessible desktop frontend for Claude Code, OpenAI Codex,
-and FreeBuff. It uses native wxPython controls so screen readers can navigate
-prompts, responses, live activity, settings, and multiple conversations without
-having to interpret a terminal interface.
+A vibe-coded, screen-reader-friendly desktop front end for AI coding agents on Windows and macOS, built so Claude Code, Codex, and FreeBuff can be driven without reading a terminal.
 
-> BlindPilot is based on the original
-> **[Claude Code Reader](https://github.com/doubletaponair/claude-code-reader)**
-> by [doubletaponair](https://github.com/doubletaponair). We gratefully credit
-> its authors and contributors for the foundational accessibility-first design.
-> BlindPilot preserves that work and extends it with a persistent, pluggable
-> backend system. See [CREDITS.md](CREDITS.md).
+[![Join SerrebiProjects on Telegram](https://img.shields.io/badge/Telegram-SerrebiProjects-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/SerrebiProjects)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
 
-BlindPilot is released under the [MIT License](LICENSE).
+**Have a question, hit a bug, or want early word on new releases?** Join the [SerrebiProjects Telegram group](https://t.me/SerrebiProjects) — the community hub for BlindPilot and my other projects, and the fastest place to get help.
 
-## Updates
-
-BlindPilot checks the public GitHub Releases feed shortly after startup. It only
-offers versions newer than the running application and never installs without
-confirmation. Packaged builds download the matching Windows or macOS archive,
-verify its published SHA-256 digest, install after BlindPilot exits, and restart
-the application. Use **Help → Check for Updates** to check immediately.
-
-## Backend selection
-
-Open **File → Backend** and choose **Claude Code**, **Codex**, or **FreeBuff**.
-Claude Code is selected on a fresh installation. Your choice is saved globally and
-used for all subsequent turns and launches until you change it again. If you
-switch while a tab already has a conversation, BlindPilot starts a new
-conversation with the new backend on that tab's next send.
-
-Open **File → Manage Backends** at any time to run the accessible installer,
-updater, and sign-in flow for the selected provider. The same provider picker is part of
-first-run setup, so Claude Code is no longer required before Codex or FreeBuff
-can be used.
-
-| Backend | Integration | Sessions | Model control | Permission modes |
-|---|---|---:|---:|---:|
-| Claude | Streaming JSON CLI | Yes | Yes | Yes |
-| Codex | Official app-server JSONL protocol | Yes | Yes, including installed reasoning levels | Yes |
-| FreeBuff | Pseudo-terminal adapter | Yes | Yes; DeepSeek V4 Pro by default | Managed by FreeBuff |
-
-FreeBuff currently provides no JSON or headless API. BlindPilot therefore runs
-its terminal UI in a hidden pseudo-terminal, extracts reasoning and answer
-updates for the accessible response list, and captures FreeBuff's saved chat ID
-for continuation. Terminal redraws and advertisements are filtered before text
-is announced. Its permission picker is disabled because the FreeBuff CLI does
-not expose equivalent permission controls.
-
-Model catalogs are discovered from each installed backend at runtime instead of
-being permanently compiled into BlindPilot. Use **/model** for the recent list,
-or **/models** to discard caches and force a fresh provider query. FreeBuff's
-catalog is read from its installed picker, and `deepseek/deepseek-v4-pro` is the
-default until you choose another available FreeBuff model.
+BlindPilot is based on the original **[Claude Code Reader](https://github.com/doubletaponair/claude-code-reader)** by [doubletaponair](https://github.com/doubletaponair). It keeps that project's accessibility-first design and adds a pluggable multi-backend system. See [CREDITS.md](CREDITS.md).
 
 ## Features
 
-- Native, screen-reader-friendly controls on Windows and macOS.
-- One navigable row per heading, paragraph, list item, quote, code block,
-  thought, tool action, or tool result.
-- Optional live narration through NVDA, JAWS, VoiceOver, or another available
-  accessibility output.
-- Multiple project sessions with independent backend conversations.
-- Steering messages while a backend is working, and stopping it outright.
-- File and clipboard-image attachments represented as explicit prompt paths.
-- Search, response jumping, whole-response copy, code copy, and code saving.
-- Provider-aware model, reasoning-effort, permission, and slash-command controls.
-- Earcons for sent, working, and received states.
+- Native wxPython controls throughout, so NVDA, JAWS, and VoiceOver read the app rather than interpreting a terminal.
+- Runs Claude Code, Codex, and FreeBuff, switchable from the File menu and remembered between launches.
+- Segments every answer into navigable rows: one per heading, paragraph, list item, quote, code block, thought, tool action, and tool result.
+- Reads answers aloud as they arrive, or stays quiet until the whole answer is ready.
+- Reopens past conversations from any backend, titled by the message that started them, and carries on where they left off.
+- Compacts a long conversation in place so the backend has room to keep going.
+- Runs several project sessions at once, each with its own conversation, folder, model, and permission mode.
+- Steers a task while it is still running, or stops it outright and keeps what it produced.
+- Attaches files and pasted clipboard images as explicit prompt paths.
+- Searches responses, jumps between them, and copies a code block, a whole response, or the whole conversation.
+- Picks the model and reasoning effort from whatever the installed CLI actually reports.
+- Marks sent, working, and received with earcons, so a long run is audible without being spoken.
+- Installs, updates, adds to PATH, and signs into any of the three backends from an accessible wizard.
+- Updates itself from GitHub Releases after verifying the published SHA-256.
 
-Live rows and automatic narration are enabled by default. The Options menu can
-turn narration off, use a read-only text field for easier screen-reader review,
-or select **Silent until the response mode** to remain quiet until an answer is complete.
+## Backends
 
-## Install and run
+| Backend | Integration | Sessions | Model control | Permission modes | Compaction |
+|---|---|---|---|---|---|
+| Claude Code | Streaming JSON CLI | Yes | Yes | Yes | Yes |
+| Codex | Official app-server protocol | Yes | Yes, including reasoning effort | Yes | Yes |
+| FreeBuff | Pseudo-terminal adapter | Yes | Yes; DeepSeek V4 Pro by default | Managed by FreeBuff | No |
 
-Python 3.10 or newer is recommended.
+FreeBuff ships no JSON or headless API, so BlindPilot runs its terminal interface in a hidden pseudo-terminal, reads the answer off its screen a finished sentence at a time, and captures its chat id so the conversation can be resumed. Terminal redraws and advertisements are filtered out before anything is spoken. Its permission picker and Compact Conversation are disabled because the FreeBuff CLI has no equivalent.
 
-```powershell
-python -m pip install -r requirements.txt
-python blind_pilot.py
-```
+## Download and install
 
-Install and authenticate at least one backend:
+Grab the latest build from the [Releases page](https://github.com/serrebidev/BlindPilot/releases).
+For a version-by-version history, see the [changelog](CHANGELOG.md).
+
+**Windows installer (recommended)**
+
+1. Download `BlindPilot-Setup-x64.exe`.
+2. Run it. It installs per user with no administrator prompt, adds a Start Menu entry, and closes a running copy before replacing it.
+
+**Windows portable**
+
+1. Download `BlindPilot-Windows-x64.zip`.
+2. Extract it anywhere and run `BlindPilot.exe` — no installation required.
+
+**macOS**
+
+Download `BlindPilot-macOS-arm64.zip` for Apple Silicon or `BlindPilot-macOS-x64.zip` for Intel. The macOS builds are ad-hoc signed but not notarized, so first launch may need approval in System Settings under Privacy & Security.
+
+Settings live in `%APPDATA%\BlindPilot\config.json` on Windows and `~/.config/blindpilot/config.json` elsewhere. An existing Claude Code Reader configuration is imported once and never modified.
+
+## Set up a backend
+
+BlindPilot's first-run wizard and **File → Manage Backends** can find, install, update, and sign into any of the three. A missing CLI is reported as an actionable error and does not affect the others. To do it by hand:
 
 ```powershell
 # Claude Code
@@ -97,74 +75,53 @@ npm install -g freebuff
 freebuff login
 ```
 
-BlindPilot's first-run and **Manage Backends** wizards can locate, install,
-update, add to PATH, and authenticate Claude Code, Codex, or FreeBuff. A missing selected
-CLI is reported as an actionable error without affecting the other installed
-backends.
+## Keyboard
 
-Configuration is stored in `%APPDATA%\BlindPilot\config.json` on Windows and
-`~/.config/blindpilot/config.json` elsewhere. Existing Claude Code Reader
-configuration is imported once from its legacy location and is never modified.
+- **Ctrl+L** focus the prompt, **Ctrl+T** open a session, **Ctrl+W** close it.
+- **Ctrl+H** reopen a past conversation.
+- **Ctrl+Shift+K** compact this conversation, **Ctrl+Shift+N** start a fresh one.
+- **Ctrl+F** search responses, **Ctrl+R** jump to the latest.
+- **Ctrl+/** slash commands, **Ctrl+.** stop the running task.
+- **Ctrl+Shift+A** attach files, **Ctrl+Shift+M** cycle permission modes.
+- **Ctrl+Shift+[** and **Ctrl+Shift+]** move between sessions; **Ctrl+1** to **Ctrl+9** jump straight to one.
+- **Up** from the prompt's first line enters the newest response; **Down** off it returns to the prompt.
 
-## Keyboard workflow
+On macOS the same accelerators map to Command where appropriate.
 
-- **Ctrl+L**: focus the prompt.
-- **Ctrl+T**: open a session.
-- **Ctrl+W**: close the current session.
-- **Ctrl+F**: search responses.
-- **Ctrl+R**: jump to the latest response.
-- **Ctrl+/**: open provider-aware slash commands.
-- **Ctrl+.**: stop the task running in this session.
-- **Ctrl+Shift+A**: attach files.
-- **Ctrl+Shift+M**: cycle common permission modes.
-- **Ctrl+Shift+[ / ]**: previous or next session.
-- **Ctrl+1 through Ctrl+9**: jump directly to a session.
-- **Up** from the prompt's first line: move to the newest response row.
-- **Down** from the newest response row: return to the prompt.
+## Run from source (any OS)
 
-On macOS, wxPython maps the same accelerator definitions to Command where
-appropriate.
+1. Install Python 3.10 or newer.
+2. Install dependencies: `pip install -r requirements.txt`
+3. Launch it: `python blind_pilot.py`
 
-## Development
+`blind_pilot.py` is the stable entry point and the implementation lives in `blindpilot_app.py`. `claude_reader.py` is a compatibility alias for anything written against the original application.
 
-```powershell
-python -m pytest -q
-python -m py_compile blind_pilot.py blindpilot_app.py claude_reader.py agent_backends.py markdown_rows.py
-```
-
-The stable entry point is `blind_pilot.py`, and the implementation lives in
-`blindpilot_app.py`. `claude_reader.py` is a compatibility alias for scripts and
-integrations written for the original application.
-
-The release build uses PyInstaller's one-directory layout so the verified
-updater can replace the application safely after it exits. Local example:
+## Building
 
 ```powershell
 python -m pip install -r requirements-build.txt
 pyinstaller --onedir --windowed --name BlindPilot --add-data "EarCons;EarCons" blind_pilot.py
 ```
 
-Windows releases also include `BlindPilot-Setup-x64.exe`, a per-user installer
-that needs no administrator access. The installer creates Start menu shortcuts,
-supports silent deployment, and closes a running BlindPilot instance before
-replacing its files. It is built from [`installer/BlindPilot.iss`](installer/BlindPilot.iss).
+The one-directory layout is what lets the verified updater replace the application after it exits. The Windows installer is built from [`installer/BlindPilot.iss`](installer/BlindPilot.iss). Pushing a `v*` tag runs [.github/workflows/release.yml](.github/workflows/release.yml), which tests startup and the full suite, then publishes the Windows installer, the Windows x64 archive, and both macOS archives with SHA-256 files.
 
-Pushing a `v*` tag runs [.github/workflows/release.yml](.github/workflows/release.yml),
-tests startup and the full suite, and publishes the Windows installer, Windows x64
-archive, and Intel and Apple Silicon macOS archives with SHA-256 files.
+Before opening a pull request:
 
-The original build document is retained as
-[`original-claude-code-reader-spec.html`](original-claude-code-reader-spec.html)
-for historical attribution. It describes the original Claude-only scope, not
-the current multi-backend architecture.
+```powershell
+python -m pytest -q
+python -m ruff check .
+```
 
-## License and credit
+## Contributing
 
-Copyright (c) 2026 doubletaponair and BlindPilot contributors.
+Pull requests are welcome. If BlindPilot has been useful to you, open a PR with a fix or feature and I'll review it.
 
-Licensed under the MIT License. BlindPilot's name and later multi-backend work
-do not erase its origin: the original
-[Claude Code Reader](https://github.com/doubletaponair/claude-code-reader) by
-[doubletaponair](https://github.com/doubletaponair) is credited in the README,
-About dialog, source headers, historical specification, and
-[CREDITS.md](CREDITS.md).
+## License
+
+BlindPilot is under the [MIT license](LICENSE) — use it, change it, redistribute it, or package it, no permission needed. Every source file carries an `SPDX-License-Identifier: MIT` header so packaging tools pick the license up automatically.
+
+Copyright (c) 2026 doubletaponair and BlindPilot contributors. The name changed and the backends multiplied, but the origin has not been erased: [Claude Code Reader](https://github.com/doubletaponair/claude-code-reader) is credited in this README, the About dialog, the source headers, [CREDITS.md](CREDITS.md), and the retained original specification at [`original-claude-code-reader-spec.html`](original-claude-code-reader-spec.html).
+
+## Community and support
+
+Report bugs and request features in [Issues](https://github.com/serrebidev/BlindPilot/issues). For questions, feedback, and release news, join the [SerrebiProjects Telegram group](https://t.me/SerrebiProjects).

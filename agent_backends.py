@@ -231,6 +231,10 @@ class BackendInfo:
     supports_effort: bool
     supports_permissions: bool
     supports_steering: bool
+    # Whether the provider can summarise a long conversation in place to free
+    # up its context window. FreeBuff's CLI has no such command — its only
+    # context control is starting a new conversation.
+    supports_compaction: bool = False
 
 
 BACKENDS = {
@@ -244,6 +248,7 @@ BACKENDS = {
         True,
         True,
         True,
+        supports_compaction=True,
     ),
     BACKEND_CODEX: BackendInfo(
         BACKEND_CODEX,
@@ -255,6 +260,7 @@ BACKENDS = {
         True,
         True,
         True,
+        supports_compaction=True,
     ),
     BACKEND_FREEBUFF: BackendInfo(
         BACKEND_FREEBUFF,
@@ -266,8 +272,27 @@ BACKENDS = {
         False,
         False,
         True,
+        supports_compaction=False,
     ),
 }
+
+# What a "compact this conversation" turn looks like per provider: the text to
+# send, and any extra keyword arguments its worker needs.
+#
+# Claude Code takes ``/compact`` as an ordinary message even in headless
+# streaming mode, and acts on it. Codex has no such message — compaction is a
+# separate app-server request — so its worker is told to compact instead, and
+# ignores the text. The text is still shown to the user either way, so the row
+# in the list says what was asked for.
+_COMPACTION_REQUESTS: dict[str, tuple[str, dict]] = {
+    BACKEND_CLAUDE: ("/compact", {}),
+    BACKEND_CODEX: ("/compact", {"compact": True}),
+}
+
+
+def compaction_request(backend: object) -> Optional[tuple[str, dict]]:
+    """(message text, extra worker arguments) to compact, or None if it can't."""
+    return _COMPACTION_REQUESTS.get(normalize_backend(backend))
 
 
 def normalize_backend(value: object) -> str:
@@ -768,6 +793,7 @@ class CodexWorker(threading.Thread):
         *,
         model: str = "",
         effort: str = "",
+        compact: bool = False,
         on_session: Callable[[str], None],
         on_started: Callable[[], None],
         on_activity: Callable[[str, str], None],
@@ -782,6 +808,9 @@ class CodexWorker(threading.Thread):
         self._permission_mode = permission_mode
         self._model = model
         self._effort = effort
+        # Compaction is a request of its own rather than a message, so this
+        # turn summarises the conversation instead of adding to it.
+        self._compact = compact
         self._on_session = on_session
         self._on_started = on_started
         self._on_activity = on_activity
@@ -887,6 +916,9 @@ class CodexWorker(threading.Thread):
         if not binary:
             self._on_failed("Codex is not installed. Run: npm install -g @openai/codex")
             return
+        if self._compact and not self._session_id:
+            self._on_failed("There is no Codex conversation to compact yet")
+            return
         try:
             server_binary = _codex_app_server_binary(binary)
             self._proc = subprocess.Popen(
@@ -950,6 +982,7 @@ class CodexWorker(threading.Thread):
         self._send(request)
 
         turn_request = 0
+        compact_request = 0
         started_notified = False
         assert self._proc.stdout is not None
         for raw in self._proc.stdout:
@@ -971,6 +1004,19 @@ class CodexWorker(threading.Thread):
                     self._on_failed("Codex did not return a session id")
                     return
                 self._on_session(self._thread_id)
+                if self._compact:
+                    # Compaction is not a message: it answers immediately with
+                    # an empty result and then runs a turn of its own, whose
+                    # notifications the loop below already understands.
+                    compact_request = self._next_id()
+                    self._send(
+                        {
+                            "method": "thread/compact/start",
+                            "id": compact_request,
+                            "params": {"threadId": self._thread_id},
+                        }
+                    )
+                    continue
                 approval, sandbox = self._policy(self._permission_mode)
                 params = {
                     "threadId": self._thread_id,
@@ -985,6 +1031,14 @@ class CodexWorker(threading.Thread):
                     params["effort"] = self._effort
                 turn_request = self._next_id()
                 self._send({"method": "turn/start", "id": turn_request, "params": params})
+                continue
+
+            if compact_request and message.get("id") == compact_request:
+                error = message.get("error")
+                if error:
+                    self._on_failed(self._error_text(error, "Codex could not compact"))
+                    return
+                # The result is empty; the compaction turn announces itself.
                 continue
 
             if turn_request and message.get("id") == turn_request:
@@ -1051,6 +1105,10 @@ class CodexWorker(threading.Thread):
                 elif status == "interrupted":
                     if not self._cancelled:
                         self._on_failed("Codex turn was interrupted")
+                elif self._compact:
+                    # A compaction turn produces no answer text of its own, so
+                    # say what happened rather than finishing in silence.
+                    self._on_complete("Conversation compacted.")
                 else:
                     self._on_complete("".join(self._assistant_parts).strip())
                 return

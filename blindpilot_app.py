@@ -62,6 +62,7 @@ from agent_backends import (
     backend_label,
     blindpilot_config_dir,
     codex_model_options,
+    compaction_request,
     discard_freebuff_prewarm,
     find_backend_cli,
     freebuff_model_options,
@@ -79,6 +80,13 @@ from markdown_rows import (
     parse_response,
     reassemble,
     reassemble_all,
+)
+from session_history import (
+    HistoryEntry,
+    HistoryTurn,
+    describe_age,
+    list_history,
+    load_turns,
 )
 
 # Optional macOS-only path for posting NSAccessibility announcements so
@@ -152,7 +160,7 @@ def announce(text: str) -> None:
 
 
 APP_NAME = "BlindPilot"
-APP_VERSION = "0.3.8"
+APP_VERSION = "0.3.9"
 ORIGINAL_APP_CREDIT = (
     "Based on the original Claude Code Reader application by doubletaponair.\n"
     "https://github.com/doubletaponair/claude-code-reader"
@@ -1187,15 +1195,16 @@ _LANG_EXT = {
 # marked [BlindPilot] are handled by the frontend; the rest are provider-only.
 _BLINDPILOT_SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/btw [message]", "Open a side-chat tab in this directory [BlindPilot]"),
-    ("/clear", "Clear conversation history and start a fresh session [BlindPilot]"),
+    ("/clear", "Start a fresh conversation in this tab [BlindPilot]"),
+    ("/compact", "Summarise this conversation to free up context [BlindPilot]"),
     ("/exit", "Close this session tab [BlindPilot]"),
     ("/model", "Pick the model and effort level in a dialog [BlindPilot]"),
     ("/models", "Refresh and pick a model in a dialog [BlindPilot]"),
     ("/model [model-id]", "Switch straight to a model [BlindPilot]"),
+    ("/resume", "Reopen a past conversation in a new tab [BlindPilot]"),
 ]
 
 _CLAUDE_SLASH_COMMANDS: list[tuple[str, str]] = [
-    ("/compact", "Compact conversation to reduce context length"),
     ("/compact [instructions]", "Compact with custom summary instructions"),
     ("/cost", "Show token usage and cost for this session"),
     ("/init", "Create or update CLAUDE.md in the current directory"),
@@ -1209,11 +1218,13 @@ _CLAUDE_SLASH_COMMANDS: list[tuple[str, str]] = [
 ]
 
 _FREEBUFF_SLASH_COMMANDS: list[tuple[str, str]] = [
-    ("/new", "Start a new FreeBuff conversation"),
+    ("/new", "Start a new FreeBuff conversation [BlindPilot]"),
     ("/history", "Open FreeBuff conversation history"),
-    ("/bash", "Open FreeBuff's command shell"),
+    ("/diagnostics", "Show FreeBuff's resource usage and tool processes"),
     ("/init", "Create project instructions"),
-    ("/feedback", "Send FreeBuff feedback"),
+    ("/usage", "Show FreeBuff credit usage"),
+    ("/review", "Review the current changes"),
+    ("/plan", "Plan before making changes"),
     ("/theme:toggle", "Toggle FreeBuff's terminal theme"),
     ("/logout", "Sign out of FreeBuff"),
 ]
@@ -1307,6 +1318,14 @@ def _short_label(path: str) -> str:
     """Tab label: directory basename, or full path if at the filesystem root."""
     name = Path(path).name
     return name or path
+
+
+def _tab_title(text: str, limit: int = 32) -> str:
+    """Tab label for a resumed conversation: its first message, cut to fit."""
+    flat = " ".join((text or "").split())
+    if len(flat) <= limit:
+        return flat
+    return flat[: limit - 1].rstrip() + "…"
 
 
 def _tool_use_label(name: str, params: dict) -> str:
@@ -2149,6 +2168,165 @@ class NewSessionDialog(wx.Dialog):
         event.Skip()
 
 
+# The two scopes the history picker can list, in the order they are offered.
+_HISTORY_SCOPES = ("folder", "all")
+_HISTORY_SCOPE_LABELS = ("This folder", "All folders")
+
+# "All backends" sits first in the backend list; the rest follow BACKEND_IDS.
+_HISTORY_ANY_BACKEND = "All backends"
+
+
+class HistoryDialog(wx.Dialog):
+    """Recent Conversations: pick a past conversation and carry on with it.
+
+    The list is every conversation the chosen backend has stored, newest first,
+    each one named by the message that started it — which is the only thing
+    that reliably tells two of them apart when they are read out. Typing in the
+    filter narrows the list by title; the backend and folder pickers widen it.
+
+    Enter (or Open) resumes the selected conversation in a new tab. Esc cancels.
+    """
+
+    def __init__(self, parent: wx.Window, backend: str, cwd: str):
+        super().__init__(
+            parent,
+            title="Recent Conversations",
+            style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER,
+        )
+        self._cwd = cwd
+        self._entries: List[HistoryEntry] = []
+        self._shown: List[HistoryEntry] = []
+        self.entry: Optional[HistoryEntry] = None
+
+        backend_label_text = wx.StaticText(self, label="&Backend:")
+        self._backend_values = [""] + list(BACKEND_IDS)
+        self.backend_picker = wx.Choice(
+            self,
+            choices=[_HISTORY_ANY_BACKEND] + [BACKEND_LABELS[b] for b in BACKEND_IDS],
+        )
+        self.backend_picker.SetName("Backend")
+        self.backend_picker.SetSelection(self._backend_values.index(normalize_backend(backend)))
+        self.backend_picker.Bind(wx.EVT_CHOICE, lambda _e: self._reload())
+
+        scope_label = wx.StaticText(self, label="&Show:")
+        self.scope_picker = wx.Choice(self, choices=list(_HISTORY_SCOPE_LABELS))
+        self.scope_picker.SetName("Show")
+        self.scope_picker.SetSelection(0)
+        self.scope_picker.Bind(wx.EVT_CHOICE, lambda _e: self._reload())
+
+        filter_label = wx.StaticText(self, label="&Filter:")
+        self.filter_box = wx.TextCtrl(self)
+        self.filter_box.SetName("Filter conversations")
+        self.filter_box.SetHint("Type part of a conversation's first message")
+        self.filter_box.Bind(wx.EVT_TEXT, lambda _e: self._refresh())
+
+        list_label = wx.StaticText(self, label="&Conversations:")
+        self.list_box = wx.ListBox(self, style=wx.LB_SINGLE | wx.LB_NEEDED_SB)
+        self.list_box.SetName("Conversations")
+        self.list_box.Bind(wx.EVT_LISTBOX_DCLICK, lambda _e: self._accept())
+
+        self.summary = wx.StaticText(self, label="")
+        self.summary.SetName("Summary")
+
+        buttons = self.CreateStdDialogButtonSizer(wx.OK | wx.CANCEL)
+        open_button = self.FindWindowById(wx.ID_OK)
+        if open_button is not None:
+            open_button.SetLabel("&Open")
+
+        pickers = wx.FlexGridSizer(2, 2, 8, 8)
+        pickers.AddGrowableCol(1, 1)
+        pickers.Add(backend_label_text, 0, wx.ALIGN_CENTER_VERTICAL)
+        pickers.Add(self.backend_picker, 0)
+        pickers.Add(scope_label, 0, wx.ALIGN_CENTER_VERTICAL)
+        pickers.Add(self.scope_picker, 0)
+
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        sizer.Add(pickers, 0, wx.EXPAND | wx.ALL, 12)
+        sizer.Add(filter_label, 0, wx.LEFT | wx.RIGHT, 12)
+        sizer.Add(self.filter_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 12)
+        sizer.Add(list_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 12)
+        sizer.Add(self.list_box, 1, wx.EXPAND | wx.ALL, 12)
+        sizer.Add(self.summary, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 12)
+        if buttons is not None:
+            sizer.Add(buttons, 0, wx.ALIGN_RIGHT | wx.ALL, 12)
+        self.SetSizerAndFit(sizer)
+        self.SetSize(wx.Size(620, 460))
+
+        self.Bind(wx.EVT_BUTTON, lambda _e: self._accept(), id=wx.ID_OK)
+        self.Bind(wx.EVT_CHAR_HOOK, self._on_key)
+        self._reload()
+        self.filter_box.SetFocus()
+
+    # ----- Loading and filtering -----
+    def _selected_backend(self) -> Optional[str]:
+        value = self._backend_values[max(0, self.backend_picker.GetSelection())]
+        return value or None
+
+    def _selected_cwd(self) -> Optional[str]:
+        scope = _HISTORY_SCOPES[max(0, self.scope_picker.GetSelection())]
+        return self._cwd if scope == "folder" else None
+
+    def _reload(self) -> None:
+        """Re-scan the history stores for the chosen backend and scope."""
+        with wx.BusyCursor():
+            self._entries = list_history(self._selected_backend(), self._selected_cwd())
+        self._refresh()
+
+    def _label_for(self, entry: HistoryEntry) -> str:
+        parts = [entry.title or "(untitled)", describe_age(entry.modified)]
+        if self._selected_cwd() is None and entry.folder:
+            parts.append(entry.folder)
+        if self._selected_backend() is None:
+            parts.append(backend_label(entry.backend))
+        return " — ".join(parts)
+
+    def _refresh(self) -> None:
+        term = self.filter_box.GetValue().strip().lower()
+        self._shown = [entry for entry in self._entries if not term or term in entry.title.lower()]
+        self.list_box.Set([self._label_for(entry) for entry in self._shown])
+        if self._shown:
+            self.list_box.SetSelection(0)
+        count = len(self._shown)
+        if not self._entries:
+            message = "No past conversations found here"
+        elif count == 1:
+            message = "1 conversation"
+        else:
+            message = f"{count} conversations"
+        self.summary.SetLabel(message)
+        self._set_open_enabled(bool(self._shown))
+
+    def _set_open_enabled(self, enabled: bool) -> None:
+        button = self.FindWindowById(wx.ID_OK)
+        if button is not None:
+            button.Enable(enabled)
+
+    # ----- Choosing -----
+    def _accept(self) -> None:
+        selection = self.list_box.GetSelection()
+        if selection == wx.NOT_FOUND or selection >= len(self._shown):
+            announce("Error: Choose a conversation first")
+            return
+        self.entry = self._shown[selection]
+        self.EndModal(wx.ID_OK)
+
+    def _on_key(self, event: wx.KeyEvent) -> None:
+        key = event.GetKeyCode()
+        if key == wx.WXK_ESCAPE:
+            self.EndModal(wx.ID_CANCEL)
+            return
+        if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER) and self._shown:
+            self._accept()
+            return
+        # Down from the filter box drops straight into the list, so a filter
+        # can be typed and its first result reached without hunting for Tab.
+        if key == wx.WXK_DOWN and self.filter_box.HasFocus() and self._shown:
+            self.list_box.SetFocus()
+            self.list_box.SetSelection(0)
+            return
+        event.Skip()
+
+
 class SessionPanel(wx.Panel):
     """One conversation tab — owns its session_id, rows, and worker.
 
@@ -2673,7 +2851,10 @@ class SessionPanel(wx.Panel):
         """Public entry point so the frame can fire a seeded side-chat prompt."""
         self._on_send()
 
-    def _on_send(self) -> None:
+    def _on_send(self, worker_extra: Optional[dict] = None) -> None:
+        # ``worker_extra`` carries per-turn arguments only some backends take —
+        # compaction, at present. Ordinary sends pass nothing.
+        #
         # "/btw [message]" opens a new side-chat tab in the same directory
         # instead of sending to this conversation.
         raw = self.prompt.GetValue().strip()
@@ -2682,16 +2863,13 @@ class SessionPanel(wx.Panel):
             self.prompt.SetValue("")
             self._on_side_chat(self.cwd, raw[4:].strip())
             return
-        if low == "/clear":
+        if low in ("/clear", "/new"):
             self.prompt.SetValue("")
-            self._session_id = None
-            self._turns = []
-            self._rows = []
-            self._displayed = []
-            self._response_count = 0
-            self._stream_response = None
-            self._refresh_list()
-            self._announce("Conversation cleared")
+            self.clear_conversation()
+            return
+        if low == "/compact":
+            self.prompt.SetValue("")
+            self.compact_conversation()
             return
         # "/model" opens the picker; "/model <name>" sets it straight away.
         if low in ("/model", "/models") or low.startswith(("/model ", "/models ")):
@@ -2709,6 +2887,12 @@ class SessionPanel(wx.Panel):
             frame = wx.GetTopLevelParent(self)
             if hasattr(frame, "_close_current_session"):
                 wx.CallAfter(frame._close_current_session)
+            return
+        if low == "/resume":
+            self.prompt.SetValue("")
+            frame = wx.GetTopLevelParent(self)
+            if hasattr(frame, "_open_history"):
+                wx.CallAfter(frame._open_history)
             return
 
         if (
@@ -2773,6 +2957,7 @@ class SessionPanel(wx.Panel):
             on_complete=lambda txt: wx.CallAfter(self._on_response_complete, txt),
             on_failed=lambda msg: wx.CallAfter(self._on_failed, msg),
             on_done=lambda: wx.CallAfter(self._on_worker_finished),
+            **(worker_extra or {}),
         )
         self._worker.start()
         self.steer_btn.Enable()
@@ -2860,6 +3045,92 @@ class SessionPanel(wx.Panel):
             listing = "\n".join(self._attachments)
             parts.append("Attached files (please read them):\n" + listing)
         return "\n\n".join(parts)
+
+    def clear_conversation(self) -> None:
+        """Forget this conversation and start a fresh one in the same tab.
+
+        The backend is not told anything: dropping its session id is what makes
+        the next message the first of a new conversation. The old conversation
+        is still on disk, and Recent Conversations can bring it back.
+        """
+        if self._worker is not None and self._worker.is_alive():
+            self._announce("Error: Stop the running task before starting a new conversation")
+            return
+        self._session_id = None
+        self._turns = []
+        self._rows = []
+        self._displayed = []
+        self._response_count = 0
+        self._stream_response = None
+        self._streamed_assistant = ""
+        self._refresh_list()
+        self._announce("New conversation started. The previous one is in Recent Conversations")
+
+    def compact_conversation(self) -> None:
+        """Ask the backend to summarise this conversation in place.
+
+        Compaction replaces the conversation so far with a summary of it, which
+        is how a long session keeps going once its context window fills up.
+        Claude Code takes it as a message; Codex has a request of its own for
+        it; FreeBuff's CLI cannot do it at all.
+        """
+        backend = self.selected_backend()
+        request = compaction_request(backend)
+        if request is None:
+            self._announce(
+                f"Error: {backend_label(backend)} cannot compact a conversation. "
+                "Start a new conversation instead"
+            )
+            return
+        if self._worker is not None and self._worker.is_alive():
+            self._announce("Error: Wait for the running task to finish before compacting")
+            return
+        if not self._session_id or backend != self._session_backend:
+            self._announce("Error: There is no conversation to compact yet")
+            return
+        text, extra = request
+        self.prompt.SetValue(text)
+        self._announce("Compacting the conversation")
+        self._on_send(worker_extra=extra)
+
+    def restore_history(self, entry: HistoryEntry, turns: List[HistoryTurn]) -> None:
+        """Put a past conversation back in this tab, ready to be continued.
+
+        Rows are rebuilt the way a live turn builds them — the user's own
+        message, then the answer segmented into navigable rows — so a
+        conversation from last week reads exactly like one that just finished.
+        Adopting the backend's own session id is what makes the next message a
+        continuation of it rather than the start of something new.
+        """
+        self._session_id = entry.session_id
+        self._session_backend = normalize_backend(entry.backend)
+        self._turns = [Turn(prompt=turn.prompt, response=turn.response) for turn in turns]
+        self._rows = []
+        self._displayed = []
+        self._search_term = ""
+        self._response_count = 0
+        self._stream_response = None
+        self._streamed_assistant = ""
+        self._assistant_narrated_this_turn = False
+        for turn in turns:
+            self._response_count += 1
+            number = self._response_count
+            if turn.prompt.strip():
+                self._rows.append(
+                    Row(
+                        kind="you",
+                        label=f"You: {' '.join(turn.prompt.split())}",
+                        payload=turn.prompt,
+                        response_number=number,
+                    )
+                )
+            self._rows.extend(parse_response(turn.response, number))
+        self._refresh_list()
+        # Picks up the restored session: relabels the backend line, and gives
+        # FreeBuff's terminal a head start on the conversation being resumed.
+        self.backend_changed()
+        responses = "1 response" if self._response_count == 1 else f"{self._response_count} responses"
+        self._set_status(f"Resumed: {entry.title} — {responses}")
 
     def _on_session_started(self, session_id: str) -> None:
         if not self._session_id:
@@ -3987,6 +4258,11 @@ class MainFrame(wx.Frame):
             "&New Session…\tCtrl+T",
             "Type or browse to a folder and open a session in it",
         )
+        history_item = file_menu.Append(
+            wx.ID_ANY,
+            "&Recent Conversations…\tCtrl+H",
+            "Reopen a past conversation and carry on with it",
+        )
         backend_menu = wx.Menu()
         self._backend_items: dict[str, wx.MenuItem] = {}
         for backend in BACKEND_IDS:
@@ -4017,6 +4293,17 @@ class MainFrame(wx.Frame):
             wx.ID_ANY,
             "Create &Desktop Shortcut",
             "Put a BlindPilot shortcut on the desktop",
+        )
+        file_menu.AppendSeparator()
+        self._compact_item = file_menu.Append(
+            wx.ID_ANY,
+            "Co&mpact Conversation\tCtrl+Shift+K",
+            "Summarise this conversation so the backend has room to keep going",
+        )
+        new_convo_item = file_menu.Append(
+            wx.ID_ANY,
+            "Start N&ew Conversation\tCtrl+Shift+N",
+            "Forget this conversation and start a fresh one in this tab",
         )
         file_menu.AppendSeparator()
         stop_item = file_menu.Append(
@@ -4090,6 +4377,7 @@ class MainFrame(wx.Frame):
         menubar.Append(help_menu, "&Help")
 
         self.SetMenuBar(menubar)
+        self._refresh_compact_item()
         self.Bind(wx.EVT_MENU, lambda _e: self._toggle_live_rows(), self._rows_item)
         self.Bind(wx.EVT_MENU, lambda _e: self._toggle_speak_live(), self._speak_item)
         self.Bind(wx.EVT_MENU, lambda _e: self._toggle_show_thinking(), self._thinking_item)
@@ -4100,6 +4388,9 @@ class MainFrame(wx.Frame):
             silent_response_item,
         )
         self.Bind(wx.EVT_MENU, lambda _e: self._new_session(), new_item)
+        self.Bind(wx.EVT_MENU, lambda _e: self._open_history(), history_item)
+        self.Bind(wx.EVT_MENU, lambda _e: self._compact_active(), self._compact_item)
+        self.Bind(wx.EVT_MENU, lambda _e: self._new_conversation_active(), new_convo_item)
         self.Bind(wx.EVT_MENU, lambda _e: self._manage_backends(), manage_backends_item)
         self.Bind(wx.EVT_MENU, lambda _e: self._set_projects_folder(), set_pf_item)
         self.Bind(wx.EVT_MENU, lambda _e: self._create_desktop_shortcut(), desktop_item)
@@ -4194,6 +4485,7 @@ class MainFrame(wx.Frame):
             page = self.notebook.GetPage(index)
             if isinstance(page, SessionPanel):
                 page.backend_changed()
+        self._refresh_compact_item()
         message = (
             f"Backend changed to {backend_label(backend)}. It will be used for the next new turn."
         )
@@ -4463,6 +4755,78 @@ class MainFrame(wx.Frame):
             return
         self._add_session(cwd)
         wx.CallAfter(announce, f"New session: {_short_label(cwd)}")
+
+    def _history_cwd(self) -> str:
+        """The directory the history picker starts out scoped to."""
+        page = self.notebook.GetCurrentPage()
+        if isinstance(page, SessionPanel):
+            return page.cwd
+        return self._projects_folder or os.getcwd()
+
+    def _open_history(self) -> None:
+        """Reopen a past conversation in a new tab (Ctrl+H)."""
+        dlg = HistoryDialog(self, backend=self._backend, cwd=self._history_cwd())
+        try:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            entry = dlg.entry
+        finally:
+            dlg.Destroy()
+        if entry is None:
+            return
+        self._resume_history(entry)
+
+    def _resume_history(self, entry: HistoryEntry) -> None:
+        """Open one past conversation in its own tab, ready to be continued."""
+        with wx.BusyCursor():
+            turns = load_turns(entry)
+        if not turns:
+            announce(f"Error: {entry.title} could not be read back")
+            return
+        # A tab only continues a conversation while the app-wide backend still
+        # matches the one that conversation belongs to — a mismatch starts a
+        # new conversation on the next send — so resuming switches to it.
+        if normalize_backend(entry.backend) != self._backend:
+            self._set_backend(entry.backend)
+        cwd = entry.cwd if entry.cwd and os.path.isdir(entry.cwd) else self._history_cwd()
+        panel = self._add_session(cwd)
+        panel.restore_history(entry, turns)
+        # The first message names the tab, because that is what tells this
+        # conversation apart from the others open in the same folder.
+        # _add_session selects the page it adds, so that is the one to rename.
+        self.notebook.SetPageText(
+            self.notebook.GetSelection(), _tab_title(entry.title) or _short_label(cwd)
+        )
+        self._refresh_picker()
+        responses = "1 response" if len(turns) == 1 else f"{len(turns)} responses"
+        wx.CallAfter(announce, f"Resumed {entry.title}, {responses}")
+
+    def _compact_active(self) -> None:
+        """Compact the conversation in the active tab (Ctrl+Shift+K)."""
+        page = self.notebook.GetCurrentPage()
+        if isinstance(page, SessionPanel):
+            page.compact_conversation()
+
+    def _new_conversation_active(self) -> None:
+        """Start a fresh conversation in the active tab (Ctrl+Shift+N)."""
+        page = self.notebook.GetCurrentPage()
+        if isinstance(page, SessionPanel):
+            page.clear_conversation()
+
+    def _refresh_compact_item(self) -> None:
+        """Grey out Compact for a provider whose CLI has no such command."""
+        item = getattr(self, "_compact_item", None)
+        if item is None:
+            return
+        supported = BACKENDS[self._backend].supports_compaction
+        item.Enable(supported)
+        if supported:
+            item.SetHelp("Summarise this conversation so the backend has room to keep going")
+        else:
+            item.SetHelp(
+                f"{backend_label(self._backend)} cannot compact a conversation — "
+                "start a new conversation instead"
+            )
 
     def _set_projects_folder(self) -> Optional[str]:
         """Choose and remember the parent folder that holds the projects."""
