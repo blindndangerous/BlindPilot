@@ -4,6 +4,10 @@ Readable release history for BlindPilot. When adjacent releases were part of the
 same fix stream, they are combined with a version range such as
 `v0.3.6-v0.3.7`.
 
+## v0.3.13 - 2026-08-12
+
+- Upgrade over an installed copy when the setup program is run by hand, which stopped on "DeleteFile failed; code 5" while the same upgrade run from inside BlindPilot went through. Only the in-app updater asked the installer to close a program that will not close on request; run by hand, the installer asked politely, and a background program holding one of our libraries — with no window to close and nobody watching it — never answered. The setup program now closes what refuses to close however it was started.
+
 ## v0.3.12 - 2026-08-12
 
 - Install updates on an installed copy, which since 0.3.10 ended in the installer stopping and reporting nothing but "code 5". BlindPilot handed its own library folder to every program it started, and to everything those started in turn, so an agent CLI or a tool it left running went on holding BlindPilot's libraries open for hours. The installer found its files in use, asked those programs to close, and — with its message boxes suppressed, as a silent update requires — silently answered Abort and rolled the update back.
