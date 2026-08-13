@@ -27,6 +27,7 @@ terminal sessions in different project folders.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import platform
@@ -63,6 +64,7 @@ from agent_backends import (
     BACKEND_LABELS,
     BACKENDS,
     FREEBUFF_PREFERRED_MODEL,
+    AgentWorker,
     backend_auth_ok,
     backend_label,
     blindpilot_config_dir,
@@ -99,20 +101,14 @@ from session_history import (
 # silently land on (notably the multi-line prompt TextCtrl, whose name set
 # via wx.SetName lands on the outer NSScrollView rather than the focused
 # NSTextView).
+#
+# Only whether AppKit exists is settled here. The names themselves are pulled
+# in where they are used, as _bring_to_front already does: importing them here
+# would leave every one of them undefined on Windows and Linux, where the
+# reader of this file — and any type checker — has to take it on faith that
+# nothing reaches them.
 if platform.system() == "Darwin":
-    try:
-        from AppKit import (  # type: ignore
-            NSApp,
-            NSAccessibilityPostNotificationWithUserInfo,
-            NSAccessibilityAnnouncementRequestedNotification,
-            NSAccessibilityAnnouncementKey,
-            NSAccessibilityPriorityKey,
-            NSAccessibilityPriorityHigh,
-        )
-
-        _MAC_ANNOUNCE = True
-    except ImportError:
-        _MAC_ANNOUNCE = False
+    _MAC_ANNOUNCE = importlib.util.find_spec("AppKit") is not None
 else:
     _MAC_ANNOUNCE = False
 
@@ -147,21 +143,33 @@ def announce(text: str) -> None:
         return
     if not _MAC_ANNOUNCE:
         return
-    app = NSApp()
-    if app is None:
-        return
-    window = app.keyWindow() or app.mainWindow()
-    if window is None:
-        return
-    info = {
-        NSAccessibilityAnnouncementKey: text,
-        NSAccessibilityPriorityKey: NSAccessibilityPriorityHigh,
-    }
-    NSAccessibilityPostNotificationWithUserInfo(
-        window,
-        NSAccessibilityAnnouncementRequestedNotification,
-        info,
-    )
+    try:
+        from AppKit import (  # type: ignore
+            NSApp,
+            NSAccessibilityPostNotificationWithUserInfo,
+            NSAccessibilityAnnouncementRequestedNotification,
+            NSAccessibilityAnnouncementKey,
+            NSAccessibilityPriorityKey,
+            NSAccessibilityPriorityHigh,
+        )
+
+        app = NSApp()
+        if app is None:
+            return
+        window = app.keyWindow() or app.mainWindow()
+        if window is None:
+            return
+        info = {
+            NSAccessibilityAnnouncementKey: text,
+            NSAccessibilityPriorityKey: NSAccessibilityPriorityHigh,
+        }
+        NSAccessibilityPostNotificationWithUserInfo(
+            window,
+            NSAccessibilityAnnouncementRequestedNotification,
+            info,
+        )
+    except Exception:  # an announcement is never worth raising over
+        pass
 
 
 APP_NAME = "BlindPilot"
@@ -2027,7 +2035,7 @@ class ReadView(wx.Dialog):
         super().__init__(
             parent,
             title=title,
-            size=(700, 500),
+            size=wx.Size(700, 500),
             style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER,
         )
 
@@ -2163,7 +2171,7 @@ class NewSessionDialog(wx.Dialog):
         label = wx.StaticText(self, label="&Folder for the new session:")
         self.folder_box = wx.TextCtrl(self, value="")
         self.folder_box.SetName("Folder for the new session")
-        self.folder_box.SetMinSize((420, -1))
+        self.folder_box.SetMinSize(wx.Size(420, -1))
         browse_btn = wx.Button(self, label="&Browse…")
         browse_btn.Bind(wx.EVT_BUTTON, lambda _e: self._browse())
 
@@ -2433,7 +2441,7 @@ class SessionPanel(wx.Panel):
         self._stopping = False
         self._session_id: Optional[str] = None
         self._session_backend = normalize_backend(self._get_backend())
-        self._worker: Optional[threading.Thread] = None
+        self._worker: Optional[AgentWorker] = None
         # Worker callbacks arrive on a background thread. Keep them in one
         # ordered mailbox with at most one pending GUI callback; otherwise a
         # long, chatty job can flood wx's event queue and starve NVDA/key input.
@@ -2491,7 +2499,7 @@ class SessionPanel(wx.Panel):
         self.prompt.Bind(wx.EVT_TEXT, self._on_prompt_text_changed)
         self._dictation_timer = None
         char_h = self.prompt.GetCharHeight()
-        self.prompt.SetMinSize((-1, char_h * 5 + 8))
+        self.prompt.SetMinSize(wx.Size(-1, char_h * 5 + 8))
 
         # Bottom row: Send, Attach, then the Permission mode picker — one line.
         self.send_btn = wx.Button(self, label="Send")
@@ -3021,15 +3029,18 @@ class SessionPanel(wx.Panel):
             return
         if low == "/exit":
             self.prompt.SetValue("")
-            frame = wx.GetTopLevelParent(self)
-            if hasattr(frame, "_close_current_session"):
-                wx.CallAfter(frame._close_current_session)
+            # The frame owns the session; this panel only knows it has one
+            # somewhere above it, which is why the method is looked up rather
+            # than called outright.
+            close_session = getattr(wx.GetTopLevelParent(self), "_close_current_session", None)
+            if callable(close_session):
+                wx.CallAfter(close_session)
             return
         if low == "/resume":
             self.prompt.SetValue("")
-            frame = wx.GetTopLevelParent(self)
-            if hasattr(frame, "_open_history"):
-                wx.CallAfter(frame._open_history)
+            open_history = getattr(wx.GetTopLevelParent(self), "_open_history", None)
+            if callable(open_history):
+                wx.CallAfter(open_history)
             return
 
         if (
@@ -3730,7 +3741,7 @@ class SetupWizard(wx.Dialog):
         super().__init__(
             parent,
             title="BlindPilot — Setup",
-            size=(580, 400),
+            size=wx.Size(580, 400),
             style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER,
         )
         self.projects_folder: Optional[str] = initial_projects_folder
@@ -4328,12 +4339,16 @@ class SetupWizard(wx.Dialog):
                 errors="replace",
                 **_no_window_kwargs(),
             )
-            _out, _ = proc.communicate(timeout=300)
-            rc = proc.returncode
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.communicate()
-            rc = -1
+            # Only the wait can time out, and killing the process is only
+            # possible once there is one, so the timeout is caught here rather
+            # than beside the failures that can happen before it starts.
+            try:
+                _out, _ = proc.communicate(timeout=300)
+                rc = proc.returncode
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+                rc = -1
         except Exception:
             rc = -2
         wx.CallAfter(self._on_login_done, rc)
@@ -4380,7 +4395,7 @@ class SetupWizard(wx.Dialog):
 
 class MainFrame(wx.Frame):
     def __init__(self, initial_cwd: str):
-        super().__init__(None, title=APP_NAME, size=(900, 760))
+        super().__init__(None, title=APP_NAME, size=wx.Size(900, 760))
 
         # Shared audio cues (send / in-progress loop / received).
         self.earcons = Earcons(os.path.join(_resource_dir(), "EarCons"))

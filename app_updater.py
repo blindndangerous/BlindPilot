@@ -19,7 +19,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Protocol
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
@@ -113,7 +113,26 @@ def _request(url: str, current_version: str) -> Request:
     )
 
 
-def _read_limited(response: object, limit: int) -> bytes:
+class HttpResponse(Protocol):
+    """What this module asks of whatever `opener` hands back.
+
+    urlopen's own response in a running BlindPilot, a stand-in in the tests.
+    Either one is entered with `with` and read a piece at a time; nothing else
+    about it is this module's business.
+    """
+
+    def read(self, amount: int = -1, /) -> bytes: ...
+
+    def __enter__(self) -> "HttpResponse": ...
+
+    def __exit__(self, *exc_info: object) -> object: ...
+
+
+# The opener is a parameter so the tests can answer without a network.
+Opener = Callable[..., HttpResponse]
+
+
+def _read_limited(response: HttpResponse, limit: int) -> bytes:
     chunks: list[bytes] = []
     received = 0
     while True:
@@ -129,7 +148,7 @@ def _read_limited(response: object, limit: int) -> bytes:
 def fetch_latest_release(
     current_version: str,
     *,
-    opener: Callable[..., object] = urlopen,
+    opener: Opener = urlopen,
     system: Optional[str] = None,
     machine: Optional[str] = None,
     kind: Optional[str] = None,
@@ -202,9 +221,7 @@ def _allowed_download_url(url: str) -> bool:
     )
 
 
-def _checksum_from_sidecar(
-    release: ReleaseInfo, current_version: str, opener: Callable[..., object]
-) -> str:
+def _checksum_from_sidecar(release: ReleaseInfo, current_version: str, opener: Opener) -> str:
     if not _allowed_download_url(release.checksum_url):
         raise UpdateError("The checksum download URL is not trusted.")
     try:
@@ -225,7 +242,7 @@ def download_update(
     current_version: str,
     *,
     progress: Optional[Callable[[int, int], None]] = None,
-    opener: Callable[..., object] = urlopen,
+    opener: Opener = urlopen,
 ) -> Path:
     """Download a release archive and reject it unless SHA-256 matches."""
     if not _allowed_download_url(release.asset_url):

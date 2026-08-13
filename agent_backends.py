@@ -24,7 +24,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Protocol, cast
 
 
 # A windowed app owns no console, so every child process Windows considers a
@@ -981,6 +981,7 @@ class CodexWorker(threading.Thread):
             }
         else:
             approval, sandbox = self._policy(self._permission_mode)
+            sandbox_type = str(sandbox.get("type", ""))
             params: dict = {
                 "cwd": self._cwd,
                 "approvalPolicy": approval,
@@ -988,7 +989,7 @@ class CodexWorker(threading.Thread):
                     "readOnly": "read-only",
                     "workspaceWrite": "workspace-write",
                     "dangerFullAccess": "danger-full-access",
-                }.get(sandbox.get("type"), "workspace-write"),
+                }.get(sandbox_type, "workspace-write"),
                 "serviceName": "blindpilot",
             }
             if self._model:
@@ -1515,9 +1516,24 @@ def _freebuff_run_status(chat: Optional[Path], offset: int = 0) -> str:
     return ""
 
 
+class FreebuffTerminal(Protocol):
+    """The pseudo-terminal handle, whichever library produced it.
+
+    winpty on Windows and pexpect everywhere else hand back objects with
+    nothing in common but the three calls made on them here. What those calls
+    give back differs too, and none of it is used, so none of it is named.
+    """
+
+    def write(self, text: str, /) -> object: ...
+
+    def terminate(self, force: bool = False) -> object: ...
+
+    def close(self, force: bool = False) -> object: ...
+
+
 def _spawn_freebuff_pty(
     args: list[str], cwd: str, stream_ended: threading.Event
-) -> tuple[object, Callable[[float], str]]:
+) -> tuple[FreebuffTerminal, Callable[[float], str]]:
     """Start FreeBuff under a pseudo-terminal, off screen, and read it.
 
     Returns the terminal and a call that yields whatever it has produced.
@@ -1778,7 +1794,7 @@ class FreebuffWorker(threading.Thread):
         self._cancelled = False
         self._accepting_input = threading.Event()
         self._write_lock = threading.Lock()
-        self._pty = None
+        self._pty: Optional[FreebuffTerminal] = None
         # Set once the terminal can produce no further output.
         self._stream_ended = threading.Event()
         # Everything read out this turn, and the frame each kind is waiting to
@@ -1868,7 +1884,10 @@ class FreebuffWorker(threading.Thread):
             # it saves the whole of FreeBuff's start-up. Its own record of the
             # chats that existed before it started is what identifies the new
             # conversation, since it created that chat when it started.
-            self._pty = waiting["pty"]
+            # The prewarm record holds a terminal, a reader, an event and a
+            # listing side by side, so what comes back out of it is opaque
+            # until it is named.
+            self._pty = cast(FreebuffTerminal, waiting["pty"])
             read = waiting["read"]
             self._stream_ended = waiting["ended"]
             before = waiting["before"]
@@ -2061,7 +2080,11 @@ class FreebuffWorker(threading.Thread):
                 if chat_path is None:
                     after = _freebuff_chat_dirs(self._cwd)
                     new_ids = set(after) - set(before)
-                    discovered = max(new_ids, key=after.get) if new_ids else self._session_id
+                    discovered = (
+                        max(new_ids, key=lambda chat_id: after[chat_id])
+                        if new_ids
+                        else self._session_id
+                    )
                     if discovered:
                         self._session_id = discovered
                         chat_path = _freebuff_chat_path(self._cwd, discovered)
@@ -2165,7 +2188,7 @@ class FreebuffWorker(threading.Thread):
 
         after = _freebuff_chat_dirs(self._cwd)
         new_ids = set(after) - set(before)
-        session = max(new_ids, key=after.get) if new_ids else self._session_id
+        session = max(new_ids, key=lambda chat_id: after[chat_id]) if new_ids else self._session_id
         if session and not session_reported:
             self._on_session(session)
         # The next message in this conversation should not have to wait for a
@@ -2315,7 +2338,33 @@ class FreebuffWorker(threading.Thread):
         return self._freebuff_sections(visible)[1]
 
 
-def worker_class(backend: str, claude_worker: type[threading.Thread]) -> type[threading.Thread]:
+class AgentWorker(Protocol):
+    """The part of a backend's worker that the window actually drives.
+
+    All three workers are threads, but a thread is not what the window wants
+    from them: it wants to start a turn, ask whether it is still running, stop
+    it, and wait for it to let go. Saying that here is what lets the window
+    hold whichever worker the backend chose without knowing which one it is —
+    and lets `cancel` be a method the code is allowed to call, rather than one
+    a reader has to take on trust.
+    """
+
+    def start(self) -> None: ...
+
+    def is_alive(self) -> bool: ...
+
+    def join(self, timeout: Optional[float] = None) -> None: ...
+
+    def cancel(self) -> None: ...
+
+
+# Callable rather than type[...]: each backend's worker takes the keywords its
+# own turn needs — Codex alone understands `compact` — and the caller passes
+# the extras for the backend it picked.
+AgentWorkerFactory = Callable[..., AgentWorker]
+
+
+def worker_class(backend: str, claude_worker: AgentWorkerFactory) -> AgentWorkerFactory:
     backend = normalize_backend(backend)
     if backend == BACKEND_CODEX:
         return CodexWorker
