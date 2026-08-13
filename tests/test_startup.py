@@ -52,6 +52,69 @@ def test_gui_startup_smoke_skips_first_run_wizard(monkeypatch):
     assert "main-loop" in events
 
 
+def test_nothing_started_inherits_a_path_into_the_install_folder(monkeypatch, tmp_path):
+    """A child that can find our libraries will hold them open past our exit.
+
+    PyInstaller's pywin32 hook puts the packaged DLL folder on PATH, and every
+    process BlindPilot starts inherits it. Those processes go on loading the
+    Visual C++ runtime and pythoncom out of the install folder long after
+    BlindPilot has closed, and the installer then refuses to replace files that
+    are in use — the update that reported nothing but "code 5".
+    """
+    import blindpilot_app
+
+    bundle = tmp_path / "BlindPilot" / "_internal"
+    (bundle / "pywin32_system32").mkdir(parents=True)
+    unrelated = tmp_path / "elsewhere"
+    unrelated.mkdir()
+    polluted = os.pathsep.join(
+        [
+            str(bundle / "pywin32_system32"),
+            str(unrelated),
+            str(bundle),
+        ]
+    )
+
+    monkeypatch.setattr(blindpilot_app.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(blindpilot_app.sys, "_MEIPASS", str(bundle), raising=False)
+    monkeypatch.setenv("PATH", polluted)
+
+    blindpilot_app.keep_bundle_off_child_path()
+
+    assert os.environ["PATH"] == str(unrelated)
+
+
+def test_a_path_outside_the_install_folder_is_left_alone(monkeypatch, tmp_path):
+    import blindpilot_app
+
+    bundle = tmp_path / "BlindPilot" / "_internal"
+    bundle.mkdir(parents=True)
+    # A sibling whose name merely starts with the bundle's is a different
+    # folder, and stripping it would break whatever put it there.
+    neighbour = tmp_path / "BlindPilot" / "_internal-tools"
+    neighbour.mkdir()
+    kept = os.pathsep.join([str(neighbour), str(tmp_path)])
+
+    monkeypatch.setattr(blindpilot_app.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(blindpilot_app.sys, "_MEIPASS", str(bundle), raising=False)
+    monkeypatch.setenv("PATH", kept)
+
+    blindpilot_app.keep_bundle_off_child_path()
+
+    assert os.environ["PATH"] == kept
+
+
+def test_running_from_source_never_touches_the_path(monkeypatch):
+    import blindpilot_app
+
+    monkeypatch.delattr(blindpilot_app.sys, "frozen", raising=False)
+    monkeypatch.setenv("PATH", "/one/place")
+
+    blindpilot_app.keep_bundle_off_child_path()
+
+    assert os.environ["PATH"] == "/one/place"
+
+
 def test_downloaded_update_schedules_before_forced_close(monkeypatch, tmp_path):
     import blindpilot_app
 

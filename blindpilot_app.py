@@ -165,7 +165,7 @@ def announce(text: str) -> None:
 
 
 APP_NAME = "BlindPilot"
-APP_VERSION = "0.3.11"
+APP_VERSION = "0.3.12"
 
 # Streamed coding-agent output can arrive much faster than a native list and a
 # screen reader can consume it. Process a bounded number of events per GUI turn
@@ -308,6 +308,55 @@ def _same_dir(a: str, b: str) -> bool:
         return os.path.normcase(os.path.normpath(p))
 
     return bool(a.strip()) and norm(a) == norm(b)
+
+
+def _bundle_dir() -> Optional[str]:
+    """The folder a packaged build keeps its own libraries in, if this is one."""
+    if not getattr(sys, "frozen", False):
+        return None
+    return getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(sys.executable))
+
+
+def path_without_bundle_entries(current: str, bundle: str) -> str:
+    """*current* PATH with every entry inside the packaged folder removed."""
+
+    def inside(entry: str) -> bool:
+        try:
+            candidate = os.path.normcase(
+                os.path.normpath(os.path.abspath(entry.strip().strip('"')))
+            )
+        except (OSError, ValueError):
+            return False
+        root = os.path.normcase(os.path.normpath(os.path.abspath(bundle)))
+        return candidate == root or candidate.startswith(root + os.sep)
+
+    kept = [entry for entry in current.split(os.pathsep) if entry.strip() and not inside(entry)]
+    return os.pathsep.join(kept)
+
+
+def keep_bundle_off_child_path() -> None:
+    """Stop BlindPilot's private DLL folder from reaching child processes.
+
+    PyInstaller's pywin32 hook puts ``_internal\\pywin32_system32`` on this
+    process's PATH. It registers the same folder with ``os.add_dll_directory``,
+    which is what actually makes pywin32 load; the PATH entry is only a
+    fallback for Anaconda builds where that call does nothing. Unlike the DLL
+    directory, PATH is inherited — by the agent CLI, by the terminal, and by
+    everything those start in turn, for as long as any of them live.
+
+    Those processes then resolve ordinary libraries (the Visual C++ runtime,
+    pythoncom) out of BlindPilot's install folder and hold them open. The next
+    update finds its own files in use by programs it has no business closing,
+    and the installer gives up rather than replace them — the silent "installer
+    exited with code 5" this used to end in.
+    """
+    bundle = _bundle_dir()
+    if not bundle:
+        return
+    current = os.environ.get("PATH", "")
+    cleaned = path_without_bundle_entries(current, bundle)
+    if cleaned != current:
+        os.environ["PATH"] = cleaned
 
 
 def _windows_persistent_path_dirs() -> List[str]:
@@ -5086,6 +5135,10 @@ def main() -> int:
             return 3
         return 0
     gui_startup_smoke = "--startup-gui-smoke" in sys.argv
+    # Before anything is started: nothing BlindPilot launches may inherit a
+    # PATH that points back into its own install folder, or the files there
+    # stay open long after BlindPilot has closed and cannot be updated.
+    keep_bundle_off_child_path()
     # Claim the console before anything can create one on screen. Doing it here,
     # rather than when a terminal is first needed, keeps it out of the way of
     # the first message as well as every later one.

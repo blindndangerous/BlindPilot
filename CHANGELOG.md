@@ -4,6 +4,16 @@ Readable release history for BlindPilot. When adjacent releases were part of the
 same fix stream, they are combined with a version range such as
 `v0.3.6-v0.3.7`.
 
+## v0.3.12 - 2026-08-12
+
+- Install updates on an installed copy, which since 0.3.10 ended in the installer stopping and reporting nothing but "code 5". BlindPilot handed its own library folder to every program it started, and to everything those started in turn, so an agent CLI or a tool it left running went on holding BlindPilot's libraries open for hours. The installer found its files in use, asked those programs to close, and — with its message boxes suppressed, as a silent update requires — silently answered Abort and rolled the update back.
+- Keep the packaged library folder off the environment BlindPilot hands its children, so nothing outside the application loads out of the install folder in the first place.
+- Notice a program that has one of our libraries loaded, not only one that runs from the install folder, and close it before the installer has to. The old check looked at where a process runs from and so found none of the programs that were actually holding files.
+- Let the installer close what refuses to close, so one stubborn program can no longer abort an update.
+- Check that every file can be opened before starting the installer, as the portable update already did.
+- Say what went wrong when an installed update fails, rather than reading out the installer's exit code, and keep the installer's own log beside the reason.
+- Stand aside when a second BlindPilot window starts an update at the same time, instead of two installers racing over one folder.
+
 ## v0.3.11 - 2026-08-12
 
 - Stay in the responses when Down is pressed on the newest row, in the list and in the read-only edit field alike, rather than dropping focus into the prompt. Tab is the way to the prompt.

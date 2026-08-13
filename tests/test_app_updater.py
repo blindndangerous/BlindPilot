@@ -539,3 +539,104 @@ def test_setup_helper_script_has_valid_powershell_syntax(tmp_path):
         creationflags=subprocess.CREATE_NO_WINDOW,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_the_installer_is_never_left_to_abort_over_a_file_in_use():
+    """Message boxes are suppressed, so the default answer is the one taken.
+
+    Asked to close a program and told no, the installer shows an
+    Abort / Retry / Ignore box; suppressed, that box answers Abort and setup
+    exits with code 5, having rolled the update back. Forcing the close is what
+    makes a silent update silent in the intended sense.
+    """
+    script = app_updater._WINDOWS_SETUP_HELPER
+    assert "/FORCECLOSEAPPLICATIONS" in script
+    assert "/CLOSEAPPLICATIONS" in script
+    # And the failure that reaches the user says what happened, not a number.
+    assert "still in use" in script
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires Windows PowerShell")
+def test_a_program_holding_one_of_our_libraries_counts_as_a_blocker(tmp_path):
+    """The blocker that broke updates ran from somewhere else entirely.
+
+    BlindPilot used to hand its own DLL folder to every process it started, so
+    an agent CLI — or anything that CLI started, outliving BlindPilot by hours
+    — kept a library of ours loaded. Looking only at where a process runs from
+    finds none of them; the installer's restart manager finds all of them, and
+    stops. The deep check has to see what the installer sees.
+    """
+    install_dir = tmp_path / "installed BlindPilot"
+    install_dir.mkdir()
+    # Any real DLL will do: what is being tested is that a loaded module inside
+    # the folder is noticed, not which module it is.
+    library = install_dir / "borrowed.dll"
+    library.write_bytes((Path(os.environ["SystemRoot"]) / "System32" / "version.dll").read_bytes())
+
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import ctypes, sys, time; ctypes.WinDLL(sys.argv[1]); time.sleep(60)",
+            str(library),
+        ],
+        # Deliberately started from outside the install folder, exactly like the
+        # processes that used to go unnoticed.
+        cwd=tempfile.gettempdir(),
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    probe = tmp_path / "probe.ps1"
+    probe.write_text(
+        "param([string]$Folder, [int]$Holder)\n"
+        "$LogFile = Join-Path ([IO.Path]::GetTempPath()) 'blindpilot-probe.log'\n"
+        + app_updater._WINDOWS_PRELUDE
+        + "\n"
+        "$shallow = @(Get-Blockers 0 $Folder $false | ForEach-Object { $_.Id })\n"
+        "$deep = @(Get-Blockers 0 $Folder $true | ForEach-Object { $_.Id })\n"
+        "'shallow:' + ($shallow -contains $Holder)\n"
+        "'deep:' + ($deep -contains $Holder)\n",
+        encoding="utf-8-sig",
+    )
+    powershell = (
+        Path(os.environ.get("SystemRoot", r"C:\Windows"))
+        / "System32"
+        / "WindowsPowerShell"
+        / "v1.0"
+        / "powershell.exe"
+    )
+    try:
+        # Give the holder a moment to actually load the library.
+        deadline = time.monotonic() + 20
+        seen = ""
+        while time.monotonic() < deadline:
+            result = subprocess.run(
+                [
+                    str(powershell),
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(probe),
+                    "-Folder",
+                    str(install_dir),
+                    "-Holder",
+                    str(holder.pid),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                stdin=subprocess.DEVNULL,
+                timeout=120,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            seen = result.stdout + result.stderr
+            if "deep:True" in seen:
+                break
+            time.sleep(0.5)
+        assert "deep:True" in seen, seen
+        # The old check really did miss it, which is why this test exists.
+        assert "shallow:False" in seen, seen
+    finally:
+        holder.kill()
+        holder.wait(timeout=10)

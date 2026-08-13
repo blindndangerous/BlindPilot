@@ -287,11 +287,18 @@ function Save-Failure([string]$Message) {
     try { Set-Content -LiteralPath $StatusFile -Value @($Message, $LogFile) } catch { }
 }
 
-function Get-Blockers([int]$TargetPid, [string]$Folder) {
+function Get-Blockers([int]$TargetPid, [string]$Folder, [bool]$Deep = $false) {
     # Waiting for the one process id is not enough. Anything still running out
     # of the folder being replaced keeps its files mapped, and BlindPilot leaves
     # descendants behind: the agent command-line tools it starts, and the
     # console host bundled in _internal for FreeBuff's terminal.
+    #
+    # A deep pass also asks which processes have *loaded* something from the
+    # folder. A program running from somewhere else entirely can still hold a
+    # library of ours open — that is what the installer's restart manager sees
+    # and what a check on the executable's own path misses completely. It reads
+    # every process's module list, so it is used at the point where something
+    # has to be closed, not in the polling loop.
     $root = ([IO.Path]::GetFullPath($Folder)).TrimEnd('\') + '\'
     $found = @()
     if ($TargetPid -gt 0) {
@@ -299,13 +306,30 @@ function Get-Blockers([int]$TargetPid, [string]$Folder) {
         if ($one) { $found += $one }
     }
     foreach ($item in (Get-Process -ErrorAction SilentlyContinue)) {
+        # Never count this script: killing the updater cancels the update.
+        if ($item.Id -eq $PID) { continue }
+        $hit = $false
         try {
             $path = $item.Path
             if ($path) {
                 $full = [IO.Path]::GetFullPath($path)
-                if ($full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { $found += $item }
+                if ($full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { $hit = $true }
             }
         } catch { }
+        if (-not $hit -and $Deep) {
+            try {
+                foreach ($module in $item.Modules) {
+                    $name = $module.FileName
+                    if (-not $name) { continue }
+                    $full = [IO.Path]::GetFullPath($name)
+                    if ($full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
+                        $hit = $true
+                        break
+                    }
+                }
+            } catch { }
+        }
+        if ($hit) { $found += $item }
     }
     return @($found | Sort-Object Id -Unique)
 }
@@ -315,17 +339,27 @@ function Wait-ForExit([int]$TargetPid, [string]$Folder) {
     for ($stage = 0; $stage -lt $stages.Count; $stage++) {
         $deadline = [DateTime]::UtcNow.AddSeconds($stages[$stage])
         while ([DateTime]::UtcNow -lt $deadline) {
-            if ((Get-Blockers $TargetPid $Folder).Count -eq 0) {
-                # Give Windows a moment to release the image mappings of a
-                # process that has only just gone.
-                Start-Sleep -Milliseconds 1500
-                return $true
+            if ((Get-Blockers $TargetPid $Folder $false).Count -eq 0) {
+                # The cheap check is clear; confirm with the expensive one
+                # before deciding the folder is free. If something is still
+                # holding a library of ours there is no point waiting for it to
+                # exit on its own, so stop polling and start closing.
+                if ((Get-Blockers $TargetPid $Folder $true).Count -eq 0) {
+                    # Give Windows a moment to release the image mappings of a
+                    # process that has only just gone.
+                    Start-Sleep -Milliseconds 1500
+                    return $true
+                }
+                break
             }
             Start-Sleep -Milliseconds 250
         }
-        $blockers = Get-Blockers $TargetPid $Folder
+        $blockers = Get-Blockers $TargetPid $Folder $true
         if ($blockers.Count -eq 0) { Start-Sleep -Milliseconds 1500; return $true }
-        Write-Log ("Still running: " + (($blockers | ForEach-Object { $_.Id }) -join ", "))
+        Write-Log (
+            "Still holding files: " +
+            (($blockers | ForEach-Object { "$($_.ProcessName) ($($_.Id))" }) -join ", ")
+        )
         foreach ($item in $blockers) {
             try {
                 if ($stage -eq 0) { $item.CloseMainWindow() | Out-Null }
@@ -333,7 +367,21 @@ function Wait-ForExit([int]$TargetPid, [string]$Folder) {
             } catch { }
         }
     }
-    return ((Get-Blockers $TargetPid $Folder).Count -eq 0)
+    return ((Get-Blockers $TargetPid $Folder $true).Count -eq 0)
+}
+
+function Enter-UpdateTurn() {
+    # Two BlindPilot windows check for updates independently, and two installers
+    # running over the same folder are guaranteed to find each other's files in
+    # use. Whoever gets here first does the update; the other steps aside.
+    $script:UpdateMutex = New-Object System.Threading.Mutex($false, "Local\BlindPilotUpdate")
+    try {
+        $mine = $script:UpdateMutex.WaitOne(0)
+    } catch [System.Threading.AbandonedMutexException] {
+        # The previous updater died holding it; the turn is ours.
+        $mine = $true
+    }
+    return $mine
 }
 
 function Wait-Unlocked([string]$Folder) {
@@ -441,6 +489,12 @@ $backup = (Join-Path (Split-Path -Parent $InstallDir) (Split-Path -Leaf $Install
 $movedAside = $false
 $replaced = $false
 $handedOver = $false
+if (-not (Enter-UpdateTurn)) {
+    Write-Log "Another update is already running; leaving it to finish."
+    Remove-Item -LiteralPath $Archive -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+    exit 0
+}
 try {
     Write-Log ("Updating " + $InstallDir)
     New-Item -ItemType Directory -Path $stage | Out-Null
@@ -538,26 +592,71 @@ _WINDOWS_SETUP_HELPER = (
 """
     + _WINDOWS_PRELUDE
     + r"""
+function Get-InstallerFailure([int]$Code, [string]$SetupLog) {
+    # The installer's own numbers mean nothing to the person being told. Only
+    # the reason is worth reading aloud; the log path follows for a bug report.
+    $reasons = @{
+        1 = "the installer could not start"
+        2 = "the installation was cancelled"
+        3 = "the installer hit a fatal error while preparing to install"
+        4 = "the installer hit a fatal error while installing"
+        5 = "some of BlindPilot's files were still in use, so the installer stopped rather than replace them"
+        6 = "the installer was terminated"
+        7 = "the installer decided it could not run on this computer"
+        8 = "the installer needs this computer to be restarted first"
+    }
+    $reason = $reasons[$Code]
+    if (-not $reason) { $reason = "the installer failed with code $Code" }
+    $text = "The update could not be installed: $reason."
+    if ($SetupLog -and (Test-Path -LiteralPath $SetupLog -PathType Leaf)) {
+        $text += " Its log is at $SetupLog."
+    }
+    return $text
+}
+
+if (-not (Enter-UpdateTurn)) {
+    Write-Log "Another update is already running; leaving it to finish."
+    Remove-Item -LiteralPath $Installer -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+    exit 0
+}
+$setupLog = [IO.Path]::ChangeExtension($LogFile, ".setup.log")
 try {
     Write-Log ("Updating the installed copy in " + $InstallDir)
     if (-not (Wait-ForExit $ParentPid $InstallDir)) {
         throw "BlindPilot is still running, so the installer could not replace its files."
+    }
+    # The installer replaces the same files this checks, and it aborts rather
+    # than wait for one that is briefly locked — by a virus scanner reading
+    # what a process just released, most often. Better to wait here, where
+    # waiting costs nothing, than to have the installer roll back.
+    if (-not (Wait-Unlocked $InstallDir)) {
+        throw "Some BlindPilot files are still in use, so the installer could not replace them."
     }
 
     # The setup program owns this installation: it keeps the uninstaller and
     # the Add or Remove Programs entry correct, and it remembers the shortcuts
     # chosen last time. Silent, because there is no one at the keyboard, and
     # pointed at the existing folder so an update never moves the application.
+    #
+    # /FORCECLOSEAPPLICATIONS matters as much as any of that. Without it the
+    # installer asks anything holding our files to close, waits half a minute,
+    # and — with message boxes suppressed — takes the silent default of Abort
+    # when one of them does not. That is the exit code 5 that quietly undid
+    # every update. Anything still holding a file here has already been asked
+    # to close and refused, so the installer may close it outright.
     $run = Start-Process -FilePath $Installer -ArgumentList @(
         "/VERYSILENT",
         "/SUPPRESSMSGBOXES",
         "/NORESTART",
         "/NOCANCEL",
         "/CLOSEAPPLICATIONS",
+        "/FORCECLOSEAPPLICATIONS",
+        ("/LOG=" + $setupLog),
         ("/DIR=" + $InstallDir)
     ) -Wait -PassThru
     if ($run.ExitCode -ne 0) {
-        throw "The BlindPilot installer exited with code $($run.ExitCode)."
+        throw (Get-InstallerFailure $run.ExitCode $setupLog)
     }
     Write-Log "Installer finished. Restarting BlindPilot."
     # The installer's own run entry is skipped when it runs silently, so
@@ -579,6 +678,7 @@ try {
 }
 Remove-Item -LiteralPath $Installer -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $LogFile -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $setupLog -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
 """
 )
