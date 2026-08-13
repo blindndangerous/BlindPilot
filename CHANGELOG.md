@@ -4,6 +4,11 @@ Readable release history for BlindPilot. When adjacent releases were part of the
 same fix stream, they are combined with a version range such as
 `v0.3.6-v0.3.7`.
 
+## v0.3.14 - 2026-08-12
+
+- Nothing here changes what BlindPilot does. A type checker was run over the three modules that ship, and the 32 things it objected to were settled — most of them objects passed around unnamed because they come from more than one library, which now say what is asked of them.
+- Two were worth the trouble on their own: the macOS announcement read names that exist only on macOS, with nothing on Windows saying so, and could take the application down with it if it failed; and the sign-in helper had a timeout handler that could be reached before the process it kills exists. Neither could happen as the code stood. Both now say so where they are written, rather than leaving it to be worked out.
+
 ## v0.3.13 - 2026-08-12
 
 - Upgrade over an installed copy when the setup program is run by hand, which stopped on "DeleteFile failed; code 5" while the same upgrade run from inside BlindPilot went through. Only the in-app updater asked the installer to close a program that will not close on request; run by hand, the installer asked politely, and a background program holding one of our libraries — with no window to close and nobody watching it — never answered. The setup program now closes what refuses to close however it was started.
