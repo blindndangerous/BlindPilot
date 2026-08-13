@@ -10,8 +10,10 @@ Run from the project root:
 
 from __future__ import annotations
 
+from collections import deque
 import os
 import sys
+import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -558,6 +560,121 @@ def test_reasoning_is_left_out_of_the_activity_by_default(monkeypatch):
     app.SessionPanel._on_activity(panel, "thinking", "Considering the options")
 
     assert [row.kind for row in panel._rows] == ["thinking"]
+
+
+def test_down_on_last_response_row_stays_in_responses():
+    """The prompt is reachable from responses by Tab, never by Down."""
+    import blindpilot_app as app
+
+    class Event:
+        skipped = False
+
+        @staticmethod
+        def GetKeyCode():
+            return app.wx.WXK_DOWN
+
+        @staticmethod
+        def CmdDown():
+            return False
+
+        def Skip(self):
+            self.skipped = True
+
+    class Prompt:
+        focused = False
+
+        def SetFocus(self):
+            self.focused = True
+
+    panel = type("PanelStub", (), {})()
+    panel.prompt = Prompt()
+    panel._selected_row = lambda: 2
+    panel._row_count = lambda: 3
+    event = Event()
+
+    app.SessionPanel._on_list_key(panel, event)
+
+    assert panel.prompt.focused is False
+    assert event.skipped is False
+
+
+def test_worker_activity_uses_bounded_gui_batches(monkeypatch):
+    """A chatty long job posts one drain at a time and redraws once per batch."""
+    import blindpilot_app as app
+
+    scheduled = []
+    monkeypatch.setattr(app.wx, "CallAfter", lambda callback: scheduled.append(callback))
+
+    panel = type("PanelStub", (), {})()
+    panel._worker_event_lock = threading.Lock()
+    panel._worker_events = deque()
+    panel._worker_events_scheduled = False
+    panel.processed = []
+    panel.refreshes = 0
+    panel._on_activity = lambda kind, text, refresh=True: panel.processed.append(
+        (kind, text, refresh)
+    )
+    panel._refresh_list = lambda: setattr(panel, "refreshes", panel.refreshes + 1)
+    panel._drain_worker_events = lambda: app.SessionPanel._drain_worker_events(panel)
+
+    total = app._WORKER_EVENT_BATCH_SIZE + 5
+    for number in range(total):
+        app.SessionPanel._queue_worker_event(panel, "activity", "tool", str(number))
+
+    assert len(scheduled) == 1
+    scheduled.pop(0)()
+    assert len(panel.processed) == app._WORKER_EVENT_BATCH_SIZE
+    assert panel.refreshes == 1
+    assert len(scheduled) == 1
+
+    scheduled.pop(0)()
+    assert [text for _kind, text, _refresh in panel.processed] == [
+        str(number) for number in range(total)
+    ]
+    assert all(refresh is False for _kind, _text, refresh in panel.processed)
+    assert panel.refreshes == 2
+    assert panel._worker_events_scheduled is False
+
+
+def test_stream_refresh_preserves_the_selected_response_row(monkeypatch):
+    """New streamed rows must not interrupt NVDA reading an existing row."""
+    import blindpilot_app as app
+
+    class Responses:
+        def __init__(self):
+            self.selection = 1
+            self.labels = []
+
+        def GetSelection(self):
+            return self.selection
+
+        def Set(self, labels):
+            self.labels = list(labels)
+            self.selection = app.wx.NOT_FOUND
+
+        def SetSelection(self, index):
+            self.selection = index
+
+    old_rows = [
+        Row(kind="prose", label="First", payload="First", response_number=1),
+        Row(kind="prose", label="Reading this", payload="Reading this", response_number=1),
+    ]
+    panel = type("PanelStub", (), {})()
+    panel._rows = old_rows + [
+        Row(kind="tool", label="New output", payload="New output", response_number=1)
+    ]
+    panel._displayed = list(old_rows)
+    panel._search_term = ""
+    panel.responses = Responses()
+    panel._selected_row = lambda: app.SessionPanel._selected_row(panel)
+    panel._select_row = lambda index: app.SessionPanel._select_row(panel, index)
+    panel._row_count = lambda: len(panel._displayed)
+    monkeypatch.setattr(app.SETTINGS, "text_view", False)
+
+    app.SessionPanel._refresh_list(panel)
+
+    assert panel.responses.labels == ["First", "Reading this", "New output"]
+    assert panel.responses.selection == 1
 
 
 # ----- Compaction and starting over -----

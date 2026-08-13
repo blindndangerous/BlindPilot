@@ -15,8 +15,9 @@ uses Win32 widgets that NVDA / JAWS handle natively.
 v2 segments each assistant turn into navigable *rows* (a header, one row per
 paragraph / heading / list / quote, and one pristine row per fenced code block)
 via the keystone parser in ``markdown_rows``. The flat list of rows sits above
-the prompt box; arrowing Up from the prompt enters the newest row and Down off
-the newest row returns to the prompt.
+the prompt box; arrowing Up from the prompt enters the newest row, while arrow
+keys at either end of the list stay in the list. Tab is the only navigation key
+that moves from the responses into the prompt.
 
 Multi-session: the main window hosts a notebook with one tab per conversation.
 Each tab owns its own conversation (session_id, prompt, rows) and its subprocess
@@ -36,6 +37,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -163,7 +165,14 @@ def announce(text: str) -> None:
 
 
 APP_NAME = "BlindPilot"
-APP_VERSION = "0.3.10"
+APP_VERSION = "0.3.11"
+
+# Streamed coding-agent output can arrive much faster than a native list and a
+# screen reader can consume it. Process a bounded number of events per GUI turn
+# so keyboard and accessibility events always get a chance to run, and redraw
+# the responses control only once for each batch.
+_WORKER_EVENT_BATCH_SIZE = 16
+_WORKER_EVENT_BUDGET_SECONDS = 0.02
 ORIGINAL_APP_CREDIT = (
     "Based on the original Claude Code Reader application by doubletaponair.\n"
     "https://github.com/doubletaponair/claude-code-reader"
@@ -2336,7 +2345,8 @@ class SessionPanel(wx.Panel):
     Layout, top to bottom: working-directory label, search box, the flat list of
     rows (oldest at top, newest at bottom), the multi-line prompt box, the Send
     button. Focus starts in the prompt; Up from the prompt enters the newest
-    row; Down off the newest row returns to the prompt.
+    row. Arrow keys remain within the responses, including at the first and last
+    rows; Tab is the way to move between the list and the prompt.
 
     `on_status(panel, text)` lets the frame show only the active tab's status.
     """
@@ -2375,6 +2385,12 @@ class SessionPanel(wx.Panel):
         self._session_id: Optional[str] = None
         self._session_backend = normalize_backend(self._get_backend())
         self._worker: Optional[threading.Thread] = None
+        # Worker callbacks arrive on a background thread. Keep them in one
+        # ordered mailbox with at most one pending GUI callback; otherwise a
+        # long, chatty job can flood wx's event queue and starve NVDA/key input.
+        self._worker_event_lock = threading.Lock()
+        self._worker_events: deque[tuple[str, tuple[object, ...]]] = deque()
+        self._worker_events_scheduled = False
         # Starts at your remembered choice, or the active provider's default
         # mode for this directory.
         self.mode = _default_permission_mode(cwd, self._session_backend)
@@ -2418,7 +2434,8 @@ class SessionPanel(wx.Panel):
         self.prompt = wx.TextCtrl(self, style=wx.TE_MULTILINE | wx.TE_PROCESS_ENTER)
         self.prompt.SetName("Prompt")
         self.prompt.SetHint(
-            "Type your prompt. Enter to send, Shift+Enter for newline, Up to enter responses."
+            "Type your prompt. Enter to send, Shift+Enter for newline, Up to enter responses; "
+            "Tab returns here from responses."
         )
         self.prompt.Bind(wx.EVT_KEY_DOWN, self._on_prompt_key)
         self.prompt.Bind(wx.EVT_SET_FOCUS, self._on_prompt_focus)
@@ -2849,6 +2866,74 @@ class SessionPanel(wx.Panel):
             return
         event.Skip()
 
+    # ----- Worker-to-GUI event mailbox -----
+    def _queue_worker_event(self, name: str, *args: object) -> None:
+        """Queue one worker callback without flooding wx's event loop.
+
+        Every backend invokes callbacks from its worker thread. A single
+        scheduled drain preserves their order while allowing a long stream to
+        accumulate in this mailbox instead of as thousands of native GUI
+        events.
+        """
+        with self._worker_event_lock:
+            self._worker_events.append((name, args))
+            if self._worker_events_scheduled:
+                return
+            self._worker_events_scheduled = True
+        wx.CallAfter(self._drain_worker_events)
+
+    def _drain_worker_events(self) -> None:
+        """Apply a short batch, then yield to keyboard and accessibility events."""
+        if not self:
+            with self._worker_event_lock:
+                self._worker_events.clear()
+                self._worker_events_scheduled = False
+            return
+
+        started = time.monotonic()
+        handled = 0
+        rows_changed = False
+        while handled < _WORKER_EVENT_BATCH_SIZE:
+            if handled and time.monotonic() - started >= _WORKER_EVENT_BUDGET_SECONDS:
+                break
+            with self._worker_event_lock:
+                if not self._worker_events:
+                    break
+                name, args = self._worker_events.popleft()
+
+            if name == "activity":
+                self._on_activity(str(args[0]), str(args[1]), refresh=False)
+                rows_changed = True
+            else:
+                # Make preceding streamed rows visible before a status or
+                # terminal event that logically follows them.
+                if rows_changed:
+                    self._refresh_list()
+                    rows_changed = False
+                if name == "session":
+                    self._on_session_started(str(args[0]))
+                elif name == "started":
+                    self._announce("Receiving response")
+                elif name == "complete":
+                    self._on_response_complete(str(args[0]))
+                elif name == "failed":
+                    self._on_failed(str(args[0]))
+                elif name == "done":
+                    self._on_worker_finished()
+            handled += 1
+
+        if rows_changed:
+            self._refresh_list()
+
+        with self._worker_event_lock:
+            pending = bool(self._worker_events)
+            if not pending:
+                self._worker_events_scheduled = False
+        if pending:
+            # Posting at the back of the native queue lets arrow, Tab, paint,
+            # and screen-reader events already waiting run before the next batch.
+            wx.CallAfter(self._drain_worker_events)
+
     # ----- Send flow -----
     def send_now(self) -> None:
         """Public entry point so the frame can fire a seeded side-chat prompt."""
@@ -2954,12 +3039,12 @@ class SessionPanel(wx.Panel):
             self.mode,
             model=self.model,
             effort=self.effort,
-            on_session=lambda sid: wx.CallAfter(self._on_session_started, sid),
-            on_started=lambda: wx.CallAfter(self._announce, "Receiving response"),
-            on_activity=lambda kind, text: wx.CallAfter(self._on_activity, kind, text),
-            on_complete=lambda txt: wx.CallAfter(self._on_response_complete, txt),
-            on_failed=lambda msg: wx.CallAfter(self._on_failed, msg),
-            on_done=lambda: wx.CallAfter(self._on_worker_finished),
+            on_session=lambda sid: self._queue_worker_event("session", sid),
+            on_started=lambda: self._queue_worker_event("started"),
+            on_activity=lambda kind, text: self._queue_worker_event("activity", kind, text),
+            on_complete=lambda txt: self._queue_worker_event("complete", txt),
+            on_failed=lambda msg: self._queue_worker_event("failed", msg),
+            on_done=lambda: self._queue_worker_event("done"),
             **(worker_extra or {}),
         )
         self._worker.start()
@@ -3159,7 +3244,7 @@ class SessionPanel(wx.Panel):
             )
         return self._stream_response
 
-    def _on_activity(self, kind: str, text: str) -> None:
+    def _on_activity(self, kind: str, text: str, *, refresh: bool = True) -> None:
         """Stream real content into the list as it arrives during a turn.
 
         ``kind == "assistant"`` is the backend's narration/answer text (segmented
@@ -3224,7 +3309,8 @@ class SessionPanel(wx.Panel):
             self._streamed_assistant += ("\n\n" if self._streamed_assistant else "") + text
             if self._say(f"{speaker}. {' '.join(text.split())}"):
                 self._assistant_narrated_this_turn = True
-        self._refresh_list()
+        if refresh:
+            self._refresh_list()
 
     def _say(self, text: str) -> bool:
         """Speak live activity, and mirror a short form to the status bar.
@@ -3319,6 +3405,10 @@ class SessionPanel(wx.Panel):
 
     # ----- List + find -----
     def _refresh_list(self) -> None:
+        # Replacing a native ListBox's contents clears its selection. Preserve
+        # the row first so incoming output never disrupts someone who is
+        # reading older rows with NVDA.
+        keep = self._selected_row()
         term = self._search_term.lower()
         labels: List[str] = []
         self._displayed = []
@@ -3331,12 +3421,11 @@ class SessionPanel(wx.Panel):
             # One row per line, so a line number is a row number. Labels are
             # already flattened, but a stray newline would break that mapping.
             text = "\n".join(" ".join(label.split()) for label in labels)
-            keep = self._selected_row()
             self.responses_text.ChangeValue(text)
-            if keep != wx.NOT_FOUND:
-                self._select_row(keep)
         else:
             self.responses.Set(labels)
+        if keep != wx.NOT_FOUND and labels:
+            self._select_row(keep)
 
     def open_find(self) -> None:
         """Find-in-responses popup (File menu / Cmd-Ctrl+F). Blank clears it."""
@@ -3379,9 +3468,9 @@ class SessionPanel(wx.Panel):
                 if sel != wx.NOT_FOUND:
                     self._jump_to_next_response(sel)
                 return
-            # Down off the newest (last) row returns to the prompt box.
+            # The responses are one focus region. At the bottom, consume Down
+            # and remain on the final row; only Tab may enter the prompt.
             if sel != wx.NOT_FOUND and sel == self._row_count() - 1:
-                self.prompt.SetFocus()
                 return
             event.Skip()
             return

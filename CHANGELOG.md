@@ -4,6 +4,14 @@ Readable release history for BlindPilot. When adjacent releases were part of the
 same fix stream, they are combined with a version range such as
 `v0.3.6-v0.3.7`.
 
+## v0.3.11 - 2026-08-12
+
+- Stay in the responses when Down is pressed on the newest row, in the list and in the read-only edit field alike, rather than dropping focus into the prompt. Tab is the way to the prompt.
+- Keep the row you are reading when streamed output rebuilds the list, which on Windows clears the selection.
+- Apply backend output in small batches that yield to keyboard and screen-reader events, so a long, chatty job no longer leaves arrow keys unanswered, and redraw the list once per batch.
+- Keep FreeBuff on DeepSeek V4 Pro. FreeBuff dated the model's name ("DeepSeek V4 Pro 08/13") without dating its documentation, so BlindPilot dropped Pro from the model list and fell back to FreeBuff's own setting, which FreeBuff rewrites to Flash after every turn.
+- Re-apply the chosen FreeBuff model before replacing a terminal mid-message, since the terminal being replaced rewrites that setting as it exits.
+
 ## v0.3.10 - 2026-08-10
 
 - Install updates at all. No update since 0.3.0 has ever been applied: the helper that does the work was started in a way that made Windows PowerShell exit without running it, and report success while doing so.

@@ -617,6 +617,21 @@ def _resolve_minified_string(
     return ""
 
 
+# FreeBuff stamps a release date onto some display names, and revises it in
+# place: "DeepSeek V4 Pro" became "DeepSeek V4 Pro 08/13" without the packaged
+# README following. Reading the two as different models drops the dated one.
+_MODEL_DATE_SUFFIX_RE = re.compile(r"\s+\d{1,2}/\d{1,2}(?:/\d{2,4})?$")
+
+
+def _readme_offset(readme_text: str, display_name: str) -> int:
+    """Where the README documents this model, or -1 if it does not at all."""
+    offset = readme_text.find(display_name)
+    if offset >= 0:
+        return offset
+    undated = _MODEL_DATE_SUFFIX_RE.sub("", display_name)
+    return readme_text.find(undated) if undated != display_name else -1
+
+
 def _freebuff_models_from_install(binary: Optional[str]) -> list[str]:
     """Read the current picker catalog from the installed FreeBuff release."""
     executable = (
@@ -663,12 +678,12 @@ def _freebuff_models_from_install(binary: Optional[str]) -> list[str]:
         # The packaged README documents the user-facing regular/earned models.
         # If it is absent, the catalog-shaped object is still better than a
         # stale list compiled into BlindPilot.
-        if readme_text and display_name not in readme_text:
+        order = _readme_offset(readme_text, display_name) if readme_text else -1
+        if readme_text and order < 0:
             continue
         model_id = _resolve_minified_string(source, match.group(2), direct)
         if not model_id or "/" not in model_id:
             continue
-        order = readme_text.find(display_name) if readme_text else match.start()
         discovered.append((order if order >= 0 else match.start(), model_id))
 
     models: list[str] = []
@@ -1918,6 +1933,14 @@ class FreebuffWorker(threading.Thread):
             """
             nonlocal before
             _kill_pty(self._pty)
+            # The terminal being replaced had a whole FreeBuff in it, and one
+            # rewrites the model setting to its own recommendation as it goes.
+            # The replacement reads that setting at launch, so the choice has to
+            # be put back before it starts rather than only before the first.
+            try:
+                set_freebuff_model(self._model)
+            except OSError:
+                pass
             before = _freebuff_chat_dirs(self._cwd)
             self._stream_ended = threading.Event()
             try:

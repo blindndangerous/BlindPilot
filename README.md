@@ -84,7 +84,8 @@ freebuff login
 - **Ctrl+/** slash commands, **Ctrl+.** stop the running task.
 - **Ctrl+Shift+A** attach files, **Ctrl+Shift+M** cycle permission modes.
 - **Ctrl+Shift+[** and **Ctrl+Shift+]** move between sessions; **Ctrl+1** to **Ctrl+9** jump straight to one.
-- **Up** from the prompt's first line enters the newest response; **Down** off it returns to the prompt.
+- **Up** from the prompt's first line enters the newest response. At either end,
+  arrow keys stay in the responses; press **Tab** to move to the prompt.
 
 On macOS the same accelerators map to Command where appropriate.
 

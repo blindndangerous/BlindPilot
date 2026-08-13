@@ -172,6 +172,70 @@ def test_freebuff_catalog_is_discovered_at_runtime_and_pro_is_default(monkeypatc
     assert settings["freebuffModel"] == "openai/gpt-next"
 
 
+def test_freebuff_catalog_keeps_a_model_the_readme_names_without_its_date(monkeypatch, tmp_path):
+    """A release date on the display name must not hide the model.
+
+    FreeBuff renamed "DeepSeek V4 Pro" to "DeepSeek V4 Pro 08/13" in the binary
+    and left the README undated. Reading the two as different models dropped Pro
+    out of the catalog, which quietly handed every conversation to Flash.
+    """
+    wrapper = tmp_path / "npm" / "freebuff.cmd"
+    readme = wrapper.parent / "node_modules" / "freebuff" / "README.md"
+    executable = tmp_path / ".config" / "manicode" / "freebuff.exe"
+    readme.parent.mkdir(parents=True)
+    executable.parent.mkdir(parents=True)
+    wrapper.touch()
+    readme.write_text("DeepSeek V4 Flash 07/31, DeepSeek V4 Pro, and GPT Next.\n", encoding="utf-8")
+    executable.write_text(
+        'pro="deepseek/deepseek-v4-pro",flash="deepseek/deepseek-v4-flash",'
+        'next="openai/gpt-next";'
+        'a={id:flash,displayName:"DeepSeek V4 Flash 07/31",availability:"always"};'
+        'b={id:pro,displayName:"DeepSeek V4 Pro 08/13",availability:"always"};'
+        'c={id:next,displayName:"GPT Next",availability:"always"};',
+        encoding="latin-1",
+    )
+    monkeypatch.setattr(agent_backends.Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setattr(agent_backends.platform, "system", lambda: "Windows")
+    monkeypatch.setenv("APPDATA", str(tmp_path / "AppData"))
+    monkeypatch.setattr(agent_backends, "find_backend_cli", lambda _backend: str(wrapper))
+    agent_backends.invalidate_backend_cache()
+
+    models, _efforts, current, _current_effort, error = freebuff_model_options()
+
+    assert models[0] == "deepseek/deepseek-v4-pro"
+    assert "deepseek/deepseek-v4-flash" in models
+    assert current == "deepseek/deepseek-v4-pro"
+    assert error == ""
+
+
+def test_freebuff_falls_back_to_pro_rather_than_freebuffs_own_flash_setting(monkeypatch, tmp_path):
+    """With no BlindPilot record, Pro wins over whatever FreeBuff left behind."""
+    wrapper = tmp_path / "npm" / "freebuff.cmd"
+    readme = wrapper.parent / "node_modules" / "freebuff" / "README.md"
+    executable = tmp_path / ".config" / "manicode" / "freebuff.exe"
+    readme.parent.mkdir(parents=True)
+    executable.parent.mkdir(parents=True)
+    wrapper.touch()
+    readme.write_text("DeepSeek V4 Flash 07/31 and DeepSeek V4 Pro.\n", encoding="utf-8")
+    executable.write_text(
+        'pro="deepseek/deepseek-v4-pro",flash="deepseek/deepseek-v4-flash";'
+        'a={id:flash,displayName:"DeepSeek V4 Flash 07/31",availability:"always"};'
+        'b={id:pro,displayName:"DeepSeek V4 Pro 08/13",availability:"always"};',
+        encoding="latin-1",
+    )
+    settings = executable.parent / "settings.json"
+    settings.write_text(json.dumps({"freebuffModel": "deepseek/deepseek-v4-flash"}), "utf-8")
+    monkeypatch.setattr(agent_backends.Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setattr(agent_backends.platform, "system", lambda: "Windows")
+    monkeypatch.setenv("APPDATA", str(tmp_path / "AppData"))
+    monkeypatch.setattr(agent_backends, "find_backend_cli", lambda _backend: str(wrapper))
+    agent_backends.invalidate_backend_cache()
+
+    _models, _efforts, current, _current_effort, _error = freebuff_model_options()
+
+    assert current == "deepseek/deepseek-v4-pro"
+
+
 def test_freebuff_picker_navigation_uses_runtime_model_order():
     visible = """
 │   DeepSeek V4 Pro          Deep reasoning │
