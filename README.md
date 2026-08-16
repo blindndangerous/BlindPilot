@@ -86,17 +86,35 @@ hermes model      # pick one, if none is set yet
 ### Driving a Hermes on another computer
 
 Leave **Options → Remote Hermes** off and the Hermes backend runs the copy
-installed here. To use one running elsewhere, start it there:
+installed here — including one installed in WSL, which is found and started
+there without any network setup.
+
+To use a Hermes running on a different machine, how you start it decides how you
+sign in.
+
+On the same computer, bound to localhost, a session token is enough:
 
 ```bash
 HERMES_DASHBOARD_SESSION_TOKEN=pick-a-long-random-string hermes serve --port 9119
 ```
 
-Then fill in that computer's name, the port, and the same string as the key.
-**Test connection** reports whether the address and key work before you send
-anything. A Hermes reachable from outside its own machine has to be bound to a
-public address, and Hermes then requires a password or OAuth login of its own;
-in that case log in and use the ticket it mints as the key.
+Reachable from elsewhere, it has to be bound to a public address, and Hermes
+refuses that outright unless a login is configured — there is no unauthenticated
+public bind. Configure a password once, on the machine running Hermes:
+
+```bash
+hermes config set dashboard.basic_auth.username your-name
+# Hermes prints the hash to store; run this from its own installation:
+python -c "from plugins.dashboard_auth.basic import hash_password; print(hash_password('your-password'))"
+hermes config set dashboard.basic_auth.password_hash 'the-hash-it-printed'
+hermes serve --port 9119 --host 0.0.0.0
+```
+
+Then choose **Username and password** in the settings. Hermes' WebSocket accepts
+only a single-use ticket once that gate is up, and those tickets live thirty
+seconds — far too short to paste into a field — so BlindPilot logs in and mints
+one itself each time it connects. **Test connection** reports whether the address
+and credentials work before anything is sent.
 
 Note that `websocket-client` is only needed for this path. The local backend
 uses a pipe, and a missing copy is reported as an installable package rather

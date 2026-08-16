@@ -1666,8 +1666,9 @@ class _RemoteHermes:
         except (TypeError, ValueError):
             self.port = 9119
         self.secure = bool(remote.get("secure", False))
-        # "token" for a server on this machine; "ticket" for one reachable from
-        # elsewhere, which Hermes requires a password login for.
+        # "token" for a server on this machine; "password" for one reachable
+        # from elsewhere, where Hermes requires a login of its own and its
+        # WebSocket upgrade then wants a short-lived ticket.
         credential = str(remote.get("credential", "token") or "token")
         self.credential = credential if credential in REMOTE_CREDENTIALS else "token"
         self.username = str(remote.get("username", "") or "")
