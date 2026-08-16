@@ -4,6 +4,15 @@ Readable release history for BlindPilot. When adjacent releases were part of the
 same fix stream, they are combined with a version range such as
 `v0.3.6-v0.3.7`.
 
+## Unreleased
+
+- Run Hermes Agent as a fourth backend, chosen from File, Backend like the others. It reads its answers, its reasoning, and every tool it runs into the same navigable rows, reopens past conversations from Recent Conversations, compacts in place, and can be steered or stopped while it works.
+- Drive a Hermes running on another computer, from Options, Remote Hermes: a name, a port, and a key, with a Test connection button that says whether they work before anything is sent. A server on a home network can be worked with from the desktop without opening a terminal. Leave it off and the copy installed here is used, with nothing to configure.
+- Say why a remote connection failed in terms of what to do about it — a refused key, nothing listening, an unknown name — rather than reporting that it failed. The key never appears in those messages, or anywhere else that is read aloud; it is kept in a file of its own rather than among the display settings.
+- Ask each backend what it supports instead of naming the ones that do not. The permission picker, the effort levels, the compaction command, and the wizard's closing summary were all deciding by backend name, which quietly gave a new backend controls its protocol has no answer for.
+- Stop telling users to install Node.js for a backend that does not come from npm, and stop running an interactive sign-in hidden with no keyboard attached to it — which fails immediately and was reported as a failed sign-in. A backend whose setup asks questions now opens a real terminal window and says to come back when it is answered.
+- Hermes' reasoning channel carries the spinner it draws for a terminal, not the model's reasoning. That is left out, since read aloud it is noise, and the reasoning it does report is shown instead — once, not twice when a short answer arrives as its own reasoning.
+
 ## v0.3.14 - 2026-08-12
 
 - Nothing here changes what BlindPilot does. A type checker was run over the three modules that ship, and the 32 things it objected to were settled — most of them objects passed around unnamed because they come from more than one library, which now say what is asked of them.

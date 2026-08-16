@@ -1,6 +1,6 @@
 # BlindPilot
 
-A vibe-coded, screen-reader-friendly desktop front end for AI coding agents on Windows and macOS, built so Claude Code, Codex, and FreeBuff can be driven without reading a terminal.
+A vibe-coded, screen-reader-friendly desktop front end for AI coding agents on Windows and macOS, built so Claude Code, Codex, FreeBuff, and Hermes can be driven without reading a terminal.
 
 [![Join SerrebiProjects on Telegram](https://img.shields.io/badge/Telegram-SerrebiProjects-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/SerrebiProjects)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
@@ -12,7 +12,8 @@ BlindPilot is based on the original **[Claude Code Reader](https://github.com/do
 ## Features
 
 - Native wxPython controls throughout, so NVDA, JAWS, and VoiceOver read the app rather than interpreting a terminal.
-- Runs Claude Code, Codex, and FreeBuff, switchable from the File menu and remembered between launches.
+- Runs Claude Code, Codex, FreeBuff, and Hermes, switchable from the File menu and remembered between launches.
+- Drives a Hermes on another computer over the network, so a server elsewhere can be worked with from the desktop.
 - Segments every answer into navigable rows: one per heading, paragraph, list item, quote, code block, thought, tool action, and tool result.
 - Reads answers aloud as they arrive, or stays quiet until the whole answer is ready.
 - Reopens past conversations from any backend, titled by the message that started them, and carries on where they left off.
@@ -33,8 +34,11 @@ BlindPilot is based on the original **[Claude Code Reader](https://github.com/do
 | Claude Code | Streaming JSON CLI | Yes | Yes | Yes | Yes |
 | Codex | Official app-server protocol | Yes | Yes, including reasoning effort | Yes | Yes |
 | FreeBuff | Pseudo-terminal adapter | Yes | Yes; DeepSeek V4 Pro by default | Managed by FreeBuff | No |
+| Hermes | Gateway JSON-RPC, local pipe or network | Yes | Yes | Yes | Yes |
 
 FreeBuff ships no JSON or headless API, so BlindPilot runs its terminal interface in a hidden pseudo-terminal, reads the answer off its screen a finished sentence at a time, and captures its chat id so the conversation can be resumed. Terminal redraws and advertisements are filtered out before anything is spoken. Its permission picker and Compact Conversation are disabled because the FreeBuff CLI has no equivalent.
+
+Hermes speaks its gateway JSON-RPC, which runs over both a local pipe and a network socket — so a Hermes on another computer can be driven from the desktop without a terminal (**Options → Remote Hermes**). Its reasoning channel carries a terminal spinner rather than the model's reasoning, so that is filtered out and the real reasoning shown instead. Hermes exposes no per-turn reasoning effort on this protocol, so that picker stays empty.
 
 ## Download and install
 
@@ -73,7 +77,30 @@ codex login
 # FreeBuff
 npm install -g freebuff
 freebuff login
+
+# Hermes Agent — see https://hermes-agent.nousresearch.com/docs
+hermes status     # shows the provider and model it will use
+hermes model      # pick one, if none is set yet
 ```
+
+### Driving a Hermes on another computer
+
+Leave **Options → Remote Hermes** off and the Hermes backend runs the copy
+installed here. To use one running elsewhere, start it there:
+
+```bash
+HERMES_DASHBOARD_SESSION_TOKEN=pick-a-long-random-string hermes serve --port 9119
+```
+
+Then fill in that computer's name, the port, and the same string as the key.
+**Test connection** reports whether the address and key work before you send
+anything. A Hermes reachable from outside its own machine has to be bound to a
+public address, and Hermes then requires a password or OAuth login of its own;
+in that case log in and use the ticket it mints as the key.
+
+Note that `websocket-client` is only needed for this path. The local backend
+uses a pipe, and a missing copy is reported as an installable package rather
+than stopping the app.
 
 ## Keyboard
 

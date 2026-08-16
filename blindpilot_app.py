@@ -81,7 +81,7 @@ from agent_backends import (
     set_freebuff_model,
     worker_class,
 )
-from hermes_backend import hermes_model_options
+from hermes_backend import REMOTE_CREDENTIALS, hermes_model_options, remote_ws_url
 
 from markdown_rows import (
     Row,
@@ -1140,6 +1140,17 @@ def probe_model_options(
     """
     backend = normalize_backend(backend)
     binary = _find_claude() if backend == BACKEND_CLAUDE else find_backend_cli(backend)
+    if backend == BACKEND_HERMES and REMOTE_HERMES.url() and binary is None:
+        # A remote Hermes needs no local copy at all, so "not found" here is
+        # not a problem to report - there is simply nothing local to ask.
+        return ModelOptions(
+            [],
+            [],
+            error=(
+                "Remote Hermes chooses its model on the machine it runs on. "
+                "Use its own /model command there."
+            ),
+        )
     if binary is None:
         label = backend_label(backend)
         return ModelOptions(
@@ -1155,6 +1166,18 @@ def probe_model_options(
         return fresh
 
     if backend == BACKEND_HERMES:
+        # A remote Hermes owns its own model list, and the local copy may not
+        # even be installed, so asking here would report the wrong catalog or
+        # none at all. The model is chosen on the machine Hermes runs on.
+        if REMOTE_HERMES.url():
+            return ModelOptions(
+                [],
+                [],
+                error=(
+                    "Remote Hermes chooses its model on the machine it runs on. "
+                    "Use its own /model command there."
+                ),
+            )
         models, efforts, current_model, current_effort, error = hermes_model_options(cwd)
         options = ModelOptions(models, efforts, current_model, current_effort, error)
         if models:
@@ -1611,6 +1634,93 @@ class _Settings:
 
 
 SETTINGS = _Settings()
+
+
+class _RemoteHermes:
+    """Where to find a Hermes that is not on this computer.
+
+    Off by default: with nothing configured, the Hermes backend launches the
+    local copy and there is nothing to set up. Filling this in points it at a
+    Hermes running elsewhere -- a home server, or the same machine reached over
+    a private network -- so the desktop can work with it without a terminal.
+
+    The key is stored separately from the display preferences, in a file of its
+    own with owner-only permissions where the platform supports them. It is a
+    credential: it belongs no more in a settings file full of checkboxes than a
+    password does.
+    """
+
+    def __init__(self) -> None:
+        cfg = _load_config()
+        remote = cfg.get("remote_hermes")
+        remote = remote if isinstance(remote, dict) else {}
+        self.enabled = bool(remote.get("enabled", False))
+        self.host = str(remote.get("host", "") or "")
+        try:
+            self.port = int(remote.get("port", 9119))
+        except (TypeError, ValueError):
+            self.port = 9119
+        self.secure = bool(remote.get("secure", False))
+        # "token" for a server on this machine; "ticket" for one reachable from
+        # elsewhere, which Hermes requires a password login for.
+        credential = str(remote.get("credential", "token") or "token")
+        self.credential = credential if credential in REMOTE_CREDENTIALS else "token"
+        self.key = self._read_key()
+
+    @staticmethod
+    def _key_path() -> Path:
+        return _config_dir() / "remote-hermes-key"
+
+    def _read_key(self) -> str:
+        try:
+            return self._key_path().read_text(encoding="utf-8").strip()
+        except (OSError, ValueError):
+            return ""
+
+    def _write_key(self) -> None:
+        path = self._key_path()
+        try:
+            _config_dir().mkdir(parents=True, exist_ok=True)
+            if not self.key:
+                path.unlink(missing_ok=True)
+                return
+            path.write_text(self.key, encoding="utf-8")
+            if platform.system() != "Windows":
+                # Owner-only. On Windows the per-user AppData directory is
+                # already the boundary, and chmod there does not mean this.
+                os.chmod(path, 0o600)
+        except OSError:
+            pass
+
+    def url(self) -> str:
+        """The gateway address, or "" when the remote mode is not in use."""
+        if not self.enabled or not self.host.strip():
+            return ""
+        return remote_ws_url(self.host, self.port, self.secure)
+
+    def describe(self) -> str:
+        """One line saying where this will connect, for the settings dialog."""
+        if not self.enabled:
+            return "Off — the Hermes backend runs the copy installed here."
+        url = self.url()
+        if not url:
+            return "On, but no address is set yet."
+        return f"On — {url}"
+
+    def save(self) -> None:
+        cfg = _load_config()
+        cfg["remote_hermes"] = {
+            "enabled": self.enabled,
+            "host": self.host,
+            "port": self.port,
+            "secure": self.secure,
+            "credential": self.credential,
+        }
+        _save_config(cfg)
+        self._write_key()
+
+
+REMOTE_HERMES = _RemoteHermes()
 
 
 def _resource_dir() -> str:
@@ -3121,6 +3231,16 @@ class SessionPanel(wx.Panel):
         self._earcons.start_progress()
 
         worker_type = worker_class(selected_backend, ClaudeWorker)
+        extra = dict(worker_extra or {})
+        if selected_backend == BACKEND_HERMES:
+            # Point the turn at a Hermes elsewhere when one is configured.
+            # Nothing is added when it is not, so the local path stays the
+            # zero-configuration default.
+            remote_url = REMOTE_HERMES.url()
+            if remote_url:
+                extra["remote_url"] = remote_url
+                extra["remote_token"] = REMOTE_HERMES.key
+                extra["remote_credential"] = REMOTE_HERMES.credential
         self._worker = worker_type(
             send_text,
             self._session_id,
@@ -3134,7 +3254,7 @@ class SessionPanel(wx.Panel):
             on_complete=lambda txt: self._queue_worker_event("complete", txt),
             on_failed=lambda msg: self._queue_worker_event("failed", msg),
             on_done=lambda: self._queue_worker_event("done"),
-            **(worker_extra or {}),
+            **extra,
         )
         self._worker.start()
         self.steer_btn.Enable()
@@ -4504,6 +4624,156 @@ class SetupWizard(wx.Dialog):
         announce(f"Projects folder: {self.projects_folder}")
 
 
+class RemoteHermesDialog(wx.Dialog):
+    """Where a Hermes on another computer lives, and how to prove who we are.
+
+    Deliberately plain: a checkbox, an address, a port, a key, and a button
+    that tries it. Every field has a label of its own so a screen reader
+    announces what it is on the way in, and the test button reports its result
+    in the same status line rather than a message box that has to be dismissed.
+    """
+
+    def __init__(self, parent: wx.Window):
+        super().__init__(parent, title="Remote Hermes", style=wx.DEFAULT_DIALOG_STYLE)
+        intro = wx.StaticText(
+            self,
+            label=(
+                "By default the Hermes backend runs the copy installed on this "
+                "computer. Turn this on to drive a Hermes running somewhere "
+                "else instead — start it there with 'hermes serve'."
+            ),
+        )
+        intro.Wrap(520)
+
+        self._enabled = wx.CheckBox(self, label="&Use a Hermes on another computer")
+        self._enabled.SetValue(REMOTE_HERMES.enabled)
+
+        host_label = wx.StaticText(self, label="Computer &name or address:")
+        self._host = wx.TextCtrl(self, value=REMOTE_HERMES.host)
+        self._host.SetHint("for example: my-server, or 100.64.0.5")
+
+        port_label = wx.StaticText(self, label="&Port:")
+        self._port = wx.SpinCtrl(self, min=1, max=65535, initial=REMOTE_HERMES.port)
+
+        self._secure = wx.CheckBox(self, label="Connect over &TLS (wss)")
+        self._secure.SetValue(REMOTE_HERMES.secure)
+
+        credential_label = wx.StaticText(self, label="&Key type:")
+        self._credential = wx.Choice(
+            self,
+            choices=[
+                "Session token — a Hermes on this same machine",
+                "Ticket — a Hermes that asked you to log in",
+            ],
+        )
+        self._credential.SetSelection(0 if REMOTE_HERMES.credential == "token" else 1)
+
+        key_label = wx.StaticText(self, label="&Key:")
+        # Not a password field: a screen-reader user has to be able to review
+        # what was pasted, and this is a machine-generated string nobody types
+        # from memory. It is stored in a file of its own, not shown elsewhere.
+        self._key = wx.TextCtrl(self, value=REMOTE_HERMES.key)
+
+        self._status = wx.StaticText(self, label=REMOTE_HERMES.describe())
+        self._status.Wrap(520)
+
+        self._test_btn = wx.Button(self, label="&Test connection")
+        self._test_btn.Bind(wx.EVT_BUTTON, lambda _e: self._test())
+
+        buttons = self.CreateStdDialogButtonSizer(wx.OK | wx.CANCEL)
+
+        grid = wx.FlexGridSizer(cols=2, vgap=6, hgap=8)
+        grid.AddGrowableCol(1, 1)
+        for label, control in (
+            (host_label, self._host),
+            (port_label, self._port),
+            (credential_label, self._credential),
+            (key_label, self._key),
+        ):
+            grid.Add(label, 0, wx.ALIGN_CENTER_VERTICAL)
+            grid.Add(control, 1, wx.EXPAND)
+
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        sizer.Add(intro, 0, wx.ALL, 10)
+        sizer.Add(self._enabled, 0, wx.LEFT | wx.BOTTOM, 10)
+        sizer.Add(grid, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+        sizer.Add(self._secure, 0, wx.ALL, 10)
+        sizer.Add(self._test_btn, 0, wx.LEFT | wx.BOTTOM, 10)
+        sizer.Add(self._status, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        sizer.Add(buttons, 0, wx.EXPAND | wx.ALL, 10)
+        self.SetSizerAndFit(sizer)
+        self._host.SetFocus()
+
+    def _credential_name(self) -> str:
+        return "token" if self._credential.GetSelection() == 0 else "ticket"
+
+    def _say(self, text: str) -> None:
+        self._status.SetLabel(text)
+        self._status.Wrap(520)
+        self.Layout()
+        announce(text)
+
+    def _test(self) -> None:
+        """Try the address now, so a mistake is found here and not mid-turn."""
+        host = self._host.GetValue().strip()
+        if not host:
+            self._say("Enter the computer's name or address first.")
+            self._host.SetFocus()
+            return
+        url = remote_ws_url(host, int(self._port.GetValue()), self._secure.GetValue())
+        self._test_btn.Disable()
+        self._say(f"Trying {url}…")
+        key = self._key.GetValue().strip()
+        credential = self._credential_name()
+        threading.Thread(target=self._run_test, args=(url, key, credential), daemon=True).start()
+
+    def _run_test(self, url: str, key: str, credential: str) -> None:
+        from hermes_backend import WebSocketTransport
+
+        transport = WebSocketTransport(url, key, credential)
+        try:
+            transport.start()
+        except OSError as exc:
+            wx.CallAfter(self._test_done, str(exc))
+            return
+        # Connecting proves the address and the key. Waiting for Hermes to
+        # announce itself proves the far end really is a Hermes gateway, which
+        # is the difference between a wrong port and a wrong program.
+        try:
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                frame = transport.receive(0.5)
+                if frame is None:
+                    continue
+                params = frame.get("params")
+                if isinstance(params, dict) and params.get("type") == "gateway.ready":
+                    wx.CallAfter(self._test_done, "")
+                    return
+            wx.CallAfter(
+                self._test_done,
+                f"Connected to {url}, but it did not identify itself as Hermes.",
+            )
+        finally:
+            transport.close()
+
+    def _test_done(self, error: str) -> None:
+        self._test_btn.Enable()
+        if error:
+            self._say(error)
+        else:
+            self._say("Hermes answered. This address and key work.")
+
+    def apply(self) -> None:
+        """Copy the fields into the saved settings."""
+        REMOTE_HERMES.enabled = self._enabled.GetValue()
+        REMOTE_HERMES.host = self._host.GetValue().strip()
+        REMOTE_HERMES.port = int(self._port.GetValue())
+        REMOTE_HERMES.secure = self._secure.GetValue()
+        REMOTE_HERMES.credential = self._credential_name()
+        REMOTE_HERMES.key = self._key.GetValue().strip()
+        REMOTE_HERMES.save()
+
+
 class MainFrame(wx.Frame):
     def __init__(self, initial_cwd: str):
         super().__init__(None, title=APP_NAME, size=wx.Size(900, 760))
@@ -4625,6 +4895,12 @@ class MainFrame(wx.Frame):
             "&Silent until the response mode",
             "Turn both off: nothing appears or is spoken until the whole response is ready",
         )
+        options_menu.AppendSeparator()
+        remote_hermes_item = options_menu.Append(
+            wx.ID_ANY,
+            "Re&mote Hermes...",
+            "Drive a Hermes running on another computer instead of the one installed here",
+        )
         self._rows_item.Check(SETTINGS.live_rows)
         self._speak_item.Check(SETTINGS.speak_live)
         self._thinking_item.Check(SETTINGS.show_thinking)
@@ -4651,6 +4927,7 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, lambda _e: self._toggle_speak_live(), self._speak_item)
         self.Bind(wx.EVT_MENU, lambda _e: self._toggle_show_thinking(), self._thinking_item)
         self.Bind(wx.EVT_MENU, lambda _e: self._toggle_text_view(), self._text_view_item)
+        self.Bind(wx.EVT_MENU, lambda _e: self._configure_remote_hermes(), remote_hermes_item)
         self.Bind(
             wx.EVT_MENU,
             lambda _e: self._use_silent_until_response_mode(),
@@ -5096,6 +5373,22 @@ class MainFrame(wx.Frame):
         page = self.notebook.GetCurrentPage()
         if isinstance(page, SessionPanel):
             page.compact_conversation()
+
+    def _configure_remote_hermes(self) -> None:
+        """Point the Hermes backend at another computer, or back at this one."""
+        dlg = RemoteHermesDialog(self)
+        try:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            dlg.apply()
+        finally:
+            dlg.Destroy()
+        # A conversation already open belongs to whichever Hermes started it,
+        # so the change applies from the next new conversation rather than
+        # silently moving this one to a different machine. The cached model
+        # catalog belonged to the old address and would be wrong for the new.
+        invalidate_model_options(BACKEND_HERMES)
+        announce(f"Remote Hermes: {REMOTE_HERMES.describe()}. Applies to new conversations.")
 
     def _new_conversation_active(self) -> None:
         """Start a fresh conversation in the active tab (Ctrl+Shift+N)."""
