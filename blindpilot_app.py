@@ -81,7 +81,12 @@ from agent_backends import (
     set_freebuff_model,
     worker_class,
 )
-from hermes_backend import REMOTE_CREDENTIALS, hermes_model_options, remote_ws_url
+from hermes_backend import (
+    REMOTE_CREDENTIALS,
+    hermes_model_options,
+    remote_ws_url,
+    wsl_path_to_windows,
+)
 
 from markdown_rows import (
     Row,
@@ -5355,7 +5360,18 @@ class MainFrame(wx.Frame):
         # new conversation on the next send — so resuming switches to it.
         if normalize_backend(entry.backend) != self._backend:
             self._set_backend(entry.backend)
-        cwd = entry.cwd if entry.cwd and os.path.isdir(entry.cwd) else self._history_cwd()
+        cwd = self._history_cwd()
+        if entry.cwd:
+            candidate = entry.cwd
+            if not os.path.isdir(candidate):
+                # A Hermes in WSL records its own form of the path, which
+                # Windows cannot open. Translate it back before giving up,
+                # otherwise a resumed conversation quietly reopens in whatever
+                # folder happened to be current.
+                translated = wsl_path_to_windows(candidate)
+                candidate = translated if os.path.isdir(translated) else ""
+            if candidate:
+                cwd = candidate
         panel = self._add_session(cwd)
         panel.restore_history(entry, turns)
         # The first message names the tab, because that is what tells this

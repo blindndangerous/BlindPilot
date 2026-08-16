@@ -586,6 +586,26 @@ def test_a_windows_folder_becomes_the_path_wsl_understands():
     assert convert("") == ""
 
 
+def test_a_wsl_path_becomes_the_windows_form_again():
+    """Hermes records the directory as it saw it; reopening needs it back.
+
+    Without this a resumed conversation quietly reopened in whatever folder
+    happened to be current, because Windows cannot stat "/mnt/d/work".
+    """
+    convert = hermes_backend.wsl_path_to_windows
+
+    assert convert("/mnt/d/projekty/blindpilot") == "D:\\projekty\\blindpilot"
+    assert convert("/mnt/c/Users/someone") == "C:\\Users\\someone"
+    assert convert("/mnt/d") == "D:\\"
+    assert convert("/mnt/d/") == "D:\\"
+    # Inside the distribution's own filesystem there is no drive-letter form,
+    # so it comes back unchanged for the caller to reject.
+    assert convert("/home/ubuntu/projects") == "/home/ubuntu/projects"
+    assert convert("") == ""
+    # And a round trip has to land where it started.
+    assert convert(hermes_backend.windows_path_to_wsl(r"D:\a\b")) == "D:\\a\\b"
+
+
 def test_the_gateway_in_wsl_is_started_as_a_module_in_the_chosen_folder(monkeypatch):
     """Hermes has no CLI subcommand for this protocol - measured, not assumed.
 

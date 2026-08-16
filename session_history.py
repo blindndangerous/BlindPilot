@@ -229,6 +229,26 @@ def _same_dir(a: str, b: str) -> bool:
     return os.path.normcase(os.path.normpath(a)) == os.path.normcase(os.path.normpath(b))
 
 
+def _same_dir_across_wsl(recorded: str, wanted: str) -> bool:
+    """Whether two working directories are the same place, across WSL.
+
+    A Hermes running in WSL records ``/mnt/d/work``, while the folder picker in
+    a Windows desktop produces ``D:\\work``. They are one directory, so
+    comparing the strings hid every conversation from the folder filter -- the
+    dialog said "No past conversations found here" beside three hundred of
+    them. Both forms are normalised to the WSL one before comparing.
+    """
+    if _same_dir(recorded, wanted):
+        return True
+    from hermes_backend import windows_path_to_wsl
+
+    left = windows_path_to_wsl(recorded)
+    right = windows_path_to_wsl(wanted)
+    if not left or not right:
+        return False
+    return left.rstrip("/").lower() == right.rstrip("/").lower()
+
+
 # ----- Claude Code -----
 
 
@@ -432,10 +452,48 @@ _HERMES_HIDDEN_KIND = "hidden"
 
 
 def _hermes_db_path() -> Path:
-    """Hermes' session store. Its home honours HERMES_HOME, like Hermes does."""
+    """Hermes' session store on this side of the machine, if there is one."""
     override = os.environ.get("HERMES_HOME", "").strip()
     root = Path(override).expanduser() if override else _home() / ".hermes"
     return root / "state.db"
+
+
+def _hermes_query(sql: str, params: Sequence = ()) -> List[dict]:
+    """Run one read-only query against Hermes' store, wherever it lives.
+
+    Two routes, because Hermes keeps its store in WAL mode and that decides
+    which one works:
+
+    * a store on this machine is opened directly, read-only;
+    * a store belonging to a Hermes in WSL is read *through* WSL. It is also
+      visible to Windows under \\\\wsl.localhost, but WAL needs shared memory
+      that a network share cannot provide, so SQLite refuses with "database is
+      locked" -- measured, and the reason the dialog reported no conversations
+      at all. Asking WSL to run the query sidesteps that entirely.
+
+    Returns a list of plain dicts so the caller never holds a connection.
+    """
+    path = _hermes_db_path()
+    if path.is_file():
+        connection = _hermes_connect(path)
+        if connection is None:
+            return []
+        try:
+            return [dict(row) for row in connection.execute(sql, tuple(params)).fetchall()]
+        except Exception:  # noqa: BLE001 - an older schema is not a crash
+            return []
+        finally:
+            connection.close()
+
+    if os.environ.get("HERMES_HOME", "").strip():
+        # An explicit home names one store. If it is not there, that is the
+        # answer -- reaching into WSL would return a different Hermes' history
+        # than the one the user pointed at.
+        return []
+
+    from hermes_backend import wsl_sqlite_query
+
+    return wsl_sqlite_query(sql, params)
 
 
 def _hermes_connect(path: Path):
@@ -459,50 +517,48 @@ def _hermes_connect(path: Path):
 
 def _hermes_entries(cwd: Optional[str]) -> List[HistoryEntry]:
     path = _hermes_db_path()
-    connection = _hermes_connect(path)
-    if connection is None:
-        return []
-    modified = _mtime(path)
+    modified = _mtime(path) if path.is_file() else 0.0
+    # Hermes titles its own conversations, so unlike the other backends there is
+    # no transcript to scan for a first message. Sessions with no messages are
+    # skipped: they are starts that never went anywhere.
+    rows = _hermes_query(
+        """
+        SELECT id, title, cwd, started_at, last_activity_at, message_count
+        FROM sessions
+        WHERE COALESCE(archived, 0) = 0 AND COALESCE(message_count, 0) > 0
+        ORDER BY COALESCE(last_activity_at, started_at) DESC
+        LIMIT 500
+        """
+    )
     entries: List[HistoryEntry] = []
-    try:
-        # Hermes titles its own conversations, so unlike the other backends
-        # there is no transcript to scan for a first message. Sessions with no
-        # messages are skipped: they are starts that never went anywhere.
-        rows = connection.execute(
-            """
-            SELECT id, title, cwd, started_at, last_activity_at, message_count
-            FROM sessions
-            WHERE COALESCE(archived, 0) = 0 AND COALESCE(message_count, 0) > 0
-            ORDER BY COALESCE(last_activity_at, started_at) DESC
-            LIMIT 500
-            """
-        ).fetchall()
-    except Exception:  # noqa: BLE001 - an older schema is not a crash
-        return []
-    finally:
-        connection.close()
 
     for row in rows:
-        session_id = str(row["id"] or "")
+        session_id = str(row.get("id") or "")
         if not session_id:
             continue
-        session_cwd = str(row["cwd"] or "")
-        if cwd and not _same_dir(session_cwd, cwd):
+        session_cwd = str(row.get("cwd") or "")
+        if cwd and not _same_dir_across_wsl(session_cwd, cwd):
             continue
-        title = make_title(clean_user_text(str(row["title"] or "")))
+        title = make_title(clean_user_text(str(row.get("title") or "")))
         if not title:
             title = session_id
         # Prefer the session's own last-activity time over the file's mtime:
         # one shared store means every conversation would otherwise appear to
         # have been touched at the same moment, and the list is sorted by this.
-        stamp = row["last_activity_at"] or row["started_at"] or modified
+        stamp = row.get("last_activity_at") or row.get("started_at") or modified
+        try:
+            # A query answered through WSL arrives as JSON, where a timestamp
+            # can come back as text.
+            stamp = float(stamp)
+        except (TypeError, ValueError):
+            stamp = modified
         entries.append(
             HistoryEntry(
                 backend=BACKEND_HERMES,
                 session_id=session_id,
                 title=title,
                 path=str(path),
-                modified=float(stamp),
+                modified=stamp,
                 cwd=session_cwd,
                 folder=_folder_name(session_cwd),
             )
@@ -510,36 +566,31 @@ def _hermes_entries(cwd: Optional[str]) -> List[HistoryEntry]:
     return entries
 
 
-def _hermes_turns_for(session_id: str, path: Optional[Path] = None) -> List[HistoryTurn]:
-    """Read one Hermes conversation back as prompt-and-response turns."""
-    store = path or _hermes_db_path()
-    connection = _hermes_connect(store)
-    if connection is None:
-        return []
-    try:
-        rows = connection.execute(
-            """
-            SELECT role, content, display_kind
-            FROM messages
-            WHERE session_id = ?
-            ORDER BY id
-            LIMIT ?
-            """,
-            (session_id, _HERMES_MAX_ROWS),
-        ).fetchall()
-    except Exception:  # noqa: BLE001
-        return []
-    finally:
-        connection.close()
+def _hermes_turns_for(session_id: str) -> List[HistoryTurn]:
+    """Read one Hermes conversation back as prompt-and-response turns.
+
+    Which store is consulted is decided by :func:`_hermes_query`, so this does
+    not need to know whether Hermes runs here or in WSL.
+    """
+    rows = _hermes_query(
+        """
+        SELECT role, content, display_kind
+        FROM messages
+        WHERE session_id = ?
+        ORDER BY id
+        LIMIT ?
+        """,
+        (session_id, _HERMES_MAX_ROWS),
+    )
 
     turns: List[HistoryTurn] = []
     for row in rows:
-        role = str(row["role"] or "")
+        role = str(row.get("role") or "")
         if role in _HERMES_SKIP_ROLES:
             continue
-        if str(row["display_kind"] or "") == _HERMES_HIDDEN_KIND:
+        if str(row.get("display_kind") or "") == _HERMES_HIDDEN_KIND:
             continue
-        text = str(row["content"] or "").strip()
+        text = str(row.get("content") or "").strip()
         if not text:
             # A turn that only called tools has no text of its own; the tool
             # rows themselves are Hermes' bookkeeping, not the conversation.
@@ -556,10 +607,10 @@ def _hermes_turns_for(session_id: str, path: Optional[Path] = None) -> List[Hist
 def _hermes_turns(path: Path) -> List[HistoryTurn]:
     """Reader signature the public API uses. See :func:`load_turns`.
 
-    Hermes' entries all share one database, so the session id has to come from
-    the entry rather than the path; ``load_turns`` passes it through.
+    Hermes' entries all share one store, so the session id has to come from the
+    entry rather than the path; ``load_turns`` passes it through.
     """
-    return _hermes_turns_for("", path)
+    return _hermes_turns_for("")
 
 
 # ----- FreeBuff -----
@@ -760,7 +811,7 @@ def load_turns(entry: HistoryEntry) -> List[HistoryTurn]:
         try:
             return [
                 turn
-                for turn in _hermes_turns_for(entry.session_id, path)
+                for turn in _hermes_turns_for(entry.session_id)
                 if turn.prompt.strip() or turn.response.strip()
             ]
         except OSError:

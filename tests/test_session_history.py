@@ -27,8 +27,16 @@ from session_history import (
 
 @pytest.fixture
 def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Point every history store at a throwaway home directory."""
+    """Point every history store at a throwaway home directory.
+
+    The Hermes reader also has a second route -- a store belonging to a Hermes
+    in WSL -- which is switched off here. Without that a machine with a real
+    Hermes in WSL answers these tests with its own hundreds of conversations.
+    """
     monkeypatch.setattr(session_history, "_home", lambda: tmp_path)
+    import hermes_backend
+
+    monkeypatch.setattr(hermes_backend, "wsl_sqlite_query", lambda _sql, _params=(): [])
     return tmp_path
 
 
@@ -684,6 +692,74 @@ def test_hermes_honours_its_own_home_override(home: Path, monkeypatch) -> None:
     monkeypatch.setenv("HERMES_HOME", str(elsewhere / ".hermes"))
 
     assert [entry.title for entry in list_history("hermes")] == ["Default home"]
+
+
+def test_a_conversation_run_through_wsl_is_found_by_the_folder_filter(home: Path) -> None:
+    """Hermes in WSL records /mnt/d/work; the picker asks about D:\\work.
+
+    They are one directory, so comparing the strings hid every conversation
+    behind "No past conversations found here" -- measured on Windows against a
+    store holding three hundred of them.
+    """
+    _write_hermes(
+        home,
+        [{"id": "wsl", "title": "Through WSL", "cwd": "/mnt/d/projekty/blindpilot"}],
+        [
+            {"session_id": "wsl", "role": "user", "content": "a"},
+            {"session_id": "wsl", "role": "assistant", "content": "b"},
+        ],
+    )
+
+    # Asked with the Windows form the picker produces.
+    assert [e.title for e in list_history("hermes", r"D:\projekty\blindpilot")] == ["Through WSL"]
+    # And the WSL form still works, for a desktop running on Linux.
+    assert [e.title for e in list_history("hermes", "/mnt/d/projekty/blindpilot")] == [
+        "Through WSL"
+    ]
+    # A genuinely different folder must still be excluded.
+    assert list_history("hermes", r"D:\somewhere\else") == []
+
+
+def test_a_store_belonging_to_wsl_is_read_through_wsl(home: Path, monkeypatch) -> None:
+    """WAL over a network share answers "database is locked" - measured.
+
+    The store is visible to Windows under \\\\wsl.localhost, but Hermes keeps it
+    in WAL mode and WAL needs shared memory a share cannot provide, so opening
+    it that way lists nothing at all. The query is run inside WSL instead.
+    """
+    import hermes_backend
+
+    # No store on this side of the machine.
+    monkeypatch.setattr(session_history, "_hermes_db_path", lambda: home / "absent.db")
+    asked = []
+
+    def _fake_query(sql, params=()):
+        asked.append((sql, tuple(params)))
+        if "FROM sessions" in sql:
+            return [
+                {
+                    "id": "s1",
+                    "title": "From WSL",
+                    "cwd": "/mnt/d/work",
+                    "started_at": 1000.0,
+                    # JSON brings numbers back as text; that must not break it.
+                    "last_activity_at": "2000.0",
+                    "message_count": 2,
+                }
+            ]
+        return [
+            {"role": "user", "content": "hello", "display_kind": None},
+            {"role": "assistant", "content": "hi", "display_kind": None},
+        ]
+
+    monkeypatch.setattr(hermes_backend, "wsl_sqlite_query", _fake_query)
+
+    entries = list_history("hermes")
+
+    assert [e.title for e in entries] == ["From WSL"]
+    assert entries[0].modified == 2000.0
+    assert [(t.prompt, t.response) for t in load_turns(entries[0])] == [("hello", "hi")]
+    assert asked, "the WSL route has to be used when there is no local store"
 
 
 # ----- Titles and ages -----

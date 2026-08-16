@@ -36,7 +36,7 @@ import threading
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Optional, Protocol
+from typing import Optional, Protocol, Sequence
 
 # Hermes' launcher is a plain executable on PATH, but the gateway itself is a
 # Python module inside Hermes' own virtual environment. A GUI cannot rely on
@@ -173,6 +173,10 @@ def hermes_installed() -> bool:
 _WSL_HERMES: Optional[str] = None
 _WSL_CHECKED = False
 
+# How long a history query inside WSL may take. The dialog runs this on the GUI
+# thread, so it has to fail rather than freeze the window.
+WSL_QUERY_TIMEOUT = 20.0
+
 
 def wsl_exe() -> Optional[str]:
     """Windows' WSL launcher, or None when this is not Windows."""
@@ -216,6 +220,8 @@ def wsl_hermes_available() -> bool:
 # Cached alongside the launcher: same reasoning, same lifetime.
 _WSL_PYTHON: Optional[str] = None
 _WSL_PYTHON_CHECKED = False
+_WSL_STATE_DB: Optional[str] = None
+_WSL_STATE_DB_CHECKED = False
 
 
 def wsl_hermes_python(timeout: int = 25) -> Optional[str]:
@@ -260,6 +266,90 @@ def wsl_hermes_python(timeout: int = 25) -> Optional[str]:
     return _WSL_PYTHON
 
 
+def wsl_state_db() -> Optional[str]:
+    """Hermes' session store inside WSL, as the POSIX path WSL sees.
+
+    Both the path and Hermes' home are resolved inside WSL rather than guessed,
+    so a distribution with HERMES_HOME set still works.
+    """
+    global _WSL_STATE_DB, _WSL_STATE_DB_CHECKED
+    if _WSL_STATE_DB_CHECKED:
+        return _WSL_STATE_DB
+    _WSL_STATE_DB_CHECKED = True
+    launcher = wsl_exe()
+    if not launcher:
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                launcher,
+                "-e",
+                "sh",
+                "-lc",
+                'db="${HERMES_HOME:-$HOME/.hermes}/state.db"; [ -f "$db" ] && printf %s "$db"',
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=25,
+            **_text_output_kwargs(),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    found = (proc.stdout or "").strip()
+    _WSL_STATE_DB = found or None
+    return _WSL_STATE_DB
+
+
+def wsl_sqlite_query(sql: str, params: "Sequence" = ()) -> "list[dict]":
+    """Run one read-only query against Hermes' store from inside WSL.
+
+    The store is also reachable from Windows under \\\\wsl.localhost, but Hermes
+    keeps it in WAL mode and WAL needs shared memory that a network share
+    cannot provide: SQLite answers "database is locked" and no conversation is
+    ever listed. Running the query on WSL's side avoids the problem instead of
+    working around it.
+
+    The query and its parameters are passed as JSON on stdin rather than
+    interpolated into a shell command, so no value is ever quoted into code.
+    Rows come back as JSON, which is why the caller gets plain dicts.
+    """
+    launcher = wsl_exe()
+    store = wsl_state_db()
+    if not launcher or not store:
+        return []
+    reader = (
+        "import json,sqlite3,sys\n"
+        "req=json.load(sys.stdin)\n"
+        "db=sqlite3.connect('file:'+req['db']+'?mode=ro',uri=True,timeout=5.0)\n"
+        "db.row_factory=sqlite3.Row\n"
+        "try:\n"
+        "    rows=[dict(r) for r in db.execute(req['sql'],tuple(req['params'])).fetchall()]\n"
+        "finally:\n"
+        "    db.close()\n"
+        "json.dump(rows,sys.stdout,default=str)\n"
+    )
+    payload = json.dumps({"db": store, "sql": sql, "params": list(params)})
+    try:
+        proc = subprocess.run(
+            [launcher, "-e", "python3", "-c", reader],
+            input=payload,
+            capture_output=True,
+            timeout=WSL_QUERY_TIMEOUT,
+            **_text_output_kwargs(),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if proc.returncode != 0:
+        return []
+    try:
+        rows = json.loads(proc.stdout or "[]")
+    except ValueError:
+        return []
+    return rows if isinstance(rows, list) else []
+
+
 def windows_path_to_wsl(path: str) -> str:
     """Translate a Windows working directory into its WSL equivalent.
 
@@ -275,6 +365,24 @@ def windows_path_to_wsl(path: str) -> str:
         parts = [p for p in text[2:].replace("\\", "/").split("/") if p]
         return f"/mnt/{drive}/" + "/".join(parts) if parts else f"/mnt/{drive}"
     return text.replace("\\", "/")
+
+
+def wsl_path_to_windows(path: str) -> str:
+    """Translate a WSL path back into the Windows form, where one exists.
+
+    Hermes records the working directory as it saw it, so a conversation run
+    through WSL carries "/mnt/d/work". Reopening it in a Windows desktop needs
+    the drive-letter form back. Paths inside the distribution's own filesystem
+    have no drive-letter equivalent and are returned unchanged, for the caller
+    to reject.
+    """
+    text = str(path or "").strip().replace("\\", "/")
+    parts = [p for p in text.split("/") if p]
+    if len(parts) >= 2 and parts[0].lower() == "mnt" and len(parts[1]) == 1:
+        drive = parts[1].upper()
+        rest = "\\".join(parts[2:])
+        return f"{drive}:\\{rest}" if rest else f"{drive}:\\"
+    return str(path or "")
 
 
 def hermes_auth_ok(timeout: int = 25) -> bool:
