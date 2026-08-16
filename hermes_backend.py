@@ -34,6 +34,7 @@ import shutil
 import subprocess
 import threading
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Optional, Protocol
 
@@ -177,6 +178,88 @@ def hermes_auth_ok(timeout: int = 25) -> bool:
 # --------------------------------------------------------------------------
 # Transports
 # --------------------------------------------------------------------------
+
+
+# How long to wait for a remote handshake. Long enough for a sleepy machine on
+# a private network, short enough that a wrong address is reported rather than
+# leaving the user listening to silence.
+REMOTE_CONNECT_TIMEOUT = 20.0
+
+# Credential names Hermes' WebSocket upgrade accepts from a configured client.
+# "token" is the server's session token; "ticket" is the one-shot ticket minted
+# after a password login, which is what a server reachable from another machine
+# requires. A third name exists for processes Hermes spawns itself and is
+# deliberately not offered here.
+REMOTE_CREDENTIALS = ("token", "ticket")
+
+
+def remote_ws_url(host: str, port: int = 9119, secure: bool = False) -> str:
+    """Build the gateway URL from the parts a user actually types.
+
+    Asking for a whole ``ws://host:port/api/ws`` is asking to get the path
+    wrong, so the settings take a host and a port and the path is added here.
+    """
+    host = host.strip()
+    # Tolerate someone pasting a full URL anyway.
+    for prefix in ("ws://", "wss://", "http://", "https://"):
+        if host.lower().startswith(prefix):
+            secure = prefix in ("wss://", "https://")
+            host = host[len(prefix) :]
+            break
+    host = host.rstrip("/")
+    if host.endswith("/api/ws"):
+        host = host[: -len("/api/ws")].rstrip("/")
+    if ":" in host and not host.startswith("["):
+        host, _, given_port = host.rpartition(":")
+        if given_port.isdigit():
+            port = int(given_port)
+    scheme = "wss" if secure else "ws"
+    return f"{scheme}://{host}:{port}/api/ws"
+
+
+def _authenticated_ws_url(url: str, token: str, credential: str) -> str:
+    """Put the credential in the query string, where the upgrade looks for it."""
+    if not token:
+        return url
+    name = credential if credential in REMOTE_CREDENTIALS else "token"
+    separator = "&" if "?" in url else "?"
+    return f"{url}{separator}{name}={urllib.parse.quote(token, safe='')}"
+
+
+def _redacted_ws_url(url: str) -> str:
+    """The address without any credential, safe to show or speak."""
+    return url.split("?", 1)[0]
+
+
+def _remote_failure_message(url: str, exc: Exception) -> str:
+    """Say what to do about a failed connection, not just that it failed.
+
+    A blind user cannot glance at a log, so the message has to carry the
+    diagnosis: refused means nothing is listening, a rejected handshake means
+    the key is wrong, a timeout means the machine is not answering.
+    """
+    detail = str(exc).strip() or exc.__class__.__name__
+    lowered = detail.lower()
+    if "403" in detail or "401" in detail or "handshake" in lowered:
+        return (
+            f"Hermes at {url} refused the connection key. Check the key in "
+            "Remote Hermes settings, then try again."
+        )
+    if "refused" in lowered:
+        return (
+            f"Nothing is listening at {url}. Start Hermes there with "
+            "'hermes serve', then try again."
+        )
+    if "name or service not known" in lowered or "getaddrinfo" in lowered:
+        return f"The address {url} could not be found. Check the host name."
+    if "timed out" in lowered or "timeout" in lowered:
+        # A closed port on a reachable machine also reports a timeout rather
+        # than a refusal, so name both causes instead of guessing one.
+        return (
+            f"{url} did not answer. Check that Hermes is running there with "
+            "'hermes serve', and that the machine is awake and reachable."
+        )
+    return f"Could not reach Hermes at {url}: {detail}"
 
 
 class Transport(Protocol):
@@ -333,11 +416,21 @@ class WebSocketTransport:
     home server, or a WSL instance reached over a private network — so the
     desktop can drive it without a terminal. The protocol is the same as the
     local path; only the pipe changes.
+
+    Authentication is a query parameter, not a header. Hermes' HTTP routes do
+    accept ``X-Hermes-Session-Token``, but the WebSocket upgrade reads its
+    credential from the URL and refuses the handshake without one - a header
+    alone is answered with 403. Two credential names are meant for a client a
+    person configures: ``token`` for the server's session token, and
+    ``ticket`` for the one-shot ticket minted after a password login on a
+    server reachable from outside this machine.
     """
 
-    def __init__(self, url: str, token: str = "") -> None:
-        self._url = url
-        self._token = token
+    def __init__(self, url: str, token: str = "", credential: str = "token") -> None:
+        self._url = _authenticated_ws_url(url, token, credential)
+        # Kept credential-free for anything shown to the user: a token spoken
+        # aloud by a screen reader is a token read out to the room.
+        self._display_url = _redacted_ws_url(url)
         self._ws = None
         self._error = ""
 
@@ -349,14 +442,11 @@ class WebSocketTransport:
             raise OSError(
                 "Remote Hermes needs the websocket-client package: pip install websocket-client"
             ) from exc
-        headers = []
-        if self._token:
-            headers.append(f"X-Hermes-Session-Token: {self._token}")
         try:
-            self._ws = create_connection(self._url, header=headers, timeout=20)
+            self._ws = create_connection(self._url, timeout=REMOTE_CONNECT_TIMEOUT)
         except Exception as exc:  # noqa: BLE001 - any failure is "cannot reach it"
             self._error = str(exc)
-            raise OSError(f"Could not reach Hermes at {self._url}: {exc}") from exc
+            raise OSError(_remote_failure_message(self._display_url, exc)) from exc
 
     def send(self, message: dict) -> bool:
         if self._ws is None:

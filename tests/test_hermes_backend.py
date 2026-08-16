@@ -556,14 +556,103 @@ def test_a_missing_hermes_is_reported_rather_than_crashing(monkeypatch):
 # -- remote mode ----------------------------------------------------------
 
 
+def test_the_gateway_url_is_built_from_a_host_the_user_types():
+    """Asking for a full ws:// URL with the right path invites getting it wrong."""
+    assert hermes_backend.remote_ws_url("garfield") == "ws://garfield:9119/api/ws"
+    assert hermes_backend.remote_ws_url("100.64.0.5", 9223) == "ws://100.64.0.5:9223/api/ws"
+    # A port typed into the host field wins over the separate field.
+    assert hermes_backend.remote_ws_url("garfield:9300", 9119) == "ws://garfield:9300/api/ws"
+    # And a pasted URL is tolerated rather than mangled.
+    assert hermes_backend.remote_ws_url("ws://box:9119/api/ws") == "ws://box:9119/api/ws"
+    assert hermes_backend.remote_ws_url("https://box") == "wss://box:9119/api/ws"
+
+
+def test_the_credential_travels_in_the_query_string_not_a_header():
+    """Hermes' WebSocket upgrade reads its credential from the URL.
+
+    A header alone is answered with 403, which was the first version's bug.
+    """
+    url = hermes_backend._authenticated_ws_url("ws://box:9119/api/ws", "s3cret", "token")
+    assert url == "ws://box:9119/api/ws?token=s3cret"
+
+    # A server reachable from outside this machine wants a minted ticket.
+    ticket = hermes_backend._authenticated_ws_url("ws://box:9119/api/ws", "abc", "ticket")
+    assert ticket == "ws://box:9119/api/ws?ticket=abc"
+
+    # An unknown credential name falls back rather than sending nonsense.
+    odd = hermes_backend._authenticated_ws_url("ws://box:9119/api/ws", "abc", "nonsense")
+    assert odd == "ws://box:9119/api/ws?token=abc"
+
+    # A credential with URL-significant characters must survive intact.
+    quoted = hermes_backend._authenticated_ws_url("ws://box/api/ws", "a b&c=d", "token")
+    assert "a%20b%26c%3Dd" in quoted
+
+
+def test_no_credential_means_no_query_string():
+    assert hermes_backend._authenticated_ws_url("ws://box/api/ws", "", "token") == (
+        "ws://box/api/ws"
+    )
+
+
+def test_the_address_shown_to_the_user_never_carries_the_key():
+    """A token read aloud by a screen reader is a token read out to the room."""
+    assert hermes_backend._redacted_ws_url("ws://box/api/ws?token=s3cret") == "ws://box/api/ws"
+
+
+def test_connection_failures_say_what_to_do_about_them():
+    """ "Could not connect" is useless to someone who cannot glance at a log."""
+    url = "ws://box:9119/api/ws"
+
+    rejected = hermes_backend._remote_failure_message(url, OSError("Handshake status 403"))
+    assert "key" in rejected.lower()
+
+    refused = hermes_backend._remote_failure_message(url, OSError("[Errno 111] Connection refused"))
+    assert "hermes serve" in refused
+
+    timeout = hermes_backend._remote_failure_message(url, OSError("timed out"))
+    assert "hermes serve" in timeout and "reachable" in timeout
+
+    unknown = hermes_backend._remote_failure_message(url, OSError("getaddrinfo failed"))
+    assert "host name" in unknown
+
+    # Every message names the address, and none of them leaks a credential.
+    for message in (rejected, refused, timeout, unknown):
+        assert url in message
+
+
+def test_a_missing_websocket_library_is_reported_as_a_fixable_thing(monkeypatch):
+    """The local backend needs no such library, so this must not be fatal.
+
+    It is an optional dependency; the message has to name the package.
+    """
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _no_websocket(name, *args, **kwargs):
+        if name == "websocket":
+            raise ImportError("no module named websocket")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _no_websocket)
+    transport = hermes_backend.WebSocketTransport("ws://box/api/ws", "t")
+    try:
+        transport.start()
+    except OSError as exc:
+        assert "websocket-client" in str(exc)
+    else:  # pragma: no cover - the import must fail here
+        raise AssertionError("expected the missing library to be reported")
+
+
 def test_a_remote_url_selects_the_network_transport(monkeypatch):
     """The remote path is the whole point of using this protocol."""
     created = {}
 
     class _Fake:
-        def __init__(self, url, token=""):
+        def __init__(self, url, token="", credential="token"):
             created["url"] = url
             created["token"] = token
+            created["credential"] = credential
 
         def start(self):
             return None
@@ -581,14 +670,18 @@ def test_a_remote_url_selects_the_network_transport(monkeypatch):
     )
 
     assert worker._open_transport() is True
-    assert created == {"url": "ws://192.168.1.10:9119/api/ws", "token": "secret"}
+    assert created == {
+        "url": "ws://192.168.1.10:9119/api/ws",
+        "token": "secret",
+        "credential": "token",
+    }
 
 
 def test_an_unreachable_remote_hermes_says_where_it_tried(monkeypatch):
     """ "Could not connect" without an address is useless to a blind user."""
 
     class _Fake:
-        def __init__(self, url, token=""):
+        def __init__(self, url, token="", credential="token"):
             self._url = url
 
         def start(self):

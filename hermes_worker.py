@@ -159,6 +159,7 @@ class HermesWorker(threading.Thread):
         compact: bool = False,
         remote_url: str = "",
         remote_token: str = "",
+        remote_credential: str = "token",
         on_session: Callable[[str], None],
         on_started: Callable[[], None],
         on_activity: Callable[[str, str], None],
@@ -179,6 +180,9 @@ class HermesWorker(threading.Thread):
         self._compact = compact
         self._remote_url = remote_url
         self._remote_token = remote_token
+        # Which credential name the remote server expects: its session token,
+        # or a ticket minted after a password login.
+        self._remote_credential = remote_credential
         self._on_session = on_session
         self._on_started = on_started
         self._on_activity = on_activity
@@ -267,7 +271,9 @@ class HermesWorker(threading.Thread):
     def _open_transport(self) -> bool:
         """Connect, local or remote. Reports its own failure and returns False."""
         if self._remote_url:
-            transport = WebSocketTransport(self._remote_url, self._remote_token)
+            transport = WebSocketTransport(
+                self._remote_url, self._remote_token, self._remote_credential
+            )
         else:
             if not hermes_installed():
                 self._on_failed(
