@@ -58,6 +58,18 @@ def _no_window_kwargs() -> dict:
     return {}
 
 
+def _text_output_kwargs() -> dict:
+    """Decode a child's output as UTF-8, whatever the console code page is.
+
+    Windows defaults to the legacy ANSI code page here, which raises
+    UnicodeDecodeError the moment a child prints a byte outside it -- Hermes'
+    own banner is enough to trigger it. Everything read from Hermes is UTF-8,
+    so that is what gets asked for, and undecodable bytes are replaced rather
+    than allowed to abort a check.
+    """
+    return {"text": True, "encoding": "utf-8", "errors": "replace"}
+
+
 # --------------------------------------------------------------------------
 # Locating Hermes
 # --------------------------------------------------------------------------
@@ -137,7 +149,132 @@ def hermes_installed() -> bool:
     The launcher alone is not enough: the gateway is a module in Hermes' venv,
     so a copy with a launcher but no importable source cannot run a session.
     """
-    return hermes_python() is not None
+    return hermes_python() is not None or wsl_hermes_available()
+
+
+# --------------------------------------------------------------------------
+# Hermes inside WSL
+#
+# A very common arrangement on Windows: the desktop is a Windows program, but
+# Hermes lives in a WSL distribution, where it was installed with the same
+# one-line installer as on Linux. Nothing in Windows' PATH points at it, so
+# without this it looks like Hermes is not installed at all -- which is what a
+# Windows machine with a perfectly good Hermes reported before this existed.
+#
+# The gateway speaks over stdin and stdout, and "wsl.exe -e" connects those
+# straight through, so the same protocol works with no translation. Paths are
+# the one thing that does not carry across, which is why the working directory
+# is converted below rather than passed as-is.
+# --------------------------------------------------------------------------
+
+
+# Cached because every backend check would otherwise start a WSL process, and
+# the answer cannot change while the app is running.
+_WSL_HERMES: Optional[str] = None
+_WSL_CHECKED = False
+
+
+def wsl_exe() -> Optional[str]:
+    """Windows' WSL launcher, or None when this is not Windows."""
+    if platform.system() != "Windows":
+        return None
+    return shutil.which("wsl.exe") or shutil.which("wsl")
+
+
+def wsl_hermes_path(timeout: int = 20) -> Optional[str]:
+    """Hermes' path inside WSL, or None when there is no Hermes there."""
+    global _WSL_HERMES, _WSL_CHECKED
+    if _WSL_CHECKED:
+        return _WSL_HERMES
+    _WSL_CHECKED = True
+    launcher = wsl_exe()
+    if not launcher:
+        return None
+    try:
+        proc = subprocess.run(
+            [launcher, "-e", "sh", "-lc", "command -v hermes"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=timeout,
+            **_text_output_kwargs(),
+            **_no_window_kwargs(),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    path = (proc.stdout or "").strip().splitlines()
+    _WSL_HERMES = path[0].strip() if path and path[0].strip() else None
+    return _WSL_HERMES
+
+
+def wsl_hermes_available() -> bool:
+    """Whether a Hermes in WSL can be driven from this Windows desktop."""
+    return wsl_hermes_python() is not None
+
+
+# Cached alongside the launcher: same reasoning, same lifetime.
+_WSL_PYTHON: Optional[str] = None
+_WSL_PYTHON_CHECKED = False
+
+
+def wsl_hermes_python(timeout: int = 25) -> Optional[str]:
+    """The interpreter inside WSL that can import Hermes' gateway.
+
+    Hermes' launcher has no subcommand for this protocol, so the gateway has to
+    be started as a module -- which means finding the interpreter of the venv
+    Hermes installed itself into. Its home is resolved inside WSL rather than
+    guessed from Windows, so a distribution with HERMES_HOME set, or a home
+    directory that is not /home/<user>, still works.
+    """
+    global _WSL_PYTHON, _WSL_PYTHON_CHECKED
+    if _WSL_PYTHON_CHECKED:
+        return _WSL_PYTHON
+    _WSL_PYTHON_CHECKED = True
+    launcher = wsl_exe()
+    if not launcher:
+        return None
+    # Printed by WSL's own shell, so ${HERMES_HOME:-$HOME/.hermes} is expanded
+    # there and the answer is a path that exists on that side.
+    probe = (
+        'root="${HERMES_HOME:-$HOME/.hermes}/' + HERMES_SOURCE_DIRNAME + '"; '
+        'for p in "$root/venv/bin/python3" "$root/venv/bin/python"; do '
+        'if [ -x "$p" ] && [ -d "$root/' + HERMES_GATEWAY_MODULE.split(".")[0] + '" ]; '
+        'then printf %s "$p"; exit 0; fi; done; exit 1'
+    )
+    try:
+        proc = subprocess.run(
+            [launcher, "-e", "sh", "-lc", probe],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=timeout,
+            **_text_output_kwargs(),
+            **_no_window_kwargs(),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    found = (proc.stdout or "").strip()
+    _WSL_PYTHON = found or None
+    return _WSL_PYTHON
+
+
+def windows_path_to_wsl(path: str) -> str:
+    """Translate a Windows working directory into its WSL equivalent.
+
+    Only the drive-letter form is translated, since that is what the folder
+    picker produces. Anything already in POSIX form, or a network path with no
+    WSL equivalent, is passed through for WSL itself to interpret.
+    """
+    text = str(path or "").strip()
+    if len(text) >= 2 and text[1] == ":" and text[0].isalpha():
+        drive = text[0].lower()
+        # Collapse repeated separators: "D:\\projekty\\\\x" and a trailing slash
+        # both otherwise produce a path with empty components in it.
+        parts = [p for p in text[2:].replace("\\", "/").split("/") if p]
+        return f"/mnt/{drive}/" + "/".join(parts) if parts else f"/mnt/{drive}"
+    return text.replace("\\", "/")
 
 
 def hermes_auth_ok(timeout: int = 25) -> bool:
@@ -151,14 +288,20 @@ def hermes_auth_ok(timeout: int = 25) -> bool:
     """
     binary = find_hermes_cli()
     if not binary:
-        return False
+        wsl_path = wsl_hermes_path()
+        launcher = wsl_exe()
+        if not wsl_path or not launcher:
+            return False
+        command = [launcher, "-e", wsl_path, "status"]
+    else:
+        command = [binary, "status"]
     try:
         proc = subprocess.run(
-            [binary, "status"],
+            command,
             stdin=subprocess.DEVNULL,
             capture_output=True,
-            text=True,
             timeout=timeout,
+            **_text_output_kwargs(),
             **_no_window_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -306,19 +449,46 @@ class StdioTransport:
         """Launch the gateway. Raises ``OSError`` if it cannot be started."""
         python = hermes_python()
         root = hermes_source_root()
-        if not python or root is None:
-            raise OSError("Hermes Agent is installed but its Python environment is missing")
         env = os.environ.copy()
-        # The gateway imports itself from the source tree, and Hermes' own
-        # launcher clears these two before exec'ing, so mirror that: a stale
-        # PYTHONHOME from the host application would break the child.
-        env.pop("PYTHONHOME", None)
-        existing = env.get("PYTHONPATH", "").strip()
-        env["PYTHONPATH"] = f"{root}{os.pathsep}{existing}" if existing else str(root)
-        env["HERMES_PYTHON_SRC_ROOT"] = str(root)
+        if python and root is not None:
+            # Hermes on this side of the machine: run its own interpreter.
+            #
+            # The gateway imports itself from the source tree, and Hermes' own
+            # launcher clears these two before exec'ing, so mirror that: a
+            # stale PYTHONHOME from the host application would break the child.
+            env.pop("PYTHONHOME", None)
+            existing = env.get("PYTHONPATH", "").strip()
+            env["PYTHONPATH"] = f"{root}{os.pathsep}{existing}" if existing else str(root)
+            env["HERMES_PYTHON_SRC_ROOT"] = str(root)
+            command = [python, "-m", HERMES_GATEWAY_MODULE]
+            cwd = self._cwd
+        else:
+            # Hermes inside WSL, driven from a Windows desktop. Its interpreter
+            # is invisible to Windows, so the gateway is started with WSL's own
+            # launcher instead. The module is asked for rather than a
+            # subcommand, because Hermes has no CLI subcommand for this
+            # protocol -- checked, rather than assumed.
+            #
+            # The working directory is translated and handed to WSL, not to
+            # Popen, which only understands Windows paths.
+            wsl_python = wsl_hermes_python()
+            launcher = wsl_exe()
+            if not wsl_python or not launcher:
+                raise OSError("Hermes Agent is installed but its Python environment is missing")
+            command = [
+                launcher,
+                "--cd",
+                windows_path_to_wsl(self._cwd),
+                "-e",
+                wsl_python,
+                "-m",
+                HERMES_GATEWAY_MODULE,
+            ]
+            # Popen's cwd is a Windows path; WSL was already told where to run.
+            cwd = None
         self._proc = subprocess.Popen(
-            [python, "-m", HERMES_GATEWAY_MODULE],
-            cwd=self._cwd,
+            command,
+            cwd=cwd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

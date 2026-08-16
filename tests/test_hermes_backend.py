@@ -10,7 +10,9 @@ successful while losing something a screen-reader user needs.
 from __future__ import annotations
 
 import json
+import subprocess
 import threading
+from pathlib import Path
 
 import agent_backends
 import hermes_backend
@@ -36,6 +38,29 @@ def _callbacks() -> dict:
         "on_failed": lambda _value: None,
         "on_done": lambda: None,
     }
+
+
+def _completed(stdout: str, returncode: int = 0) -> subprocess.CompletedProcess:
+    """A finished child process with the given output."""
+    return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
+
+
+def _reset_wsl_cache(monkeypatch) -> None:
+    """Clear the once-per-run WSL probe so a test can drive it itself."""
+    monkeypatch.setattr(hermes_backend, "_WSL_HERMES", None, raising=False)
+    monkeypatch.setattr(hermes_backend, "_WSL_CHECKED", False, raising=False)
+    monkeypatch.setattr(hermes_backend, "_WSL_PYTHON", None, raising=False)
+    monkeypatch.setattr(hermes_backend, "_WSL_PYTHON_CHECKED", False, raising=False)
+
+
+class _NullThread:
+    """Stands in for the reader threads a transport starts."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def start(self):
+        return None
 
 
 def _worker(**overrides) -> HermesWorker:
@@ -460,6 +485,196 @@ def test_a_session_error_is_surfaced_with_hermes_own_message():
     assert failed == ["session not found"]
 
 
+# -- Hermes inside WSL ----------------------------------------------------
+#
+# A Windows desktop with Hermes installed in WSL. Every one of these covers a
+# fault found by running on Windows, not by reading the code.
+
+
+def test_a_windows_desktop_finds_hermes_installed_in_wsl(monkeypatch):
+    """Nothing in Windows' PATH points at a Hermes living in WSL.
+
+    Before this, a Windows machine with a perfectly good Hermes reported that
+    Hermes was not installed.
+    """
+    monkeypatch.setattr(hermes_backend.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(hermes_backend.shutil, "which", lambda name: r"C:\Windows\wsl.exe")
+    monkeypatch.setattr(hermes_backend, "hermes_python", lambda: None)
+    _reset_wsl_cache(monkeypatch)
+
+    calls = []
+
+    def _fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return _completed("/home/u/.hermes/hermes-agent/venv/bin/python3")
+
+    monkeypatch.setattr(hermes_backend.subprocess, "run", _fake_run)
+
+    assert hermes_backend.wsl_hermes_python() == "/home/u/.hermes/hermes-agent/venv/bin/python3"
+    assert hermes_backend.hermes_installed() is True
+    # The probe runs inside WSL, so its home is expanded there rather than
+    # guessed from Windows.
+    probe = " ".join(calls[0][0])
+    assert "HERMES_HOME" in probe and "wsl.exe" in probe
+
+
+def test_the_wsl_probe_is_only_run_once(monkeypatch):
+    """Every backend check would otherwise start a WSL process."""
+    monkeypatch.setattr(hermes_backend.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(hermes_backend.shutil, "which", lambda name: r"C:\Windows\wsl.exe")
+    _reset_wsl_cache(monkeypatch)
+    runs = []
+
+    def _fake_run(command, **kwargs):
+        runs.append(command)
+        return _completed("/opt/hermes/venv/bin/python3")
+
+    monkeypatch.setattr(hermes_backend.subprocess, "run", _fake_run)
+
+    hermes_backend.wsl_hermes_python()
+    hermes_backend.wsl_hermes_python()
+    hermes_backend.wsl_hermes_available()
+
+    assert len(runs) == 1
+
+
+def test_hermes_output_is_read_as_utf8_whatever_the_code_page(monkeypatch):
+    """Windows decodes a child's output with the legacy code page by default.
+
+    Hermes' own banner contains bytes outside it, so the check died with
+    UnicodeDecodeError and reported an unconfigured Hermes.
+    """
+    kwargs = hermes_backend._text_output_kwargs()
+
+    assert kwargs["encoding"] == "utf-8"
+    assert kwargs["errors"] == "replace"
+
+    # And every probe has to use it, or the crash comes back in one of them.
+    monkeypatch.setattr(hermes_backend.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(hermes_backend.shutil, "which", lambda name: r"C:\Windows\wsl.exe")
+    monkeypatch.setattr(hermes_backend, "find_hermes_cli", lambda: None)
+    _reset_wsl_cache(monkeypatch)
+    seen = []
+
+    def _fake_run(command, **kw):
+        seen.append(kw)
+        return _completed("/opt/hermes/venv/bin/python3\nModel: some-model\n")
+
+    monkeypatch.setattr(hermes_backend.subprocess, "run", _fake_run)
+    hermes_backend.wsl_hermes_python()
+    hermes_backend.hermes_auth_ok()
+
+    assert seen, "expected the probes to run"
+    for kw in seen:
+        assert kw.get("encoding") == "utf-8", kw
+
+
+def test_a_windows_folder_becomes_the_path_wsl_understands():
+    """The folder picker hands over a Windows path; Hermes needs a WSL one."""
+    convert = hermes_backend.windows_path_to_wsl
+
+    assert convert(r"D:\projekty\blindpilot") == "/mnt/d/projekty/blindpilot"
+    assert convert(r"C:\Users\someone") == "/mnt/c/Users/someone"
+    # A drive on its own is still a directory.
+    assert convert("D:") == "/mnt/d"
+    # Repeated and trailing separators must not leave empty components: the
+    # first version produced "/mnt/d/projekty//blindpilot".
+    assert convert("D:\\projekty\\\\blindpilot\\") == "/mnt/d/projekty/blindpilot"
+    assert "//" not in convert("D:\\\\a\\\\\\\\b\\\\")
+    # Anything already POSIX is left alone.
+    assert convert("/home/ubuntu") == "/home/ubuntu"
+    assert convert("") == ""
+
+
+def test_the_gateway_in_wsl_is_started_as_a_module_in_the_chosen_folder(monkeypatch):
+    """Hermes has no CLI subcommand for this protocol - measured, not assumed.
+
+    The working directory goes to WSL rather than to Popen, which only
+    understands Windows paths.
+    """
+    monkeypatch.setattr(hermes_backend.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(hermes_backend.shutil, "which", lambda name: r"C:\Windows\wsl.exe")
+    monkeypatch.setattr(hermes_backend, "hermes_python", lambda: None)
+    monkeypatch.setattr(hermes_backend, "hermes_source_root", lambda: None)
+    monkeypatch.setattr(hermes_backend, "wsl_hermes_python", lambda: "/opt/h/venv/bin/python3")
+    started = {}
+
+    class _FakeProc:
+        stdout = None
+        stderr = None
+        stdin = None
+
+        def poll(self):
+            return None
+
+    def _fake_popen(command, **kwargs):
+        started["command"] = command
+        started["cwd"] = kwargs.get("cwd")
+        return _FakeProc()
+
+    monkeypatch.setattr(hermes_backend.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(hermes_backend.threading, "Thread", _NullThread)
+
+    transport = hermes_backend.StdioTransport(r"D:\work\project")
+    transport.start()
+
+    command = started["command"]
+    assert command[0].endswith("wsl.exe")
+    assert "--cd" in command
+    assert command[command.index("--cd") + 1] == "/mnt/d/work/project"
+    assert command[-2:] == ["-m", hermes_backend.HERMES_GATEWAY_MODULE]
+    # Popen must not be handed the Windows path as a working directory.
+    assert started["cwd"] is None
+
+
+def test_a_local_hermes_is_preferred_over_one_in_wsl(monkeypatch):
+    """Where Hermes is installed on Windows itself, that is the one to run."""
+    monkeypatch.setattr(
+        hermes_backend, "hermes_python", lambda: r"C:\hermes\venv\Scripts\python.exe"
+    )
+    monkeypatch.setattr(hermes_backend, "hermes_source_root", lambda: Path(r"C:\hermes"))
+
+    def _must_not_run():  # pragma: no cover - asserts it is not consulted
+        raise AssertionError("WSL must not be probed when Hermes is local")
+
+    monkeypatch.setattr(hermes_backend, "wsl_hermes_python", _must_not_run)
+    started = {}
+
+    class _FakeProc:
+        stdout = None
+        stderr = None
+        stdin = None
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(
+        hermes_backend.subprocess,
+        "Popen",
+        lambda command, **kwargs: (
+            started.update(command=command, cwd=kwargs.get("cwd")),
+            _FakeProc(),
+        )[1],
+    )
+    monkeypatch.setattr(hermes_backend.threading, "Thread", _NullThread)
+
+    transport = hermes_backend.StdioTransport(r"D:\work")
+    transport.start()
+
+    assert started["command"][0].endswith("python.exe")
+    assert started["cwd"] == r"D:\work"
+
+
+def test_wsl_is_not_consulted_on_other_systems(monkeypatch):
+    """A Linux or macOS machine has no wsl.exe and must not look for one."""
+    monkeypatch.setattr(hermes_backend.platform, "system", lambda: "Linux")
+    _reset_wsl_cache(monkeypatch)
+
+    assert hermes_backend.wsl_exe() is None
+    assert hermes_backend.wsl_hermes_python() is None
+    assert hermes_backend.wsl_hermes_available() is False
+
+
 # -- discovery ------------------------------------------------------------
 
 
@@ -511,8 +726,13 @@ def test_the_picker_reports_a_missing_hermes_instead_of_waiting(monkeypatch):
 
 
 def test_hermes_is_only_usable_when_its_python_environment_is_present(monkeypatch):
-    """A launcher alone cannot run the gateway, which is a module in the venv."""
+    """A launcher alone cannot run the gateway, which is a module in the venv.
+
+    On Windows there is a second place to look -- a Hermes inside WSL -- so
+    both have to come up empty for Hermes to count as unusable.
+    """
     monkeypatch.setattr(hermes_backend, "hermes_python", lambda: None)
+    monkeypatch.setattr(hermes_backend, "wsl_hermes_available", lambda: False)
     assert hermes_backend.hermes_installed() is False
     monkeypatch.setattr(hermes_backend, "hermes_python", lambda: "/somewhere/python")
     assert hermes_backend.hermes_installed() is True
