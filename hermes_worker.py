@@ -35,6 +35,20 @@ _READ_TIMEOUT = 0.5
 # dropped network link, which the local pipe never has.
 _IDLE_LIMIT = 900.0
 
+# How often a turn that has gone quiet says so. A long turn is normal work --
+# a build, a test run, a model thinking, a rate limit being waited out -- but
+# from the outside it is indistinguishable from a hang, and a listener cannot
+# glance at a screen to check. So the wait is narrated rather than left silent:
+# the turn says how long it has been working and, when it knows, what it is
+# waiting for.
+_PROGRESS_NOTICE_SECONDS = 60.0
+
+# How often the connection itself is checked while a turn waits. A held
+# connection can die between frames (a server restart, a laptop lid, a network
+# drop), and without this the turn would sit out the whole idle limit before
+# saying anything -- fifteen minutes of silence that looks exactly like work.
+_CONNECTION_CHECK_SECONDS = 15.0
+
 # Hermes advertises its permission surface as slash commands and config rather
 # than per-turn flags, so BlindPilot's picker maps onto the closest Hermes
 # behaviour: whether this session may act without asking.
@@ -386,6 +400,10 @@ class HermesWorker(threading.Thread):
         # Hermes reports a tool's name at start and again at completion; the
         # name is kept so a result row can say which tool produced it.
         self._tool_names: dict[str, str] = {}
+        # The last step Hermes reported, so a turn that goes quiet can say what
+        # it is quiet ON. "Still working on terminal" tells a listener the run
+        # is alive and where it is; "still working" only tells them the first.
+        self._last_step = ""
 
     # -- public surface the window drives ---------------------------------
 
@@ -754,8 +772,19 @@ class HermesWorker(threading.Thread):
         self._on_complete("Conversation compacted.")
 
     def _consume_turn(self) -> None:
-        """Read events until the answer is complete, failed, or interrupted."""
+        """Read events until the answer is complete, failed, or interrupted.
+
+        A quiet stretch is narrated rather than sat out. Hermes can spend
+        minutes on a single step -- a build, a test run, a rate limit being
+        waited out -- and the connection can also die between frames. Both look
+        identical from here: no frames. So the wait is timed, said out loud
+        while it lasts, and the connection is checked as it goes, which is what
+        turns "did anything happen?" into an answer the listener is given
+        without having to ask.
+        """
         idle = 0.0
+        next_notice = _PROGRESS_NOTICE_SECONDS
+        next_check = _CONNECTION_CHECK_SECONDS
         while not self._cancelled:
             transport = self._transport
             if transport is None:
@@ -763,13 +792,40 @@ class HermesWorker(threading.Thread):
             frame = transport.receive(_READ_TIMEOUT)
             if frame is None:
                 idle += _READ_TIMEOUT
+                if idle >= next_check:
+                    next_check = idle + _CONNECTION_CHECK_SECONDS
+                    # A connection that has gone away is reported now, with the
+                    # reason, instead of after the full idle limit.
+                    if not transport.connected():
+                        self._on_failed(transport.failure_detail())
+                        return
+                if idle >= next_notice:
+                    next_notice = idle + _PROGRESS_NOTICE_SECONDS
+                    self._announce_still_working(idle)
                 if idle >= _IDLE_LIMIT:
                     self._on_failed(transport.failure_detail())
                     return
                 continue
             idle = 0.0
+            next_notice = _PROGRESS_NOTICE_SECONDS
+            next_check = _CONNECTION_CHECK_SECONDS
             if self._handle_event(frame) is True:
                 return
+
+    def _announce_still_working(self, waited: float) -> None:
+        """Say that the turn is still going, and what it was last doing.
+
+        Named after what it answers: the listener's question is not "how many
+        seconds" but "is this still alive". The last step Hermes reported is
+        included when there is one, because "still working on terminal" is worth
+        far more than "still working".
+        """
+        minutes = int(waited // 60)
+        how_long = f"{minutes} minute{'' if minutes == 1 else 's'}" if minutes else "under a minute"
+        if self._last_step:
+            self._on_activity("tool", f"Still working, {how_long} on {self._last_step}")
+        else:
+            self._on_activity("tool", f"Still working, {how_long} so far")
 
     # -- events into accessible rows --------------------------------------
 
@@ -816,6 +872,21 @@ class HermesWorker(threading.Thread):
             text = str(payload.get("text") or "").strip()
             if text:
                 self._reasoning = text
+            return None
+
+        if event == "status.update":
+            # Hermes' own account of what it is doing between answers: which
+            # process it started, that it is summarising the conversation to
+            # free up context, and so on. Ignoring it is what left a long turn
+            # with nothing to say for itself, so it becomes a row like any other
+            # step -- and it is remembered, so a turn that then goes quiet can
+            # say what it went quiet on.
+            text = _first_text(payload.get("text"), payload.get("kind"))
+            if text:
+                kind = str(payload.get("kind") or "")
+                label = "Summarising the conversation" if kind == "compacting" else text
+                self._last_step = label
+                self._on_activity("tool", label)
             return None
 
         if event == "tool.start":
@@ -882,6 +953,9 @@ class HermesWorker(threading.Thread):
         tool_id = str(payload.get("tool_id") or "")
         if tool_id:
             self._tool_names[tool_id] = name
+        # Remembered for the progress notice: a long wait is nearly always a
+        # long-running tool, and naming it is what makes the notice useful.
+        self._last_step = name
         context = _first_text(payload.get("context"), payload.get("args_text"))
         self._on_activity("tool", f"{name}: {context}" if context else name)
 

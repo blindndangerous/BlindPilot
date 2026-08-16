@@ -437,6 +437,21 @@ def hermes_auth_ok(timeout: int = 25) -> bool:
 # leaving the user listening to silence.
 REMOTE_CONNECT_TIMEOUT = 20.0
 
+# Read timeouts that mean "nothing arrived yet", not "the connection is gone".
+# The websocket library raises its own timeout type, and the socket underneath
+# raises the built-in one; a client that cannot tell either from a real failure
+# hangs up on a connection that is still healthy. Named as a tuple so the
+# reading loop states the distinction once, where it is easy to check.
+_WS_TIMEOUT_ERRORS: tuple = (TimeoutError,)
+try:  # pragma: no cover - depends on the optional remote dependency
+    from websocket import WebSocketTimeoutException as _WSTimeout  # type: ignore
+
+    _WS_TIMEOUT_ERRORS = (_WSTimeout, TimeoutError)
+except ImportError:
+    # The local (stdio) path does not need websocket-client at all, so its
+    # absence must not stop the application starting.
+    pass
+
 # Credential names Hermes' WebSocket upgrade accepts from a configured client.
 # "token" is the server's session token; "ticket" is the one-shot ticket minted
 # after a password login, which is what a server reachable from another machine
@@ -870,6 +885,17 @@ class WebSocketTransport:
         Reading continuously is what answers the server's keepalive pings, so
         this is not merely a convenience: without it a connection held between
         turns is closed by the server after about half a minute.
+
+        A read that times out is NOT the end of the connection, and telling the
+        two apart is what keeps a long turn alive. The socket carries the
+        connect timeout into every later operation, so a quiet stretch longer
+        than that -- a build, a test run, a model thinking, anything that
+        produces no frame for twenty seconds -- raised a timeout here. Treating
+        it as a dead peer ended this thread, and from then on nobody answered
+        the server's pings, so the server closed a connection that was fine.
+        Measured: the thread died after 21 seconds of quiet even on a loopback
+        server, which does not ping at all, and ``send`` went on reporting
+        success into a socket with no reader behind it.
         """
         ws = self._ws
         if ws is None:
@@ -877,6 +903,11 @@ class WebSocketTransport:
         while not self._closing.is_set():
             try:
                 raw = ws.recv()
+            except _WS_TIMEOUT_ERRORS:
+                # Nothing arrived in time. The connection is untouched, and the
+                # library has already answered any ping from inside recv, so the
+                # only correct thing to do is read again.
+                continue
             except Exception as exc:  # noqa: BLE001
                 if not self._closing.is_set():
                     self._error = str(exc)
@@ -893,7 +924,21 @@ class WebSocketTransport:
                 continue
 
     def send(self, message: dict) -> bool:
+        """Write one frame. ``False`` means the peer is gone.
+
+        A dead reading thread counts as gone, even when the socket still accepts
+        bytes. Measured: with the reader stopped, ``send`` reported success and
+        the answer never came, because there was nobody left to read the reply
+        -- a silent loss, which is the worst outcome for a listener who has no
+        way to see that nothing is happening. Refusing here turns it into a
+        message the turn can report.
+        """
         if self._ws is None:
+            return False
+        reader = self._reader
+        if reader is not None and not reader.is_alive() and not self._closing.is_set():
+            if not self._error:
+                self._error = "the connection to Hermes stopped being read"
             return False
         try:
             self._ws.send(json.dumps(message, ensure_ascii=False))
