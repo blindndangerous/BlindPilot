@@ -1810,6 +1810,11 @@ class Earcons:
         self._loop_stop = threading.Event()
         self._loop_thread: Optional[threading.Thread] = None
         self._loop_proc: Optional[subprocess.Popen] = None
+        # Whether a progress cue of ours has been started and not yet stopped.
+        # It matters because the Windows sound API is stopped by purging every
+        # sound this process started, which would also cut a one-shot that had
+        # just begun. So the purge only runs while there is a cue to stop.
+        self._cue_sounding = False
 
     def _resolve(self, *basenames: str) -> Optional[str]:
         for name in basenames:
@@ -1869,6 +1874,7 @@ class Earcons:
         if mode == CUE_OFF:
             return
         if mode == CUE_PERIODIC:
+            self._cue_sounding = True
             self._start_periodic(max(CUE_SECONDS_MIN, SETTINGS.progress_cue_seconds))
             return
         if self._system == "Windows":
@@ -1879,9 +1885,11 @@ class Earcons:
                     self.in_progress,
                     winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP,
                 )
+                self._cue_sounding = True
             except Exception:
                 pass
             return
+        self._cue_sounding = True
         self._loop_stop.clear()
         self._loop_thread = threading.Thread(target=self._loop_unix, daemon=True)
         self._loop_thread.start()
@@ -1928,7 +1936,17 @@ class Earcons:
         # periodic cue is a thread of ours and would otherwise keep playing
         # after the answer arrived.
         self._loop_stop.set()
+        sounding = self._cue_sounding
+        self._cue_sounding = False
         if self._system == "Windows":
+            # Purging is per process, not per sound: it silences whatever this
+            # application is playing, including a one-shot that started a
+            # moment ago. So it runs only when a cue of ours is actually
+            # playing. Without this guard, ending a turn purged the 'received'
+            # cue it had just started -- and the faster the turn ended, the
+            # less of that cue was left to hear.
+            if not sounding:
+                return
             try:
                 import winsound
 

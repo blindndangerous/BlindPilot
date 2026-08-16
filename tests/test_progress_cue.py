@@ -244,3 +244,112 @@ def test_the_send_and_received_cues_survive_switching_the_cue_off(
     cues.play_received()
 
     assert cues.played == ["send.wav", "received.wav"]
+
+
+def _purge_watching_winsound(monkeypatch, log: list) -> None:
+    """Install a winsound whose every call is recorded, purges included."""
+    def _play_sound(sound, flags):
+        log.append(("purge",) if sound is None else ("play", sound))
+
+    monkeypatch.setitem(
+        sys.modules, "winsound",
+        types.SimpleNamespace(
+            PlaySound=_play_sound,
+            SND_FILENAME=1, SND_ASYNC=2, SND_LOOP=8, SND_PURGE=0,
+        ),
+    )
+
+
+def test_ending_a_turn_does_not_purge_the_received_cue(config_dir: Path, monkeypatch) -> None:
+    """The cue announcing the answer must not be cut off by the turn ending.
+
+    Purging is per process on Windows, so a purge issued to stop a working cue
+    also silences the one-shot that has just started. The window ends a turn in
+    two steps -- the response arrives, then the worker finishes -- and the
+    second step used to purge unconditionally, cutting the 'received' cue after
+    however long the gap between the two happened to be. Measured: 290 ms of
+    audio reduced to 50 ms once a held connection made that gap almost nothing.
+
+    So the property under test is not 'stop_progress purges' but 'no purge is
+    issued after the received cue starts, when no working cue is playing'.
+    """
+    settings = blindpilot_app._Settings()
+    settings.progress_cue = blindpilot_app.CUE_OFF
+    monkeypatch.setattr(blindpilot_app, "SETTINGS", settings)
+    calls: list = []
+    _purge_watching_winsound(monkeypatch, calls)
+
+    cues = blindpilot_app.Earcons("/nonexistent")
+    cues._system = "Windows"
+    cues.received, cues.in_progress, cues.send = "received.wav", "in-progress.wav", "send.wav"
+
+    cues.start_progress()      # off: nothing to play, nothing to stop
+    cues.play_received()       # the answer arrived
+    cues.stop_progress()       # the worker finished, a moment later
+
+    assert ("play", "received.wav") in calls, calls
+    # Nothing of ours is playing in this mode, so no purge is warranted at any
+    # point of the turn. The weaker property -- 'no purge after the received cue
+    # starts' -- let a mutation through that raised the flag unconditionally:
+    # that purges while the send cue is still sounding, which on a fast turn
+    # cuts the send cue instead of the received one. Same defect, different
+    # victim, so the flag has to mean 'a cue of ours is playing' exactly.
+    assert ("purge",) not in calls, f"purged with no cue of ours playing: {calls}"
+
+
+def test_a_working_cue_is_still_silenced_when_the_answer_arrives(
+    config_dir: Path, monkeypatch
+) -> None:
+    """The guard must not leave the looping cue playing over the answer.
+
+    The counterpart to the test above: not purging is only correct when there
+    is nothing of ours to stop. While a working cue loops, the purge is what
+    ends it, and it has to happen before the received cue is played.
+    """
+    settings = blindpilot_app._Settings()
+    settings.progress_cue = blindpilot_app.CUE_LOOP
+    monkeypatch.setattr(blindpilot_app, "SETTINGS", settings)
+    calls: list = []
+    _purge_watching_winsound(monkeypatch, calls)
+
+    cues = blindpilot_app.Earcons("/nonexistent")
+    cues._system = "Windows"
+    cues.received, cues.in_progress, cues.send = "received.wav", "in-progress.wav", "send.wav"
+
+    cues.start_progress()
+    assert ("play", "in-progress.wav") in calls, calls
+    calls.clear()
+
+    cues.play_received()
+
+    assert calls[0] == ("purge",), f"the looping cue was left playing: {calls}"
+    assert ("play", "received.wav") in calls, calls
+    # And the second step of ending the turn adds no further purge.
+    calls.clear()
+    cues.stop_progress()
+    assert calls == [], f"the finished turn purged again: {calls}"
+
+
+def test_a_periodic_cue_is_silenced_when_the_answer_arrives(
+    config_dir: Path, monkeypatch
+) -> None:
+    """The periodic mode plays through the one-shot player, and still needs the
+    purge: its cue may be sounding at the moment the answer arrives."""
+    settings = blindpilot_app._Settings()
+    settings.progress_cue = blindpilot_app.CUE_PERIODIC
+    monkeypatch.setattr(blindpilot_app, "SETTINGS", settings)
+    calls: list = []
+    _purge_watching_winsound(monkeypatch, calls)
+    monkeypatch.setattr(
+        blindpilot_app.threading, "Thread", lambda *a, **k: _NullThread()
+    )
+
+    cues = blindpilot_app.Earcons("/nonexistent")
+    cues._system = "Windows"
+    cues.received, cues.in_progress, cues.send = "received.wav", "in-progress.wav", "send.wav"
+
+    cues.start_progress()
+    calls.clear()
+    cues.play_received()
+
+    assert calls[0] == ("purge",), f"a periodic cue was not silenced: {calls}"
