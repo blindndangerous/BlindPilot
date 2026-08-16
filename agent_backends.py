@@ -248,6 +248,13 @@ class BackendInfo:
     # an interactive picker: run hidden with no stdin it simply fails, so the
     # wizard opens a real console instead of pretending to have signed in.
     login_needs_terminal: bool = False
+    # Whether the backend takes an attachment's BYTES rather than its path.
+    # The CLI backends run on this machine, so naming the file is enough for
+    # them. Hermes may be running somewhere else entirely -- in WSL, or on
+    # another machine over the network -- where a path from here means nothing
+    # or, worse, means a different file that happens to share the name. Those
+    # backends are handed the file itself.
+    uploads_attachments: bool = False
 
 
 BACKENDS = {
@@ -301,6 +308,9 @@ BACKENDS = {
         True,
         supports_compaction=True,
         login_needs_terminal=True,
+        # Hermes' gateway takes an upload of the file, so an attachment works
+        # the same whether Hermes is here, in WSL, or on another machine.
+        uploads_attachments=True,
     ),
 }
 

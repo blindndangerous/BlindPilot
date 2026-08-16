@@ -3319,11 +3319,20 @@ class SessionPanel(wx.Panel):
             )
 
         send_text = self._build_send_text(prompt)
+        # Attachments leave the tab's pending list here, but the turn still
+        # needs them: an uploading backend is handed the paths so the worker
+        # can send the bytes.
+        outgoing_files = list(self._attachments)
+        uploading = bool(outgoing_files) and self._backend_uploads_attachments()
+        row_text = send_text
+        if uploading:
+            summary = self._attachment_summary()
+            row_text = f"{send_text}\n{summary}" if send_text else summary
         self._turns.append(Turn(prompt=prompt))
         self._assistant_narrated_this_turn = False
         self._streamed_assistant = ""
         self._stopping = False
-        self._add_your_message(send_text)
+        self._add_your_message(row_text)
         self.prompt.SetValue("")
         self._attachments = []
 
@@ -3337,22 +3346,10 @@ class SessionPanel(wx.Panel):
         worker_type = worker_class(selected_backend, ClaudeWorker)
         extra = dict(worker_extra or {})
         if selected_backend == BACKEND_HERMES:
-            # Point the turn at a Hermes elsewhere when one is configured.
-            # Nothing is added when it is not, so the local path stays the
-            # zero-configuration default.
-            remote_url = REMOTE_HERMES.url()
-            if remote_url:
-                extra["remote_url"] = remote_url
-                extra["remote_token"] = REMOTE_HERMES.key
-                extra["remote_credential"] = REMOTE_HERMES.credential
-                extra["remote_username"] = REMOTE_HERMES.username
-            # The connection belongs to the conversation, not the turn: the next
-            # message reuses it instead of logging in and resuming again.
-            if self._held_hermes is None:
-                from hermes_worker import HeldConnection
-
-                self._held_hermes = HeldConnection()
-            extra["held"] = self._held_hermes
+            # No condition on "does this backend upload" here: this branch IS
+            # the uploading backend. Guarding it twice would be a line no test
+            # could ever hold to account.
+            extra.update(self._hermes_worker_extra(outgoing_files))
         self._worker = worker_type(
             send_text,
             self._session_id,
@@ -3447,13 +3444,65 @@ class SessionPanel(wx.Panel):
         self._refresh_list()
         self._announce("Stopped")
 
+    def _hermes_worker_extra(self, attachments: list[str]) -> dict:
+        """The extra arguments a Hermes turn needs, gathered in one place.
+
+        Kept as a method of its own so a test can ask what a turn will be
+        given. Inline in the send path this was untestable, and a mutation that
+        dropped the attachments -- meaning no file bytes ever left the machine,
+        the exact bug being fixed -- went unnoticed by a green test run.
+        """
+        extra: dict = {}
+        # Point the turn at a Hermes elsewhere when one is configured. Nothing
+        # is added when it is not, so the local path stays the
+        # zero-configuration default.
+        remote_url = REMOTE_HERMES.url()
+        if remote_url:
+            extra["remote_url"] = remote_url
+            extra["remote_token"] = REMOTE_HERMES.key
+            extra["remote_credential"] = REMOTE_HERMES.credential
+            extra["remote_username"] = REMOTE_HERMES.username
+        # The connection belongs to the conversation, not the turn: the next
+        # message reuses it instead of logging in and resuming again.
+        if self._held_hermes is None:
+            from hermes_worker import HeldConnection
+
+            self._held_hermes = HeldConnection()
+        extra["held"] = self._held_hermes
+        if attachments:
+            extra["attachments"] = list(attachments)
+        return extra
+
     def _build_send_text(self, prompt: str) -> str:
-        """Combine the prompt with file paths for the selected coding agent."""
+        """Combine the prompt with file paths for the selected coding agent.
+
+        Only for backends that read the file off this machine's disk. A backend
+        that takes an upload is handed the files themselves (see
+        ``uploads_attachments``), and naming their paths here would describe
+        them twice -- once as a path that may mean nothing on the far side.
+        """
         parts = [prompt] if prompt else []
-        if self._attachments:
+        if self._attachments and not self._backend_uploads_attachments():
             listing = "\n".join(self._attachments)
             parts.append("Attached files (please read them):\n" + listing)
         return "\n\n".join(parts)
+
+    def _backend_uploads_attachments(self) -> bool:
+        """Whether the chosen backend wants the file's bytes, not its path."""
+        return bool(getattr(BACKENDS[self.selected_backend()], "uploads_attachments", False))
+
+    def _attachment_summary(self) -> str:
+        """One line naming the files going out, for the transcript row.
+
+        An uploading backend gets no paths in its prompt, so without this the
+        user's own message in the list would not mention the attachment at all
+        and the transcript would read as a question about nothing.
+        """
+        names = [os.path.basename(p) or p for p in self._attachments]
+        if not names:
+            return ""
+        noun = "file" if len(names) == 1 else "files"
+        return f"[Sending {len(names)} {noun}: {', '.join(names)}]"
 
     def clear_conversation(self) -> None:
         """Forget this conversation and start a fresh one in the same tab.

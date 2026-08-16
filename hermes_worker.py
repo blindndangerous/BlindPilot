@@ -11,8 +11,11 @@ SPDX-License-Identifier: MIT
 
 from __future__ import annotations
 
+import base64
+import mimetypes
+import os
 import threading
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 from hermes_backend import (
     StdioTransport,
@@ -43,6 +46,112 @@ _MODE_TO_YOLO = {
     "default": False,
     "plan": False,
 }
+
+# How large a single attachment may be. Hermes caps a one-shot upload frame
+# well above this, but a file this big is not something a person is asking to
+# have read aloud: it is a mistake, and the honest answer is to say so before
+# spending a minute encoding it.
+ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
+
+# Media types for the file kinds a person actually attaches. Named here because
+# ``mimetypes`` consults the Windows registry, and on a Windows Python it did
+# not know ``.xlsx``: the same spreadsheet would then be described as a generic
+# byte stream on one machine and as a spreadsheet on another.
+_ATTACHMENT_MIME_TYPES = {
+    ".csv": "text/csv",
+    ".doc": "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".json": "application/json",
+    ".log": "text/plain",
+    ".md": "text/markdown",
+    ".odt": "application/vnd.oasis.opendocument.text",
+    ".ods": "application/vnd.oasis.opendocument.spreadsheet",
+    ".pdf": "application/pdf",
+    ".ppt": "application/vnd.ms-powerpoint",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".rtf": "application/rtf",
+    ".txt": "text/plain",
+    ".xls": "application/vnd.ms-excel",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xml": "application/xml",
+    ".yaml": "application/yaml",
+    ".yml": "application/yaml",
+    ".zip": "application/zip",
+}
+
+
+def attachment_name(path: str) -> str:
+    """The bare filename of an attachment, whichever platform wrote the path.
+
+    Measured on a live gateway: Hermes stores the uploaded file under the
+    ``name`` it is given, and a Linux gateway does not read a backslash as a
+    separator -- so handing it a Windows path unchanged produces a file called
+    ``D:\\projekty\\report.xlsx``, one long name rather than a name in a folder.
+    Splitting on both separators here is what keeps the stored file called
+    ``report.xlsx`` no matter which side of the WSL boundary the user picked it
+    from.
+    """
+    text = str(path or "").strip().strip('"').rstrip("\\/")
+    if not text:
+        return ""
+    for sep in ("\\", "/"):
+        text = text.rsplit(sep, 1)[-1]
+    return text
+
+
+def attachment_data_url(path: str) -> str:
+    """Read a file and wrap its bytes as a ``data:`` URL for ``file.attach``.
+
+    The media type is a hint only -- Hermes stores the bytes and lets its file
+    tools read them -- but a truthful one costs nothing and makes the frame
+    readable in a log.
+
+    The common document types are named here rather than left to
+    ``mimetypes``, which reads the Windows registry: measured on a Windows
+    Python, ``.xlsx`` came back unknown, so the same file would be described
+    differently on two machines for no reason anyone can see.
+    """
+    with open(path, "rb") as handle:
+        payload = handle.read()
+    suffix = os.path.splitext(path)[1].lower()
+    mime = _ATTACHMENT_MIME_TYPES.get(suffix) or mimetypes.guess_type(path)[0]
+    mime = mime or "application/octet-stream"
+    return f"data:{mime};base64," + base64.b64encode(payload).decode("ascii")
+
+
+class AttachmentError(Exception):
+    """An attachment could not be sent, with a reason worth reading aloud."""
+
+
+def _size_text(size: int) -> str:
+    """A file size a listener can take in, rather than a count of bytes."""
+    if size >= 1024 * 1024:
+        return f"{size / (1024 * 1024):.1f} MB"
+    if size >= 1024:
+        return f"{size / 1024:.0f} KB"
+    return f"{size} bytes"
+
+
+def check_attachment(path: str) -> int:
+    """Size of an attachment, or ``AttachmentError`` saying why it cannot go.
+
+    Refusing early, by name and reason, is the difference between a message a
+    screen reader user can act on and a turn that simply answers about a file
+    the model never received.
+    """
+    name = attachment_name(path) or path
+    try:
+        size = os.path.getsize(path)
+    except OSError as exc:
+        raise AttachmentError(f"{name} could not be read: {exc.strerror or exc}") from exc
+    if size == 0:
+        raise AttachmentError(f"{name} is empty")
+    if size > ATTACHMENT_MAX_BYTES:
+        mb = ATTACHMENT_MAX_BYTES // (1024 * 1024)
+        raise AttachmentError(
+            f"{name} is too large to send ({size // (1024 * 1024)} MB; the limit is {mb} MB)"
+        )
+    return size
 
 
 def _first_text(*candidates: object) -> str:
@@ -212,6 +321,7 @@ class HermesWorker(threading.Thread):
         remote_credential: str = "token",
         remote_username: str = "",
         held: Optional[HeldConnection] = None,
+        attachments: Optional[Sequence[str]] = None,
         on_session: Callable[[str], None],
         on_started: Callable[[], None],
         on_activity: Callable[[str, str], None],
@@ -242,6 +352,10 @@ class HermesWorker(threading.Thread):
         # worker owns its own, so a caller that has not opted in keeps the old
         # connect-per-turn behaviour and nothing about it changes.
         self._held = held
+        # Files the user attached to this message. They live on the machine
+        # BlindPilot runs on, which is not necessarily the machine Hermes runs
+        # on, so their bytes are uploaded before the prompt goes out.
+        self._attachments = [str(p) for p in (attachments or []) if str(p).strip()]
         # Whether this turn inherited a live connection rather than opening one.
         self._reused = False
         self._on_session = on_session
@@ -494,6 +608,12 @@ class HermesWorker(threading.Thread):
         return params
 
     def _run_turn(self) -> None:
+        text = self._prompt
+        if self._attachments:
+            uploaded = self._upload_attachments()
+            if uploaded is None:
+                return
+            text = self._prompt_with_attachments(uploaded)
         request_id = self._next_id()
         transport = self._transport
         if transport is None:
@@ -503,7 +623,7 @@ class HermesWorker(threading.Thread):
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "method": "prompt.submit",
-                "params": {"session_id": self._live_session, "text": self._prompt},
+                "params": {"session_id": self._live_session, "text": text},
             }
         )
         reply = self._await_response(request_id, 120.0)
@@ -519,6 +639,92 @@ class HermesWorker(threading.Thread):
         self._accepting_input.set()
         self._on_started()
         self._consume_turn()
+
+    def _upload_attachments(self) -> Optional[list[tuple[str, str]]]:
+        """Send each attached file's bytes to Hermes, before the prompt goes out.
+
+        Returns pairs of (name as the user knows it, path Hermes stored it at),
+        or ``None`` when the turn has already been reported as failed.
+
+        The bytes travel even when the path would resolve on the gateway. Two
+        machines that both mount a drive at the same place -- an everyday
+        Windows-and-WSL pair, or two hosts sharing a folder layout -- would
+        otherwise let a path point at a DIFFERENT file with the same name, and
+        the answer would be about a file the user never attached. Uploading is
+        the only way the file being discussed is the file that was picked.
+        """
+        sent: list[tuple[str, str]] = []
+        for path in self._attachments:
+            display = attachment_name(path) or path
+            try:
+                size = check_attachment(path)
+                data_url = attachment_data_url(path)
+            except AttachmentError as exc:
+                self._on_failed(str(exc))
+                return None
+            except OSError as exc:
+                self._on_failed(f"{display} could not be read: {exc.strerror or exc}")
+                return None
+            self._on_activity("tool", f"Sending {display} ({_size_text(size)}) to Hermes")
+            request_id = self._next_id()
+            transport = self._transport
+            if transport is None:
+                return None
+            transport.send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "file.attach",
+                    "params": {
+                        "session_id": self._live_session,
+                        # The name is given separately on purpose: a Linux
+                        # gateway handed "D:\\dir\\report.xlsx" stores one file
+                        # with that whole string as its name.
+                        "name": display,
+                        "data_url": data_url,
+                    },
+                }
+            )
+            reply = self._await_response(request_id, 300.0)
+            if reply is None:
+                if not self._cancelled:
+                    detail = transport.failure_detail()
+                    self._on_failed(detail or f"Hermes did not confirm receiving {display}")
+                return None
+            error = reply.get("error")
+            if error:
+                self._on_failed(
+                    self._error_text(error, f"Hermes could not accept {display}")
+                )
+                return None
+            result = reply.get("result") or {}
+            stored = str(result.get("path") or "")
+            if not stored:
+                self._on_failed(f"Hermes accepted {display} but did not say where it put it")
+                return None
+            self._on_activity("result", f"{display} received by Hermes")
+            sent.append((display, stored))
+        return sent
+
+    def _prompt_with_attachments(self, uploaded: list[tuple[str, str]]) -> str:
+        """The prompt, plus where Hermes can find each file that came with it.
+
+        Measured, and the reason this is a path rather than an ``@file:`` ref:
+        Hermes stages uploads in its own ``attachments`` directory, which is
+        outside the conversation's workspace, and its ``@`` expansion refuses
+        anything outside that workspace ("path is outside the allowed
+        workspace"). The ref would be answered with a warning and no content.
+        A plain path is read by the agent's own file tools, which is what the
+        probe saw happen.
+        """
+        lines = [f"{name}: {stored}" for name, stored in uploaded]
+        listing = "\n".join(lines)
+        noun = "file" if len(lines) == 1 else "files"
+        note = (
+            f"Attached {noun} (uploaded to this machine, please read {'it' if len(lines) == 1 else 'them'}):\n"
+            + listing
+        )
+        return f"{self._prompt}\n\n{note}" if self._prompt else note
 
     def _run_compaction(self) -> None:
         """Compact in place. Hermes answers when the summary is written."""
