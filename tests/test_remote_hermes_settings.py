@@ -213,4 +213,8 @@ def test_the_description_says_where_it_will_connect(config_dir: Path) -> None:
     remote.port = 9119
     remote.save()
 
-    assert _settings().describe() == "On — ws://garfield:9119/api/ws"
+    described = _settings().describe()
+    assert described.startswith("On — ws://garfield:9119/api/ws")
+    # It also has to say HOW it will sign in: a token and a password are
+    # different setups and the difference matters when one of them fails.
+    assert "session token" in described

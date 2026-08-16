@@ -1670,6 +1670,7 @@ class _RemoteHermes:
         # elsewhere, which Hermes requires a password login for.
         credential = str(remote.get("credential", "token") or "token")
         self.credential = credential if credential in REMOTE_CREDENTIALS else "token"
+        self.username = str(remote.get("username", "") or "")
         self.key = self._read_key()
 
     @staticmethod
@@ -1710,7 +1711,8 @@ class _RemoteHermes:
         url = self.url()
         if not url:
             return "On, but no address is set yet."
-        return f"On — {url}"
+        how = "username and password" if self.credential == "password" else "session token"
+        return f"On — {url}, signing in with a {how}"
 
     def save(self) -> None:
         cfg = _load_config()
@@ -1720,6 +1722,7 @@ class _RemoteHermes:
             "port": self.port,
             "secure": self.secure,
             "credential": self.credential,
+            "username": self.username,
         }
         _save_config(cfg)
         self._write_key()
@@ -3246,6 +3249,7 @@ class SessionPanel(wx.Panel):
                 extra["remote_url"] = remote_url
                 extra["remote_token"] = REMOTE_HERMES.key
                 extra["remote_credential"] = REMOTE_HERMES.credential
+                extra["remote_username"] = REMOTE_HERMES.username
         self._worker = worker_type(
             send_text,
             self._session_id,
@@ -4663,20 +4667,24 @@ class RemoteHermesDialog(wx.Dialog):
         self._secure = wx.CheckBox(self, label="Connect over &TLS (wss)")
         self._secure.SetValue(REMOTE_HERMES.secure)
 
-        credential_label = wx.StaticText(self, label="&Key type:")
+        credential_label = wx.StaticText(self, label="Sign in &with:")
         self._credential = wx.Choice(
             self,
             choices=[
-                "Session token — a Hermes on this same machine",
-                "Ticket — a Hermes that asked you to log in",
+                "Session token — a Hermes on this same computer",
+                "Username and password — a Hermes on another computer",
             ],
         )
         self._credential.SetSelection(0 if REMOTE_HERMES.credential == "token" else 1)
+        self._credential.Bind(wx.EVT_CHOICE, lambda _e: self._sync_credential_fields())
 
-        key_label = wx.StaticText(self, label="&Key:")
-        # Not a password field: a screen-reader user has to be able to review
-        # what was pasted, and this is a machine-generated string nobody types
-        # from memory. It is stored in a file of its own, not shown elsewhere.
+        user_label = wx.StaticText(self, label="&Username:")
+        self._user = wx.TextCtrl(self, value=REMOTE_HERMES.username)
+
+        key_label = wx.StaticText(self, label="&Key or password:")
+        # Not masked: a screen-reader user has to be able to review what was
+        # pasted, and a session token is a machine-generated string nobody
+        # types from memory. It is stored in a file of its own either way.
         self._key = wx.TextCtrl(self, value=REMOTE_HERMES.key)
 
         self._status = wx.StaticText(self, label=REMOTE_HERMES.describe())
@@ -4693,6 +4701,7 @@ class RemoteHermesDialog(wx.Dialog):
             (host_label, self._host),
             (port_label, self._port),
             (credential_label, self._credential),
+            (user_label, self._user),
             (key_label, self._key),
         ):
             grid.Add(label, 0, wx.ALIGN_CENTER_VERTICAL)
@@ -4707,10 +4716,16 @@ class RemoteHermesDialog(wx.Dialog):
         sizer.Add(self._status, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         sizer.Add(buttons, 0, wx.EXPAND | wx.ALL, 10)
         self.SetSizerAndFit(sizer)
+        self._sync_credential_fields()
         self._host.SetFocus()
 
     def _credential_name(self) -> str:
-        return "token" if self._credential.GetSelection() == 0 else "ticket"
+        return "token" if self._credential.GetSelection() == 0 else "password"
+
+    def _sync_credential_fields(self) -> None:
+        """A username only means something when signing in with a password."""
+        wants_user = self._credential_name() == "password"
+        self._user.Enable(wants_user)
 
     def _say(self, text: str) -> None:
         self._status.SetLabel(text)
@@ -4730,12 +4745,15 @@ class RemoteHermesDialog(wx.Dialog):
         self._say(f"Trying {url}…")
         key = self._key.GetValue().strip()
         credential = self._credential_name()
-        threading.Thread(target=self._run_test, args=(url, key, credential), daemon=True).start()
+        username = self._user.GetValue().strip()
+        threading.Thread(
+            target=self._run_test, args=(url, key, credential, username), daemon=True
+        ).start()
 
-    def _run_test(self, url: str, key: str, credential: str) -> None:
+    def _run_test(self, url: str, key: str, credential: str, username: str) -> None:
         from hermes_backend import WebSocketTransport
 
-        transport = WebSocketTransport(url, key, credential)
+        transport = WebSocketTransport(url, key, credential, username)
         try:
             transport.start()
         except OSError as exc:
@@ -4775,6 +4793,7 @@ class RemoteHermesDialog(wx.Dialog):
         REMOTE_HERMES.port = int(self._port.GetValue())
         REMOTE_HERMES.secure = self._secure.GetValue()
         REMOTE_HERMES.credential = self._credential_name()
+        REMOTE_HERMES.username = self._user.GetValue().strip()
         REMOTE_HERMES.key = self._key.GetValue().strip()
         REMOTE_HERMES.save()
 

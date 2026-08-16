@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import threading
+import types
 from pathlib import Path
 
 import agent_backends
@@ -793,6 +795,87 @@ def test_a_missing_hermes_is_reported_rather_than_crashing(monkeypatch):
     assert failed and "not installed" in failed[0]
 
 
+def test_a_password_buys_a_ticket_because_tickets_expire_in_thirty_seconds(monkeypatch):
+    """Any non-loopback bind makes Hermes require a real login - measured.
+
+    Its WebSocket upgrade then accepts only a single-use ticket with a 30s life,
+    so a ticket cannot be pasted into a settings field: it expires while it is
+    being typed. The password is stored and the ticket minted per connection.
+    """
+    minted = []
+    monkeypatch.setattr(
+        hermes_backend,
+        "mint_ws_ticket",
+        lambda url, user, secret: minted.append((url, user, secret)) or "fresh-ticket",
+    )
+    opened = {}
+
+    class _FakeSocket:
+        def close(self):
+            return None
+
+    def _fake_create(url, timeout=None):
+        opened["url"] = url
+        return _FakeSocket()
+
+    monkeypatch.setitem(
+        sys.modules, "websocket", types.SimpleNamespace(create_connection=_fake_create)
+    )
+
+    transport = hermes_backend.WebSocketTransport(
+        "ws://box:9119/api/ws", "secret-pass", "password", "someone"
+    )
+    transport.start()
+
+    assert minted == [("ws://box:9119/api/ws", "someone", "secret-pass")]
+    # The minted ticket has to go out as ?ticket=. Sending it as ?token= is how
+    # a gated Hermes rejected every connection: the legacy token parameter is
+    # unconditionally refused once the auth gate engages.
+    assert opened["url"] == "ws://box:9119/api/ws?ticket=fresh-ticket"
+    assert "secret-pass" not in opened["url"]
+
+
+def test_the_settings_credentials_are_not_the_wire_credentials():
+    """Two different lists, and confusing them broke every gated connection.
+
+    The settings can hold a password; the WebSocket upgrade never accepts one.
+    Validating the query parameter against the settings list silently turned a
+    ticket into ?token=.
+    """
+    assert "password" in hermes_backend.REMOTE_CREDENTIALS
+    assert "password" not in hermes_backend.WS_QUERY_CREDENTIALS
+    assert "ticket" in hermes_backend.WS_QUERY_CREDENTIALS
+
+    url = hermes_backend._authenticated_ws_url("ws://box/api/ws", "value", "password")
+    assert "password=" not in url
+    assert url.endswith("token=value")
+
+
+def test_a_login_that_is_refused_says_so_without_repeating_the_password(monkeypatch):
+    """The message is read aloud, so it must diagnose without disclosing."""
+    import email.message
+    import urllib.error
+    import urllib.request
+
+    class _Opener:
+        def open(self, request, timeout=None):
+            raise urllib.error.HTTPError(
+                request.full_url, 401, "Unauthorized", email.message.Message(), None
+            )
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *a: _Opener())
+
+    try:
+        hermes_backend.mint_ws_ticket("ws://box:9119/api/ws", "someone", "hunter2")
+    except OSError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("a refused login has to raise")
+
+    assert "rejected that username and password" in message
+    assert "hunter2" not in message
+
+
 # -- remote mode ----------------------------------------------------------
 
 
@@ -889,10 +972,11 @@ def test_a_remote_url_selects_the_network_transport(monkeypatch):
     created = {}
 
     class _Fake:
-        def __init__(self, url, token="", credential="token"):
+        def __init__(self, url, token="", credential="token", username=""):
             created["url"] = url
             created["token"] = token
             created["credential"] = credential
+            created["username"] = username
 
         def start(self):
             return None
@@ -914,6 +998,7 @@ def test_a_remote_url_selects_the_network_transport(monkeypatch):
         "url": "ws://192.168.1.10:9119/api/ws",
         "token": "secret",
         "credential": "token",
+        "username": "",
     }
 
 
@@ -921,7 +1006,7 @@ def test_an_unreachable_remote_hermes_says_where_it_tried(monkeypatch):
     """ "Could not connect" without an address is useless to a blind user."""
 
     class _Fake:
-        def __init__(self, url, token="", credential="token"):
+        def __init__(self, url, token="", credential="token", username=""):
             self._url = url
 
         def start(self):

@@ -441,7 +441,83 @@ REMOTE_CONNECT_TIMEOUT = 20.0
 # after a password login, which is what a server reachable from another machine
 # requires. A third name exists for processes Hermes spawns itself and is
 # deliberately not offered here.
-REMOTE_CREDENTIALS = ("token", "ticket")
+# Credential kinds the remote settings can hold.
+#
+# "token" is the session token of a Hermes bound to the loopback address, where
+# it needs no login of its own. "password" is for a Hermes reachable from
+# another machine: any non-loopback bind makes Hermes require a real login, and
+# the WebSocket upgrade then wants a one-shot ticket rather than a token.
+#
+# Those tickets live thirty seconds -- measured, not assumed -- so pasting one
+# into a settings field is not usable. The password is stored instead and the
+# ticket is minted automatically before each connection.
+REMOTE_CREDENTIALS = ("token", "password")
+
+# What Hermes' WebSocket upgrade accepts as a query parameter. Deliberately
+# separate from REMOTE_CREDENTIALS: a password is stored in the settings but
+# never sent this way -- it buys a ticket first.
+WS_QUERY_CREDENTIALS = ("token", "ticket")
+
+# How long a minted ticket is valid. Hermes reports 30s; the ticket is used
+# immediately, and this only guards against treating a stale one as usable.
+TICKET_TTL_MARGIN = 5.0
+
+
+def mint_ws_ticket(url: str, username: str, password: str) -> str:
+    """Log in with a password and return a one-shot WebSocket ticket.
+
+    A Hermes reachable from another machine requires a login of its own, and
+    its WebSocket upgrade then accepts only a ticket, which lives thirty
+    seconds. So the desktop stores the password and does this every time it
+    connects, rather than asking anyone to paste a value that expires while
+    they are typing it.
+
+    Raises ``OSError`` with a message worth showing when the login fails.
+    """
+    import urllib.error
+    import urllib.request
+    from http.cookiejar import CookieJar
+
+    base = url.split("?", 1)[0]
+    for prefix, replacement in (("wss://", "https://"), ("ws://", "http://")):
+        if base.startswith(prefix):
+            base = replacement + base[len(prefix) :]
+            break
+    base = base[: -len("/api/ws")] if base.endswith("/api/ws") else base
+
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(CookieJar()))
+
+    def _post(path: str, body: Optional[dict]) -> dict:
+        data = json.dumps(body).encode() if body is not None else b""
+        request = urllib.request.Request(
+            base + path,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with opener.open(request, timeout=REMOTE_CONNECT_TIMEOUT) as response:
+            return json.loads(response.read() or b"{}")
+
+    try:
+        _post(
+            "/auth/password-login",
+            {"provider": "basic", "username": username, "password": password},
+        )
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise OSError(f"Hermes at {base} rejected that username and password.") from exc
+        raise OSError(f"Could not sign in to Hermes at {base}: HTTP {exc.code}") from exc
+    except Exception as exc:  # noqa: BLE001 - network, DNS, TLS all land here
+        raise OSError(_remote_failure_message(base, exc)) from exc
+
+    try:
+        payload = _post("/api/auth/ws-ticket", None)
+    except Exception as exc:  # noqa: BLE001
+        raise OSError(f"Signed in to Hermes at {base}, but it issued no ticket.") from exc
+    ticket = str(payload.get("ticket") or "")
+    if not ticket:
+        raise OSError(f"Signed in to Hermes at {base}, but it issued no ticket.")
+    return ticket
 
 
 def remote_ws_url(host: str, port: int = 9119, secure: bool = False) -> str:
@@ -469,10 +545,18 @@ def remote_ws_url(host: str, port: int = 9119, secure: bool = False) -> str:
 
 
 def _authenticated_ws_url(url: str, token: str, credential: str) -> str:
-    """Put the credential in the query string, where the upgrade looks for it."""
+    """Put the credential in the query string, where the upgrade looks for it.
+
+    The name has to be one Hermes' upgrade recognises -- ``token`` for a
+    loopback server, ``ticket`` for a gated one. That is a different list from
+    :data:`REMOTE_CREDENTIALS`, which is what the *settings* can hold: a
+    password is stored, but never sent as a query parameter. Validating against
+    the wrong list is exactly how a minted ticket went out as ``?token=`` and
+    was rejected.
+    """
     if not token:
         return url
-    name = credential if credential in REMOTE_CREDENTIALS else "token"
+    name = credential if credential in WS_QUERY_CREDENTIALS else "token"
     separator = "&" if "?" in url else "?"
     return f"{url}{separator}{name}={urllib.parse.quote(token, safe='')}"
 
@@ -704,8 +788,17 @@ class WebSocketTransport:
     server reachable from outside this machine.
     """
 
-    def __init__(self, url: str, token: str = "", credential: str = "token") -> None:
-        self._url = _authenticated_ws_url(url, token, credential)
+    def __init__(
+        self,
+        url: str,
+        token: str = "",
+        credential: str = "token",
+        username: str = "",
+    ) -> None:
+        self._base_url = url
+        self._token = token
+        self._credential = credential if credential in REMOTE_CREDENTIALS else "token"
+        self._username = username or "hermes"
         # Kept credential-free for anything shown to the user: a token spoken
         # aloud by a screen reader is a token read out to the room.
         self._display_url = _redacted_ws_url(url)
@@ -720,8 +813,16 @@ class WebSocketTransport:
             raise OSError(
                 "Remote Hermes needs the websocket-client package: pip install websocket-client"
             ) from exc
+        if self._credential == "password":
+            # A Hermes reachable from another machine requires its own login,
+            # and the ticket it then issues lives thirty seconds -- so it is
+            # minted here, immediately before use, rather than stored.
+            ticket = mint_ws_ticket(self._base_url, self._username, self._token)
+            url = _authenticated_ws_url(self._base_url, ticket, "ticket")
+        else:
+            url = _authenticated_ws_url(self._base_url, self._token, "token")
         try:
-            self._ws = create_connection(self._url, timeout=REMOTE_CONNECT_TIMEOUT)
+            self._ws = create_connection(url, timeout=REMOTE_CONNECT_TIMEOUT)
         except Exception as exc:  # noqa: BLE001 - any failure is "cannot reach it"
             self._error = str(exc)
             raise OSError(_remote_failure_message(self._display_url, exc)) from exc
@@ -765,8 +866,8 @@ class WebSocketTransport:
 
     def failure_detail(self) -> str:
         if self._error:
-            return f"Lost the connection to Hermes at {self._url}: {self._error}"
-        return f"Hermes at {self._url} closed the connection before the turn completed"
+            return f"Lost the connection to Hermes at {self._display_url}: {self._error}"
+        return f"Hermes at {self._display_url} closed the connection before the turn completed"
 
 
 # --------------------------------------------------------------------------
