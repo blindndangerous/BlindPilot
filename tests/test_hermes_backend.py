@@ -463,6 +463,53 @@ def test_a_session_error_is_surfaced_with_hermes_own_message():
 # -- discovery ------------------------------------------------------------
 
 
+def test_the_model_catalog_qualifies_every_model_with_its_provider():
+    """Hermes groups models under providers and repeats names across them.
+
+    The qualified form is also what its /model command accepts, so a picked
+    row can go back unchanged.
+    """
+    models, current = hermes_backend._model_rows(
+        {
+            "providers": [
+                {"slug": "openai", "models": ["gpt-5", "gpt-5-mini"], "is_current": False},
+                {"slug": "anthropic", "models": ["gpt-5"], "is_current": True},
+            ]
+        }
+    )
+
+    assert models == ["openai:gpt-5", "openai:gpt-5-mini", "anthropic:gpt-5"]
+    assert current == "anthropic:gpt-5"
+
+
+def test_providers_without_credentials_are_left_out_of_the_picker():
+    """Offering one would fail at the first turn, after the user chose it."""
+    models, _current = hermes_backend._model_rows(
+        {
+            "providers": [
+                {"slug": "ready", "models": ["a"], "authenticated": True},
+                {"slug": "nope", "models": ["b"], "authenticated": False},
+            ]
+        }
+    )
+
+    assert models == ["ready:a"]
+
+
+def test_a_malformed_catalog_produces_no_rows_rather_than_raising():
+    assert hermes_backend._model_rows({}) == ([], "")
+    assert hermes_backend._model_rows({"providers": "nonsense"}) == ([], "")
+    assert hermes_backend._model_rows({"providers": [None, {"models": ["x"]}]}) == ([], "")
+
+
+def test_the_picker_reports_a_missing_hermes_instead_of_waiting(monkeypatch):
+    monkeypatch.setattr(hermes_backend, "hermes_installed", lambda: False)
+    models, efforts, current, effort, error = hermes_backend.hermes_model_options()
+
+    assert (models, efforts, current, effort) == ([], [], "", "")
+    assert "not found" in error
+
+
 def test_hermes_is_only_usable_when_its_python_environment_is_present(monkeypatch):
     """A launcher alone cannot run the gateway, which is a module in the venv."""
     monkeypatch.setattr(hermes_backend, "hermes_python", lambda: None)

@@ -60,6 +60,7 @@ from agent_backends import (
     BACKEND_CLAUDE,
     BACKEND_CODEX,
     BACKEND_FREEBUFF,
+    BACKEND_HERMES,
     BACKEND_IDS,
     BACKEND_LABELS,
     BACKENDS,
@@ -80,6 +81,7 @@ from agent_backends import (
     set_freebuff_model,
     worker_class,
 )
+from hermes_backend import hermes_model_options
 
 from markdown_rows import (
     Row,
@@ -758,6 +760,16 @@ _NPM_BACKEND_PACKAGES = {
 }
 
 
+def _backend_installs_with_npm(backend: str) -> bool:
+    """Whether this backend is one BlindPilot can install for the user.
+
+    Not every backend ships on npm: Hermes installs itself from its own
+    installer, so telling the user that npm is required would send them after
+    the wrong thing entirely.
+    """
+    return normalize_backend(backend) in _NPM_BACKEND_PACKAGES
+
+
 def _npm_install_argv(backend: str) -> Optional[List[str]]:
     """Return the npm command for a backend, or None if npm is unavailable."""
     package = _NPM_BACKEND_PACKAGES.get(normalize_backend(backend))
@@ -1132,13 +1144,26 @@ def probe_model_options(
         label = backend_label(backend)
         return ModelOptions(
             list(_FALLBACK_MODELS) if backend == BACKEND_CLAUDE else [],
-            list(_FALLBACK_EFFORTS) if backend != BACKEND_FREEBUFF else [],
+            # Only offer effort levels for a backend that actually accepts one;
+            # otherwise the picker shows a control its protocol ignores.
+            list(_FALLBACK_EFFORTS) if BACKENDS[backend].supports_effort else [],
             error=f"{label} was not found.",
         )
 
     fresh = cached_model_options(cwd, max_age, backend)
     if fresh is not None:
         return fresh
+
+    if backend == BACKEND_HERMES:
+        models, efforts, current_model, current_effort, error = hermes_model_options(cwd)
+        options = ModelOptions(models, efforts, current_model, current_effort, error)
+        if models:
+            with _probe_lock:
+                _probe_cache[(f"{backend}:{cwd or ''}", _cli_stamp(binary))] = (
+                    time.time(),
+                    options,
+                )
+        return options
 
     if backend == BACKEND_CODEX:
         models, efforts, current_model, current_effort, error = codex_model_options(cwd)
@@ -2664,7 +2689,10 @@ class SessionPanel(wx.Panel):
             # be given a message. Start one now, so the first message of the
             # conversation does not spend that wait in silence.
             prewarm_freebuff(self.cwd, self._session_id, self.model)
-        supports_permissions = selected != BACKEND_FREEBUFF
+        # Ask the backend what it supports rather than naming the one that does
+        # not: a fourth backend arriving is otherwise silently given a control
+        # its protocol has no answer for.
+        supports_permissions = BACKENDS[selected].supports_permissions
         self.mode_picker.Enable(supports_permissions)
         if supports_permissions:
             self.mode_picker.SetToolTip(
@@ -2672,7 +2700,8 @@ class SessionPanel(wx.Panel):
             )
         else:
             self.mode_picker.SetToolTip(
-                "FreeBuff does not expose permission modes through its command-line interface"
+                f"{backend_label(selected)} does not expose permission modes "
+                "through its command-line interface"
             )
         self.Layout()
 
@@ -3949,18 +3978,30 @@ class SetupWizard(wx.Dialog):
         self._welcome_text.Wrap(520)
         self._cli_install_btn.SetLabel(f"Install {label}")
         self._cli_update_btn.SetLabel(f"Update {label}")
-        self._signin_intro.SetLabel(
-            f"BlindPilot needs you to be signed in to use {label}.\n\n"
-            f"If you have already run '{login}' in a terminal, choose Already "
-            "Signed In. Otherwise choose Sign In and complete any browser or "
-            "terminal authentication that opens."
-        )
+        if info.login_needs_terminal:
+            self._signin_intro.SetLabel(
+                f"BlindPilot needs {label} to have a provider and model configured.\n\n"
+                f"If you have already run '{login}' in a terminal, choose Already "
+                "Signed In. Otherwise choose Sign In: its setup opens in a terminal "
+                "window where you can answer its questions."
+            )
+        else:
+            self._signin_intro.SetLabel(
+                f"BlindPilot needs you to be signed in to use {label}.\n\n"
+                f"If you have already run '{login}' in a terminal, choose Already "
+                "Signed In. Otherwise choose Sign In and complete any browser or "
+                "terminal authentication that opens."
+            )
         self._signin_intro.Wrap(520)
         limitations = ""
         if not info.supports_model:
-            limitations += "\nFreeBuff manages model selection in its own terminal UI."
+            limitations += f"\n{label} manages model selection in its own terminal UI."
         if not info.supports_permissions:
-            limitations += "\nFreeBuff manages permissions internally."
+            limitations += f"\n{label} manages permissions internally."
+        if not info.supports_effort:
+            limitations += f"\n{label} does not expose a reasoning effort level."
+        if not info.supports_compaction:
+            limitations += f"\n{label} cannot compact a conversation; start a new one instead."
         self._done_text.SetLabel(
             f"All done! BlindPilot is ready to use {label}.\n\n"
             "Type in the Prompt field and press Enter to send.\n"
@@ -4078,7 +4119,7 @@ class SetupWizard(wx.Dialog):
                 "rights and no Node.js needed. It is put on your PATH so "
                 f"'claude' also works in {_path_shells()}.\n\n"
                 "You can also install it yourself from claude.com/claude-code "
-                "and click Check Again. To use Codex or FreeBuff instead, press "
+                "and click Check Again. To use another backend instead, press "
                 "Escape and choose it from File, Backend in the main window."
             )
             self._cli_install_btn.Show()
@@ -4103,7 +4144,7 @@ class SetupWizard(wx.Dialog):
                 f"{_missing_prereq_message()}\n\n"
                 f"Install Claude Code by running this in a terminal:\n\n"
                 f"{command}\n\n"
-                "then click Check Again. To use Codex or FreeBuff instead, press "
+                "then click Check Again. To use another backend instead, press "
                 "Escape and choose it from File, Backend in the main window."
             )
             self._cli_install_btn.Hide()
@@ -4118,7 +4159,7 @@ class SetupWizard(wx.Dialog):
         announce(" ".join(filter(None, (self._cli_status.GetLabel(), hint))))
 
     def _check_npm_backend_cli(self) -> None:
-        """Check Codex or FreeBuff without showing Claude-specific guidance."""
+        """Check a non-Claude backend without showing Claude-specific guidance."""
         info = BACKENDS[self.backend]
         self._backend_path = self._find_selected_cli()
         hint = ""
@@ -4153,6 +4194,22 @@ class SetupWizard(wx.Dialog):
             self._cli_check_btn.Show()
             self._next_btn.Enable(False)
             hint = f"Tab to Install {info.label}."
+        elif not _backend_installs_with_npm(self.backend):
+            # This backend does not come from npm, so naming npm would send the
+            # user after the wrong thing. Point at its own instructions instead.
+            self._cli_status.SetLabel(f"{info.label} was not found.")
+            self._cli_detail.SetLabel(
+                f"BlindPilot could not find {info.label} on this computer.\n\n"
+                f"{info.install_command}\n\n"
+                "Install it, then choose Check Again, or go Back and select "
+                "another backend."
+            )
+            self._cli_install_btn.Hide()
+            self._cli_update_btn.Hide()
+            self._cli_path_btn.Hide()
+            self._cli_check_btn.Show()
+            self._next_btn.Enable(False)
+            hint = "Tab to Check Again once it is installed."
         else:
             self._cli_status.SetLabel(f"{info.label} was not found.")
             self._cli_detail.SetLabel(
@@ -4329,6 +4386,13 @@ class SetupWizard(wx.Dialog):
         try:
             assert binary is not None
             args = [binary, *BACKENDS[self.backend].login_args]
+            if BACKENDS[self.backend].login_needs_terminal:
+                # An interactive setup cannot run hidden with no stdin: it dies
+                # immediately and the wizard would report a failed sign-in for a
+                # backend that is simply waiting to be asked. Give it a real
+                # console and let the user answer it.
+                self._launch_login_terminal(args)
+                return
             proc = subprocess.Popen(
                 args,
                 stdout=subprocess.PIPE,
@@ -4352,6 +4416,53 @@ class SetupWizard(wx.Dialog):
         except Exception:
             rc = -2
         wx.CallAfter(self._on_login_done, rc)
+
+    def _launch_login_terminal(self, args: List[str]) -> None:
+        """Open a real console for a backend whose setup asks questions.
+
+        The user answers in that window, not in this one, so there is no exit
+        code worth waiting for here: the wizard says what to do and re-checks
+        afterwards rather than declaring a result it cannot know.
+        """
+        command = subprocess.list2cmdline(args)
+        try:
+            if platform.system() == "Windows":
+                # start opens a console window of its own; the empty title
+                # argument is what keeps a quoted path from being read as one.
+                subprocess.Popen(["cmd", "/c", "start", "", *args], close_fds=True)
+            elif platform.system() == "Darwin":
+                script = f'tell application "Terminal" to do script "{command}"'
+                subprocess.Popen(["osascript", "-e", script], close_fds=True)
+            else:
+                for terminal in ("x-terminal-emulator", "gnome-terminal", "konsole", "xterm"):
+                    if shutil.which(terminal):
+                        subprocess.Popen([terminal, "-e", *args], close_fds=True)
+                        break
+                else:
+                    raise OSError("no terminal emulator found")
+        except (OSError, ValueError):
+            wx.CallAfter(self._on_login_terminal_opened, command, False)
+            return
+        wx.CallAfter(self._on_login_terminal_opened, command, True)
+
+    def _on_login_terminal_opened(self, command: str, opened: bool) -> None:
+        self._signin_btn.Enable()
+        self._already_btn.Enable()
+        self._next_btn.Enable()
+        if opened:
+            self._signin_status.SetLabel(
+                f"{backend_label(self.backend)} setup has opened in a terminal "
+                "window. Answer its questions there, then come back and choose "
+                "Already Signed In."
+            )
+        else:
+            self._signin_status.SetLabel(
+                f"BlindPilot could not open a terminal. Run this yourself, then "
+                f"choose Already Signed In:\n\n{command}"
+            )
+        self._pages[2].Layout()
+        self.Layout()
+        announce(self._signin_status.GetLabel())
 
     def _on_login_done(self, rc: int) -> None:
         self._signin_btn.Enable()

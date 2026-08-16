@@ -33,6 +33,7 @@ import platform
 import shutil
 import subprocess
 import threading
+import time
 from pathlib import Path
 from typing import Optional, Protocol
 
@@ -398,3 +399,104 @@ class WebSocketTransport:
         if self._error:
             return f"Lost the connection to Hermes at {self._url}: {self._error}"
         return f"Hermes at {self._url} closed the connection before the turn completed"
+
+
+# --------------------------------------------------------------------------
+# The model picker
+# --------------------------------------------------------------------------
+
+# Asking the gateway costs a Python start-up, so the picker is given a bounded
+# wait rather than being allowed to hang the dialog open.
+MODEL_QUERY_TIMEOUT = 60.0
+
+
+def _model_rows(payload: dict) -> tuple[list[str], str]:
+    """Flatten Hermes' provider catalog into picker rows.
+
+    Hermes groups models under providers and can have the same model name in
+    more than one of them, so each row is qualified with its provider - which
+    is also the form ``/model`` accepts, meaning a picked row can be sent back
+    unchanged.
+    """
+    models: list[str] = []
+    current = ""
+    providers = payload.get("providers")
+    if not isinstance(providers, list):
+        return models, current
+    for provider in providers:
+        if not isinstance(provider, dict):
+            continue
+        slug = str(provider.get("slug") or "").strip()
+        if not slug:
+            continue
+        # An unauthenticated provider is listed so the user can see it exists,
+        # but picking one would fail at the first turn.
+        if provider.get("authenticated") is False:
+            continue
+        entries = provider.get("models")
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            name = str(entry).strip()
+            if not name:
+                continue
+            qualified = f"{slug}:{name}"
+            models.append(qualified)
+            if provider.get("is_current") and not current:
+                current = qualified
+    return models, current
+
+
+def hermes_model_options(
+    cwd: Optional[str] = None,
+) -> tuple[list[str], list[str], str, str, str]:
+    """Ask Hermes which models it can run, for BlindPilot's model picker.
+
+    Returns the same five-part shape the other backends' catalogs use:
+    models, effort levels, current model, current effort, error. Hermes exposes
+    no per-turn effort control on this protocol, so that list is always empty
+    rather than offering a setting the turn would ignore.
+    """
+    if not hermes_installed():
+        return [], [], "", "", "Hermes Agent was not found on this computer."
+
+    transport = StdioTransport(cwd or str(Path.home()))
+    try:
+        transport.start()
+    except OSError as exc:
+        return [], [], "", "", str(exc)
+
+    deadline = time.monotonic() + MODEL_QUERY_TIMEOUT
+    try:
+        ready = False
+        while time.monotonic() < deadline and not ready:
+            frame = transport.receive(0.5)
+            if frame is None:
+                continue
+            params = frame.get("params")
+            if isinstance(params, dict) and params.get("type") == "gateway.ready":
+                ready = True
+        if not ready:
+            return [], [], "", "", "Hermes did not respond in time."
+
+        transport.send({"jsonrpc": "2.0", "id": 1, "method": "model.options", "params": {}})
+        while time.monotonic() < deadline:
+            frame = transport.receive(0.5)
+            if frame is None:
+                continue
+            if frame.get("id") != 1:
+                continue
+            error = frame.get("error")
+            if isinstance(error, dict):
+                message = error.get("message")
+                return [], [], "", "", str(message or "Hermes could not list its models.")
+            result = frame.get("result")
+            if not isinstance(result, dict):
+                return [], [], "", "", "Hermes returned no model list."
+            models, current = _model_rows(result)
+            if not models:
+                return [], [], "", "", "Hermes reported no usable models."
+            return models, [], current, "", ""
+        return [], [], "", "", "Hermes did not answer the model request in time."
+    finally:
+        transport.close()

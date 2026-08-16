@@ -239,6 +239,12 @@ class BackendInfo:
     # up its context window. FreeBuff's CLI has no such command — its only
     # context control is starting a new conversation.
     supports_compaction: bool = False
+    # Whether signing in has to happen in a terminal the user can type into.
+    # Claude and Codex authenticate through a browser and report the result on
+    # exit, so BlindPilot can run them hidden and watch. Hermes' equivalent is
+    # an interactive picker: run hidden with no stdin it simply fails, so the
+    # wizard opens a real console instead of pretending to have signed in.
+    login_needs_terminal: bool = False
 
 
 BACKENDS = {
@@ -291,6 +297,7 @@ BACKENDS = {
         True,
         True,
         supports_compaction=True,
+        login_needs_terminal=True,
     ),
 }
 
