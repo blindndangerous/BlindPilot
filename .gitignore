@@ -13,3 +13,4 @@ build/
 NVIDIA Corporation/
 artifacts/
 .release-setup/
+.venv-test/

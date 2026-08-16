@@ -3,6 +3,8 @@
 BlindPilot began as Claude Code Reader. Claude's adapter remains in
 ``blindpilot_app.py``; this module contains the
 provider-neutral discovery helpers plus Codex and FreeBuff workers.
+Hermes lives in ``hermes_backend.py`` and ``hermes_worker.py``, imported
+on demand so a machine without Hermes pays nothing for it.
 
 Copyright (c) 2026 doubletaponair and BlindPilot contributors.
 Based on the original Claude Code Reader application by doubletaponair:
@@ -204,11 +206,13 @@ def hide_console_windows(roots: Optional[set[int]] = None) -> int:
 BACKEND_CLAUDE = "claude"
 BACKEND_CODEX = "codex"
 BACKEND_FREEBUFF = "freebuff"
-BACKEND_IDS = (BACKEND_CLAUDE, BACKEND_CODEX, BACKEND_FREEBUFF)
+BACKEND_HERMES = "hermes"
+BACKEND_IDS = (BACKEND_CLAUDE, BACKEND_CODEX, BACKEND_FREEBUFF, BACKEND_HERMES)
 BACKEND_LABELS = {
     BACKEND_CLAUDE: "Claude Code",
     BACKEND_CODEX: "Codex",
     BACKEND_FREEBUFF: "FreeBuff",
+    BACKEND_HERMES: "Hermes",
 }
 
 # FreeBuff has no model-list or model-selection CLI flags. Its installed
@@ -274,6 +278,20 @@ BACKENDS = {
         True,
         supports_compaction=False,
     ),
+    BACKEND_HERMES: BackendInfo(
+        BACKEND_HERMES,
+        "Hermes",
+        "hermes",
+        "See https://hermes-agent.nousresearch.com/docs",
+        ("model",),
+        True,
+        # Hermes has no per-turn reasoning-effort control on the protocol this
+        # adapter speaks; effort is a profile setting rather than a turn flag.
+        False,
+        True,
+        True,
+        supports_compaction=True,
+    ),
 }
 
 # What a "compact this conversation" turn looks like per provider: the text to
@@ -287,6 +305,10 @@ BACKENDS = {
 _COMPACTION_REQUESTS: dict[str, tuple[str, dict]] = {
     BACKEND_CLAUDE: ("/compact", {}),
     BACKEND_CODEX: ("/compact", {"compact": True}),
+    # Hermes compacts through a request of its own, like Codex. Its own name
+    # for the command is /compress; the text shown to the user says what was
+    # asked for in BlindPilot's words, and the worker acts on the flag.
+    BACKEND_HERMES: ("/compact", {"compact": True}),
 }
 
 
@@ -305,6 +327,9 @@ def normalize_backend(value: object) -> str:
         "claudecode": BACKEND_CLAUDE,
         "codex": BACKEND_CODEX,
         "freebuff": BACKEND_FREEBUFF,
+        "hermes": BACKEND_HERMES,
+        "hermesagent": BACKEND_HERMES,
+        "nous": BACKEND_HERMES,
     }
     return aliases.get(compact, BACKEND_CLAUDE)
 
@@ -343,6 +368,13 @@ def _fallback_cli_paths(name: str) -> tuple[Path, ...]:
 def find_backend_cli(backend: str) -> Optional[str]:
     """Find a provider CLI even in the restricted PATH inherited by a GUI."""
     info = BACKENDS[normalize_backend(backend)]
+    if info.id == BACKEND_HERMES:
+        # Hermes installs itself under its own home directory rather than into
+        # a shared bin, so it has a search of its own that also knows about the
+        # virtual environment the gateway is launched from.
+        from hermes_backend import find_hermes_cli
+
+        return find_hermes_cli()
     found = shutil.which(info.executable)
     if found:
         return found
@@ -370,6 +402,10 @@ def find_backend_cli(backend: str) -> Optional[str]:
 def backend_auth_ok(backend: str, timeout: int = 12) -> bool:
     """Best-effort non-interactive authentication check."""
     backend = normalize_backend(backend)
+    if backend == BACKEND_HERMES:
+        from hermes_backend import hermes_auth_ok
+
+        return hermes_auth_ok(timeout=max(timeout, 25))
     binary = find_backend_cli(backend)
     if not binary:
         return False
@@ -2370,4 +2406,11 @@ def worker_class(backend: str, claude_worker: AgentWorkerFactory) -> AgentWorker
         return CodexWorker
     if backend == BACKEND_FREEBUFF:
         return FreebuffWorker
+    if backend == BACKEND_HERMES:
+        # Imported here rather than at module scope so a machine without Hermes
+        # pays nothing for it, and an import error in the adapter cannot stop
+        # the other three backends from working.
+        from hermes_worker import HermesWorker
+
+        return HermesWorker
     return claude_worker
