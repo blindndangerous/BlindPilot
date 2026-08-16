@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import queue
 import shutil
 import subprocess
 import threading
@@ -616,6 +617,10 @@ class Transport(Protocol):
         """Release the connection."""
         ...
 
+    def connected(self) -> bool:
+        """Whether this connection can still carry another turn."""
+        ...
+
     def failure_detail(self) -> str:
         """Why the connection ended, for a message a user can act on."""
         ...
@@ -766,6 +771,15 @@ class StdioTransport:
                 except OSError:
                     pass
 
+    def connected(self) -> bool:
+        """Whether the local Hermes is still running and usable.
+
+        The counterpart of the remote check, so a caller holding a connection
+        between turns asks the same question of either transport.
+        """
+        proc = self._proc
+        return proc is not None and proc.poll() is None and not self._closed
+
     def failure_detail(self) -> str:
         detail = "\n".join(self._stderr[-6:]).strip()
         return detail or "Hermes closed the connection before the turn completed"
@@ -786,6 +800,16 @@ class WebSocketTransport:
     person configures: ``token`` for the server's session token, and
     ``ticket`` for the one-shot ticket minted after a password login on a
     server reachable from outside this machine.
+
+    The connection is read by a thread of its own, which matters for a
+    connection held between turns. A Hermes bound to a public address (the
+    case whenever it is reached over a private network) pings every 20 seconds
+    and closes a connection that does not answer within 20 more; the client
+    library only answers those pings from inside a receive call. So a
+    connection nobody is reading is dropped by the server within about half a
+    minute, and the reading thread is what keeps it alive while it waits.
+    Frames arriving with no one waiting for them queue up rather than being
+    lost, so an event that lands between turns is still there for the next one.
     """
 
     def __init__(
@@ -804,6 +828,9 @@ class WebSocketTransport:
         self._display_url = _redacted_ws_url(url)
         self._ws = None
         self._error = ""
+        self._frames: "queue.Queue[dict]" = queue.Queue()
+        self._reader: Optional[threading.Thread] = None
+        self._closing = threading.Event()
 
     def start(self) -> None:
         """Connect. Raises ``OSError`` with a message worth showing a user."""
@@ -822,10 +849,48 @@ class WebSocketTransport:
         else:
             url = _authenticated_ws_url(self._base_url, self._token, "token")
         try:
-            self._ws = create_connection(url, timeout=REMOTE_CONNECT_TIMEOUT)
+            self._ws = create_connection(
+                url,
+                timeout=REMOTE_CONNECT_TIMEOUT,
+                # The reading thread and the sending turn touch the connection
+                # from different threads, which the library only supports when
+                # asked to.
+                enable_multithread=True,
+            )
         except Exception as exc:  # noqa: BLE001 - any failure is "cannot reach it"
             self._error = str(exc)
             raise OSError(_remote_failure_message(self._display_url, exc)) from exc
+        self._closing.clear()
+        self._reader = threading.Thread(target=self._read_forever, daemon=True)
+        self._reader.start()
+
+    def _read_forever(self) -> None:
+        """Read frames into the queue for as long as the connection lives.
+
+        Reading continuously is what answers the server's keepalive pings, so
+        this is not merely a convenience: without it a connection held between
+        turns is closed by the server after about half a minute.
+        """
+        ws = self._ws
+        if ws is None:
+            return
+        while not self._closing.is_set():
+            try:
+                raw = ws.recv()
+            except Exception as exc:  # noqa: BLE001
+                if not self._closing.is_set():
+                    self._error = str(exc)
+                return
+            if not raw:
+                continue
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", "replace")
+            try:
+                self._frames.put(json.loads(raw))
+            except ValueError:
+                # Hermes speaks JSON per frame; anything else is not ours to
+                # interpret, and dropping it is better than stopping the read.
+                continue
 
     def send(self, message: dict) -> bool:
         if self._ws is None:
@@ -838,31 +903,36 @@ class WebSocketTransport:
         return True
 
     def receive(self, timeout: float) -> Optional[dict]:
-        if self._ws is None:
-            return None
+        """The next frame the reader has, or ``None`` if none arrived in time.
+
+        ``None`` is not a failure: the caller polls, and a turn spends most of
+        its time waiting. A dead connection is reported through
+        ``failure_detail`` instead, which the caller already consults.
+        """
         try:
-            self._ws.settimeout(timeout)
-            raw = self._ws.recv()
-        except Exception as exc:  # noqa: BLE001 - timeout included
-            name = type(exc).__name__
-            if "timeout" not in name.lower():
-                self._error = str(exc)
-            return None
-        if not raw:
-            return None
-        if isinstance(raw, bytes):
-            raw = raw.decode("utf-8", "replace")
-        try:
-            return json.loads(raw)
-        except ValueError:
+            return self._frames.get(timeout=max(0.0, timeout))
+        except queue.Empty:
             return None
 
     def close(self) -> None:
+        self._closing.set()
         if self._ws is not None:
             try:
                 self._ws.close()
             except Exception:  # noqa: BLE001
                 pass
+
+    def connected(self) -> bool:
+        """Whether this connection is still usable for another turn.
+
+        Consulted before a held connection is reused: a server restart or a
+        network drop is only discovered by the reading thread, which records it
+        and stops.
+        """
+        if self._ws is None or self._closing.is_set():
+            return False
+        reader = self._reader
+        return reader is not None and reader.is_alive()
 
     def failure_detail(self) -> str:
         if self._error:

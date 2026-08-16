@@ -20,6 +20,7 @@ from hermes_backend import (
     WebSocketTransport,
     hermes_installed,
 )
+from markdown_rows import complete_sentences as _complete_sentences
 
 # How long a single read may block. Short enough that cancel is felt promptly,
 # long enough not to spin: the loop simply re-reads until the turn ends.
@@ -140,6 +141,55 @@ def _describe_tool_result(result: object) -> str:
     return str(result).strip()
 
 
+class HeldConnection:
+    """One connection kept across the turns of a single conversation.
+
+    A worker is created per turn, and until now so was its connection: every
+    message paid for a login, a handshake, and a session resume, and left the
+    server reaping the abandoned session moments later. The cost is small
+    (measured at about a tenth of a second) but the reaping is noise in the
+    server's log and the reconnect is work for nothing.
+
+    So the connection outlives the worker and belongs to the conversation. It is
+    handed to each turn in turn, and only dropped when the conversation is
+    closed, when the user cancels, or when it is found dead -- in which case the
+    next turn opens a fresh one, exactly as before.
+
+    One turn runs at a time in a tab, which is what makes a single shared
+    connection safe here: the window refuses a second send while a worker is
+    alive.
+    """
+
+    def __init__(self) -> None:
+        self._transport: Optional[Transport] = None
+        self._live_session = ""
+
+    def take(self) -> tuple[Optional[Transport], str]:
+        """The connection to reuse and the live session id it was bound to.
+
+        Returns ``(None, "")`` when there is nothing usable, which is the
+        signal to connect from scratch.
+        """
+        transport = self._transport
+        if transport is None:
+            return None, ""
+        if not transport.connected():
+            self.drop()
+            return None, ""
+        return transport, self._live_session
+
+    def keep(self, transport: Optional[Transport], live_session: str) -> None:
+        self._transport = transport
+        self._live_session = live_session
+
+    def drop(self) -> None:
+        transport = self._transport
+        self._transport = None
+        self._live_session = ""
+        if transport is not None:
+            transport.close()
+
+
 class HermesWorker(threading.Thread):
     """Run one Hermes turn, reporting it through BlindPilot's callbacks.
 
@@ -161,6 +211,7 @@ class HermesWorker(threading.Thread):
         remote_token: str = "",
         remote_credential: str = "token",
         remote_username: str = "",
+        held: Optional[HeldConnection] = None,
         on_session: Callable[[str], None],
         on_started: Callable[[], None],
         on_activity: Callable[[str, str], None],
@@ -187,6 +238,12 @@ class HermesWorker(threading.Thread):
         # Only used when the credential is a password: Hermes asks for a
         # username at its login, and mints the WebSocket ticket from that.
         self._remote_username = remote_username
+        # Where the connection lives between turns. Absent (the default) the
+        # worker owns its own, so a caller that has not opted in keeps the old
+        # connect-per-turn behaviour and nothing about it changes.
+        self._held = held
+        # Whether this turn inherited a live connection rather than opening one.
+        self._reused = False
         self._on_session = on_session
         self._on_started = on_started
         self._on_activity = on_activity
@@ -202,6 +259,12 @@ class HermesWorker(threading.Thread):
         # the stored id above, which is what survives a restart.
         self._live_session = ""
         self._answer_parts: list[str] = []
+        # How much of the answer has already been handed to the window. Hermes
+        # streams the answer in fragments of a few characters, and a fragment is
+        # usually half a word: released as it arrives, a screen reader reads
+        # torn words. So a fragment is held until it completes a sentence, and
+        # only whole sentences are released while the turn is still running.
+        self._streamed = 0
         self._thinking_parts: list[str] = []
         # Hermes sends the turn's finished reasoning as one replacement event;
         # it wins over the streamed fragments when both arrive.
@@ -228,6 +291,11 @@ class HermesWorker(threading.Thread):
             # Ask Hermes to stop the turn before dropping the connection, so a
             # remote Hermes is not left working on an answer nobody will read.
             self._request("session.interrupt", {"session_id": self._gateway_session})
+        # A cancelled turn leaves the connection mid-conversation: the interrupt
+        # is answered by frames this worker will not read. Reusing it would hand
+        # those to the next turn, so the connection goes with the cancellation.
+        if self._held is not None:
+            self._held.drop()
         transport = self._transport
         if transport is not None:
             transport.close()
@@ -238,8 +306,21 @@ class HermesWorker(threading.Thread):
         finally:
             self._accepting_input.clear()
             transport = self._transport
-            if transport is not None:
+            # Hand the connection back for the next turn instead of closing it,
+            # unless the turn was cancelled or the connection did not survive.
+            keep = (
+                self._held is not None
+                and not self._cancelled
+                and transport is not None
+                and transport.connected()
+                and bool(self._live_session)
+            )
+            if keep:
+                self._held.keep(transport, self._live_session)  # type: ignore[union-attr]
+            elif transport is not None:
                 transport.close()
+                if self._held is not None:
+                    self._held.keep(None, "")
             self._on_done()
 
     # -- protocol plumbing -------------------------------------------------
@@ -273,7 +354,19 @@ class HermesWorker(threading.Thread):
         return None
 
     def _open_transport(self) -> bool:
-        """Connect, local or remote. Reports its own failure and returns False."""
+        """Connect, local or remote. Reports its own failure and returns False.
+
+        A connection held from an earlier turn is reused when it is still
+        healthy, which also carries its live session id: that turn already
+        claimed the conversation, so this one has nothing to create or resume.
+        """
+        if self._held is not None:
+            transport, live_session = self._held.take()
+            if transport is not None:
+                self._transport = transport
+                self._live_session = live_session
+                self._reused = True
+                return True
         if self._remote_url:
             transport = WebSocketTransport(
                 self._remote_url,
@@ -303,13 +396,16 @@ class HermesWorker(threading.Thread):
         if not self._open_transport():
             return
 
-        # Hermes announces itself before accepting work; waiting for that is
-        # how a client knows the far end is a Hermes gateway at all, which on
-        # the remote path is the difference between "wrong address" and "slow".
-        if self._wait_for_ready() is False:
-            return
-        if not self._ensure_session():
-            return
+        # A reused connection is past all of this: the gateway announced itself
+        # on the turn that opened it, and that turn already holds the session.
+        if not self._reused:
+            # Hermes announces itself before accepting work; waiting for that is
+            # how a client knows the far end is a Hermes gateway at all, which on
+            # the remote path is the difference between "wrong address" and "slow".
+            if self._wait_for_ready() is False:
+                return
+            if not self._ensure_session():
+                return
         if self._compact:
             self._run_compaction()
             return
@@ -496,6 +592,7 @@ class HermesWorker(threading.Thread):
             text = str(payload.get("text") or "")
             if text:
                 self._answer_parts.append(text)
+                self._release_finished_sentences()
             return None
 
         if event == "thinking.delta":
@@ -550,6 +647,29 @@ class HermesWorker(threading.Thread):
             return None
 
         return None
+
+    def _release_finished_sentences(self, final: bool = False) -> None:
+        """Hand the window every sentence the answer has finished so far.
+
+        The listener hears the answer while the model is still writing it,
+        instead of waiting for the whole turn. Only finished sentences go out:
+        the live edge of the stream is a half-written word, and half a word read
+        aloud is what makes a run sound broken. At the end of the turn nothing
+        more is coming, so ``final`` releases whatever is left as it stands.
+
+        Silent when live rows are switched off in Options -- that setting lives
+        in the window, which drops the activity, so this only spends the work.
+        """
+        pending = "".join(self._answer_parts)[self._streamed :]
+        if not pending:
+            return
+        ready = pending if final else _complete_sentences(pending)
+        if not ready:
+            return
+        self._streamed += len(ready)
+        spoken = ready.strip()
+        if spoken:
+            self._on_activity("assistant", spoken)
 
     def _tool_start(self, payload: dict) -> None:
         name = str(payload.get("name") or "tool")
@@ -606,6 +726,11 @@ class HermesWorker(threading.Thread):
     def _turn_complete(self, payload: dict) -> Optional[bool]:
         self._accepting_input.clear()
         status = str(payload.get("status") or "complete")
+        # Nothing more is coming, so the tail that never finished a sentence is
+        # released as it stands. Without this the last clause of every answer
+        # would only reach the listener through the final text, arriving after
+        # everything else it was already read.
+        self._release_finished_sentences(final=True)
         # The replacement event wins; the streamed fragments are the fallback
         # for a provider that never sends one.
         thinking = self._reasoning or "".join(self._thinking_parts).strip()

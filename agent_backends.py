@@ -28,6 +28,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Protocol, cast
 
+from markdown_rows import _SENTENCE_END_RE as _markdown_sentence_end_re
+from markdown_rows import complete_sentences
+
 
 # A windowed app owns no console, so every child process Windows considers a
 # console program is given a brand new one - a terminal that pops up on screen,
@@ -1328,14 +1331,15 @@ _FREEBUFF_FRAME_SECONDS = 0.1
 _FREEBUFF_MAX_LAG_SECONDS = 0.4
 
 # Sentence-ending punctuation, or the end of a paragraph, either of which is a
-# place a listener expects the reading to stop.
-_SENTENCE_END_RE = re.compile(r"(?s)^.*(?:[.!?:;…][\"'”’)\]]*(?=\s|$)|\n)")
+# place a listener expects the reading to stop. The definition lives in
+# ``markdown_rows`` (which depends on nothing of ours) so the Hermes worker can
+# share it without importing this module and closing an import cycle.
+_SENTENCE_END_RE = _markdown_sentence_end_re
 
 
 def _complete_sentences(text: str) -> str:
     """The part of ``text`` that reads as finished, or nothing yet."""
-    match = _SENTENCE_END_RE.search(text)
-    return match.group(0).rstrip() if match else ""
+    return complete_sentences(text)
 
 
 def _unwrap_screen_text(text: str) -> str:

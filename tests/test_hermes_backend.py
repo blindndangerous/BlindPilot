@@ -78,6 +78,9 @@ class _FakeTransport:
         self.frames = list(frames)
         self.sent: list[dict] = []
         self.closed = False
+        # Held connections ask whether a transport can carry another turn. A
+        # scripted one can until it is closed.
+        self.alive = True
 
     def send(self, message: dict) -> bool:
         self.sent.append(message)
@@ -88,6 +91,9 @@ class _FakeTransport:
 
     def close(self) -> None:
         self.closed = True
+
+    def connected(self) -> bool:
+        return self.alive and not self.closed
 
     def failure_detail(self) -> str:
         return "fake transport ended"
@@ -811,11 +817,18 @@ def test_a_password_buys_a_ticket_because_tickets_expire_in_thirty_seconds(monke
     opened = {}
 
     class _FakeSocket:
+        def recv(self):
+            # The transport reads continuously to answer the server's keepalive
+            # pings, so the fake has to be readable. Reporting the connection as
+            # finished ends that thread instead of spinning in the test.
+            raise OSError("closed")
+
         def close(self):
             return None
 
-    def _fake_create(url, timeout=None):
+    def _fake_create(url, timeout=None, **kwargs):
         opened["url"] = url
+        opened["kwargs"] = kwargs
         return _FakeSocket()
 
     monkeypatch.setitem(
@@ -1090,3 +1103,233 @@ def test_the_worker_never_blocks_forever_on_a_silent_peer():
     thread.start()
 
     assert done.wait(5) is True
+
+
+# -- streaming the answer as it is written --------------------------------
+
+
+def test_a_finished_sentence_is_released_while_the_turn_is_still_running():
+    """The listener hears the answer as it is written, not after it ends.
+
+    Hermes streams an answer in fragments of a few characters. Delivered as they
+    arrive they would read as torn words, so a fragment is held until it
+    finishes a sentence -- but once it does, it goes out immediately rather than
+    waiting for the turn.
+    """
+    rows = []
+    worker = _worker(on_activity=lambda kind, text: rows.append((kind, text)))
+
+    worker._handle_event(_event("message.delta", {"text": "The first"}))
+    worker._handle_event(_event("message.delta", {"text": " sentence"}))
+    # Nothing yet: no sentence has finished, and half a sentence read aloud is
+    # what makes a run sound broken.
+    assert rows == []
+
+    worker._handle_event(_event("message.delta", {"text": " is done. And the"}))
+    assert rows == [("assistant", "The first sentence is done.")]
+
+    # The unfinished tail is still held back.
+    assert [text for _kind, text in rows] == ["The first sentence is done."]
+
+
+def test_the_last_clause_is_released_when_the_turn_ends():
+    """An answer whose final words never finish a sentence is not swallowed."""
+    rows = []
+    completed = []
+    worker = _worker(
+        on_activity=lambda kind, text: rows.append((kind, text)),
+        on_complete=completed.append,
+    )
+    worker._handle_event(_event("message.delta", {"text": "Done. No full stop here"}))
+    worker._handle_event(_event("message.complete", {"status": "complete"}))
+
+    assert ("assistant", "Done.") in rows
+    assert ("assistant", "No full stop here") in rows
+    # The final text is still the whole answer, so nothing depends on the rows.
+    assert completed == ["Done. No full stop here"]
+
+
+def test_no_part_of_the_answer_is_streamed_twice():
+    """Every character reaches the listener exactly once.
+
+    The window guards against reading a response twice, but the worker must not
+    rely on that: re-releasing text already sent is what would make a screen
+    reader repeat clauses mid-answer.
+    """
+    rows = []
+    worker = _worker(on_activity=lambda kind, text: rows.append((kind, text)))
+    for chunk in ("One. ", "Two. ", "Three. ", "Four"):
+        worker._handle_event(_event("message.delta", {"text": chunk}))
+    worker._handle_event(_event("message.complete", {"status": "complete"}))
+
+    streamed = [text for kind, text in rows if kind == "assistant"]
+    assert " ".join(streamed) == "One. Two. Three. Four"
+
+
+# -- one connection per conversation -------------------------------------
+
+
+def test_a_held_connection_is_reused_instead_of_logging_in_again():
+    """The second turn of a conversation does not reconnect.
+
+    Reconnecting per turn costs a login, a handshake and a resume, and leaves
+    the server reaping the abandoned session moments later.
+    """
+    from hermes_worker import HeldConnection
+
+    held = HeldConnection()
+    transport = _FakeTransport([])
+    held.keep(transport, "live-1")
+
+    worker = _worker()
+    worker._held = held
+    assert worker._open_transport() is True
+
+    assert worker._transport is transport
+    assert worker._live_session == "live-1"
+    # Reused, so this turn has no session to create or resume.
+    assert worker._reused is True
+    assert transport.sent == []
+
+
+def test_a_dead_held_connection_is_replaced_rather_than_reused():
+    """A server restart between turns must not break the next message."""
+    from hermes_worker import HeldConnection
+
+    held = HeldConnection()
+    dead = _FakeTransport([])
+    dead.alive = False
+    held.keep(dead, "live-1")
+
+    assert held.take() == (None, "")
+    # And the caller is told to start from scratch, not handed the corpse.
+    worker = _worker()
+    worker._held = held
+    worker._remote_url = ""
+    assert worker._reused is False
+
+
+def test_a_finished_turn_hands_its_connection_to_the_next_one():
+    from hermes_worker import HeldConnection
+
+    held = HeldConnection()
+    worker = _worker()
+    worker._held = held
+    transport = _FakeTransport([])
+    worker._live_session = "live-1"
+    # The turn itself is not under test here, only what happens to the
+    # connection once it ends, so the turn is replaced by the state it leaves.
+    worker._do_run = lambda: setattr(worker, "_transport", transport)
+
+    worker.run()
+
+    assert transport.closed is False
+    assert held.take() == (transport, "live-1")
+
+
+def test_a_cancelled_turn_does_not_leave_its_connection_behind():
+    """The frames answering an interrupt would otherwise reach the next turn."""
+    from hermes_worker import HeldConnection
+
+    held = HeldConnection()
+    worker = _worker()
+    worker._held = held
+    transport = _FakeTransport([])
+    worker._transport = transport
+    worker._live_session = "live-1"
+    worker._gateway_session = "live-1"
+
+    worker.cancel()
+
+    assert transport.closed is True
+    assert held.take() == (None, "")
+
+
+def test_a_turn_that_never_opened_a_session_keeps_nothing():
+    """A failed connection must not be stored as if it were usable."""
+    from hermes_worker import HeldConnection
+
+    held = HeldConnection()
+    worker = _worker()
+    worker._held = held
+    transport = _FakeTransport([])
+    # Connected, but no session was ever claimed on it.
+    worker._do_run = lambda: setattr(worker, "_transport", transport)
+
+    worker.run()
+
+    assert transport.closed is True
+    assert held.take() == (None, "")
+
+
+def test_without_a_held_connection_nothing_changes():
+    """The old behaviour is intact for any caller that has not opted in."""
+    worker = _worker()
+    transport = _FakeTransport([])
+    worker._live_session = "live-1"
+    worker._do_run = lambda: setattr(worker, "_transport", transport)
+
+    worker.run()
+
+    assert worker._held is None
+    assert transport.closed is True
+
+
+def test_cancelling_releases_the_connection_and_does_not_hand_it_on():
+    """Two things at once, because the mutation test caught them separately.
+
+    An interrupt is answered by frames this worker will not read, so the
+    connection must be closed AND the held slot emptied.
+
+    The slot is inspected directly rather than through ``take()``: a closed
+    transport reports itself unusable, so ``take()`` returns nothing either way
+    and cannot tell a released slot from one still holding a corpse. That is
+    the difference a cancelled turn depends on -- a connection left in the slot
+    is one the next turn tries to adopt.
+    """
+    from hermes_worker import HeldConnection
+
+    held = HeldConnection()
+    transport = _FakeTransport([])
+    held.keep(transport, "live-1")
+
+    worker = _worker()
+    worker._held = held
+    worker._transport = transport
+    worker._live_session = "live-1"
+    worker._gateway_session = "live-1"
+
+    worker.cancel()
+
+    assert transport.closed is True
+    # The property: nothing is left in the slot at all.
+    assert held._transport is None
+    assert held._live_session == ""
+
+    # And the turn that ends after the cancellation must not put it back.
+    worker.run()
+    assert held._transport is None
+
+
+def test_a_reused_connection_does_not_create_a_second_session():
+    """The turn that opened the connection already holds the conversation.
+
+    Creating or resuming again would start a second conversation on a
+    connection already bound to one, so the answer would land somewhere the
+    user is not reading.
+    """
+    from hermes_worker import HeldConnection
+
+    held = HeldConnection()
+    transport = _FakeTransport([_event("message.complete", {"status": "complete", "text": "hi"})])
+    held.keep(transport, "live-1")
+
+    worker = _worker()
+    worker._held = held
+    worker._do_run()
+
+    methods = [message.get("method") for message in transport.sent]
+    assert "session.create" not in methods
+    assert "session.resume" not in methods
+    # It went straight to the work.
+    assert "prompt.submit" in methods

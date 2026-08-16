@@ -1612,6 +1612,37 @@ def _save_config(cfg: dict) -> None:
         pass
 
 
+CUE_LOOP = "loop"
+CUE_PERIODIC = "periodic"
+CUE_OFF = "off"
+PROGRESS_CUES = (CUE_LOOP, CUE_PERIODIC, CUE_OFF)
+
+# How often the periodic working cue plays, and the range the setting allows. A
+# cue every couple of seconds is barely different from the loop; one every few
+# minutes stops answering "is it still working".
+CUE_SECONDS_DEFAULT = 10
+CUE_SECONDS_MIN = 2
+CUE_SECONDS_MAX = 120
+
+
+def _valid_progress_cue(value: object) -> str:
+    """One of the three cue behaviours, whatever the config file holds.
+
+    A config written by a newer version, or edited by hand, must not stop the
+    app from starting, so anything unrecognised falls back to the default.
+    """
+    text = str(value or "").strip().lower()
+    return text if text in PROGRESS_CUES else CUE_PERIODIC
+
+
+def _valid_cue_seconds(value: object) -> int:
+    try:
+        seconds = int(float(value))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return CUE_SECONDS_DEFAULT
+    return max(CUE_SECONDS_MIN, min(CUE_SECONDS_MAX, seconds))
+
+
 class _Settings:
     """User preferences that change how a run is presented, saved to config.
 
@@ -1620,6 +1651,20 @@ class _Settings:
     pre-live-narration behaviour: nothing appears until the turn ends, and
     nothing is spoken. ``text_view`` swaps the responses list for a read-only
     edit field and defaults to off.
+
+    ``progress_cue`` decides how the working cue behaves while a turn runs:
+
+    ``loop``
+        the original behaviour, the cue repeating end to end for the whole turn
+    ``periodic``
+        the cue once every ``progress_cue_seconds``, so a long run still says it
+        is alive without repeating over the answer being spoken
+    ``off``
+        no working cue at all; send and received still play
+
+    ``periodic`` is the default. The cue file is under a second long, so looping
+    it means dozens of repeats per turn on top of the speech, and until now
+    there was no way to turn it down.
     """
 
     def __init__(self) -> None:
@@ -1628,6 +1673,8 @@ class _Settings:
         self.speak_live = bool(cfg.get("speak_live", True))
         self.text_view = bool(cfg.get("text_view", False))
         self.show_thinking = bool(cfg.get("show_thinking", False))
+        self.progress_cue = _valid_progress_cue(cfg.get("progress_cue"))
+        self.progress_cue_seconds = _valid_cue_seconds(cfg.get("progress_cue_seconds"))
 
     def save(self) -> None:
         cfg = _load_config()
@@ -1635,6 +1682,8 @@ class _Settings:
         cfg["speak_live"] = self.speak_live
         cfg["text_view"] = self.text_view
         cfg["show_thinking"] = self.show_thinking
+        cfg["progress_cue"] = self.progress_cue
+        cfg["progress_cue_seconds"] = self.progress_cue_seconds
         _save_config(cfg)
 
 
@@ -1806,8 +1855,21 @@ class Earcons:
         self._play_once(self.received)
 
     def start_progress(self) -> None:
+        """Signal that a turn is running, in whichever way Options asks for.
+
+        Looping a cue under a second long means dozens of repeats per turn, on
+        top of the answer being spoken, so the periodic mode plays it once and
+        then only every few seconds. ``off`` plays nothing: send and received
+        still mark the boundaries of the turn.
+        """
         self.stop_progress()
         if not self.in_progress:
+            return
+        mode = SETTINGS.progress_cue
+        if mode == CUE_OFF:
+            return
+        if mode == CUE_PERIODIC:
+            self._start_periodic(max(CUE_SECONDS_MIN, SETTINGS.progress_cue_seconds))
             return
         if self._system == "Windows":
             try:
@@ -1823,6 +1885,27 @@ class Earcons:
         self._loop_stop.clear()
         self._loop_thread = threading.Thread(target=self._loop_unix, daemon=True)
         self._loop_thread.start()
+
+    def _start_periodic(self, every_seconds: int) -> None:
+        """Play the working cue now, then again every ``every_seconds``.
+
+        One timer thread, woken by the stop event rather than by sleeping in
+        fixed steps, so ``stop_progress`` ends it immediately instead of after
+        the current interval.
+        """
+        self._loop_stop.clear()
+        self._loop_thread = threading.Thread(
+            target=self._periodic, args=(every_seconds,), daemon=True
+        )
+        self._loop_thread.start()
+
+    def _periodic(self, every_seconds: int) -> None:
+        while not self._loop_stop.is_set():
+            self._play_once(self.in_progress)
+            # Returns True the moment the turn ends, so the wait is not a
+            # fixed sleep the stop has to outlast.
+            if self._loop_stop.wait(every_seconds):
+                return
 
     def _loop_unix(self) -> None:
         player = self._unix_player()
@@ -1840,6 +1923,11 @@ class Earcons:
                 break
 
     def stop_progress(self) -> None:
+        # The periodic thread exists on every platform, so its stop is set
+        # first: on Windows the looping cue is stopped by the sound API, but a
+        # periodic cue is a thread of ours and would otherwise keep playing
+        # after the answer arrived.
+        self._loop_stop.set()
         if self._system == "Windows":
             try:
                 import winsound
@@ -1848,7 +1936,6 @@ class Earcons:
             except Exception:
                 pass
             return
-        self._loop_stop.set()
         proc = self._loop_proc
         if proc is not None and proc.poll() is None:
             try:
@@ -2586,6 +2673,11 @@ class SessionPanel(wx.Panel):
         self._session_id: Optional[str] = None
         self._session_backend = normalize_backend(self._get_backend())
         self._worker: Optional[AgentWorker] = None
+        # One Hermes connection per tab, reused by each turn of this
+        # conversation. Created on first use rather than here, so a machine
+        # without Hermes never imports its adapter -- the same reason
+        # ``worker_class`` defers that import.
+        self._held_hermes: Optional[object] = None
         # Worker callbacks arrive on a background thread. Keep them in one
         # ordered mailbox with at most one pending GUI callback; otherwise a
         # long, chatty job can flood wx's event queue and starve NVDA/key input.
@@ -2900,6 +2992,7 @@ class SessionPanel(wx.Panel):
         """Apply the model / effort to every message sent from here on."""
         if self.selected_backend() == BACKEND_FREEBUFF and model != self.model:
             self._session_id = None
+            self._drop_held_hermes()
             self._announce("FreeBuff model changed; the next message starts a new conversation.")
             # Whatever terminal was waiting was started on the old model, and
             # FreeBuff reads that at launch, so it cannot serve the new one.
@@ -3213,6 +3306,8 @@ class SessionPanel(wx.Panel):
         selected_backend = self.selected_backend()
         if selected_backend != self._session_backend:
             self._session_id = None
+            # A held Hermes connection belongs to the conversation being left.
+            self._drop_held_hermes()
             self._session_backend = selected_backend
             self.model = ""
             self.effort = ""
@@ -3251,6 +3346,13 @@ class SessionPanel(wx.Panel):
                 extra["remote_token"] = REMOTE_HERMES.key
                 extra["remote_credential"] = REMOTE_HERMES.credential
                 extra["remote_username"] = REMOTE_HERMES.username
+            # The connection belongs to the conversation, not the turn: the next
+            # message reuses it instead of logging in and resuming again.
+            if self._held_hermes is None:
+                from hermes_worker import HeldConnection
+
+                self._held_hermes = HeldConnection()
+            extra["held"] = self._held_hermes
         self._worker = worker_type(
             send_text,
             self._session_id,
@@ -3364,6 +3466,7 @@ class SessionPanel(wx.Panel):
             self._announce("Error: Stop the running task before starting a new conversation")
             return
         self._session_id = None
+        self._drop_held_hermes()
         self._turns = []
         self._rows = []
         self._displayed = []
@@ -3410,6 +3513,9 @@ class SessionPanel(wx.Panel):
         continuation of it rather than the start of something new.
         """
         self._session_id = entry.session_id
+        # The tab is now a different conversation, so any connection held for
+        # the previous one must not carry the next message.
+        self._drop_held_hermes()
         self._session_backend = normalize_backend(entry.backend)
         self._turns = [Turn(prompt=turn.prompt, response=turn.response) for turn in turns]
         self._rows = []
@@ -3440,6 +3546,19 @@ class SessionPanel(wx.Panel):
             "1 response" if self._response_count == 1 else f"{self._response_count} responses"
         )
         self._set_status(f"Resumed: {entry.title} — {responses}")
+
+    def _drop_held_hermes(self) -> None:
+        """Let go of the held Hermes connection, if this tab has one.
+
+        Called wherever the tab stops being the conversation the connection was
+        opened for: a new conversation, a restored one, a different backend.
+        The connection carries a live session id, so reusing it across that
+        boundary would send the next message into the previous conversation.
+        """
+        held = self._held_hermes
+        if held is not None:
+            held.drop()  # type: ignore[attr-defined]
+            self._held_hermes = None
 
     def _on_session_started(self, session_id: str) -> None:
         if not self._session_id:
@@ -3884,6 +4003,13 @@ class SessionPanel(wx.Panel):
         if self._worker is not None and self._worker.is_alive():
             self._worker.cancel()
             self._worker.join(timeout=3)
+        # The connection outlives a single turn, so closing the tab is what
+        # closes it. Left open it would hold a session on the server for a
+        # conversation nobody is looking at any more.
+        held = self._held_hermes
+        if held is not None:
+            held.drop()  # type: ignore[attr-defined]
+            self._held_hermes = None
 
 
 class SetupWizard(wx.Dialog):
@@ -4921,6 +5047,29 @@ class MainFrame(wx.Frame):
             "Turn both off: nothing appears or is spoken until the whole response is ready",
         )
         options_menu.AppendSeparator()
+        # Radio items rather than a checkbox: three states, and a screen reader
+        # announces which one is selected when moving through them.
+        self._cue_loop_item = options_menu.AppendRadioItem(
+            wx.ID_ANY,
+            "Working sound: &continuous",
+            "Repeat the working sound for the whole turn, the way earlier versions did",
+        )
+        self._cue_periodic_item = options_menu.AppendRadioItem(
+            wx.ID_ANY,
+            "Working sound: e&very few seconds",
+            "Play the working sound occasionally, so a long turn still says it is alive",
+        )
+        self._cue_off_item = options_menu.AppendRadioItem(
+            wx.ID_ANY,
+            "Working sound: o&ff",
+            "No working sound; the send and received sounds still play",
+        )
+        cue_interval_item = options_menu.Append(
+            wx.ID_ANY,
+            "Working sound &interval...",
+            "How many seconds between working sounds in the every-few-seconds mode",
+        )
+        options_menu.AppendSeparator()
         remote_hermes_item = options_menu.Append(
             wx.ID_ANY,
             "Re&mote Hermes...",
@@ -4930,6 +5079,11 @@ class MainFrame(wx.Frame):
         self._speak_item.Check(SETTINGS.speak_live)
         self._thinking_item.Check(SETTINGS.show_thinking)
         self._text_view_item.Check(SETTINGS.text_view)
+        {
+            CUE_LOOP: self._cue_loop_item,
+            CUE_PERIODIC: self._cue_periodic_item,
+            CUE_OFF: self._cue_off_item,
+        }[SETTINGS.progress_cue].Check(True)
         menubar.Append(options_menu, "&Options")
 
         help_menu = wx.Menu()
@@ -4952,6 +5106,14 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, lambda _e: self._toggle_speak_live(), self._speak_item)
         self.Bind(wx.EVT_MENU, lambda _e: self._toggle_show_thinking(), self._thinking_item)
         self.Bind(wx.EVT_MENU, lambda _e: self._toggle_text_view(), self._text_view_item)
+        self.Bind(wx.EVT_MENU, lambda _e: self._choose_progress_cue(CUE_LOOP), self._cue_loop_item)
+        self.Bind(
+            wx.EVT_MENU,
+            lambda _e: self._choose_progress_cue(CUE_PERIODIC),
+            self._cue_periodic_item,
+        )
+        self.Bind(wx.EVT_MENU, lambda _e: self._choose_progress_cue(CUE_OFF), self._cue_off_item)
+        self.Bind(wx.EVT_MENU, lambda _e: self._configure_cue_interval(), cue_interval_item)
         self.Bind(wx.EVT_MENU, lambda _e: self._configure_remote_hermes(), remote_hermes_item)
         self.Bind(
             wx.EVT_MENU,
@@ -5288,6 +5450,70 @@ class MainFrame(wx.Frame):
         SETTINGS.save()
         state = "on" if SETTINGS.speak_live else "off"
         self._announce_setting(f"Speaking activity aloud {state}")
+
+    def _turn_in_flight(self) -> bool:
+        """Whether the tab in front is in the middle of a turn.
+
+        Used to decide if a cue change should be applied now: the sounds belong
+        to the frame, but only a running turn has one playing.
+        """
+        page = self.notebook.GetCurrentPage()
+        worker = getattr(page, "_worker", None) if isinstance(page, SessionPanel) else None
+        return worker is not None and worker.is_alive()
+
+    def _choose_progress_cue(self, mode: str) -> None:
+        """Pick how the working sound behaves, and apply it to a running turn.
+
+        Applied at once rather than from the next turn: the setting exists
+        because the sound is intrusive, and someone reaching for it mid-turn
+        wants it to stop now.
+        """
+        SETTINGS.progress_cue = _valid_progress_cue(mode)
+        SETTINGS.save()
+        if mode == CUE_OFF:
+            self.earcons.stop_progress()
+            spoken = "off"
+        elif mode == CUE_PERIODIC:
+            spoken = f"every {SETTINGS.progress_cue_seconds} seconds"
+        else:
+            spoken = "continuous"
+        if mode != CUE_OFF and self._turn_in_flight():
+            # Restart under the new mode so a turn in flight follows the choice
+            # instead of keeping the behaviour it started with.
+            self.earcons.start_progress()
+        self._announce_setting(f"Working sound {spoken}")
+
+    def _configure_cue_interval(self) -> None:
+        """Ask how many seconds between working sounds.
+
+        A number entry rather than a set of fixed choices: what counts as too
+        often is a matter of hearing and of how long the runs are.
+        """
+        dialog = wx.NumberEntryDialog(
+            self,
+            "How many seconds between working sounds?",
+            f"Seconds ({CUE_SECONDS_MIN} to {CUE_SECONDS_MAX})",
+            "Working sound interval",
+            SETTINGS.progress_cue_seconds,
+            CUE_SECONDS_MIN,
+            CUE_SECONDS_MAX,
+        )
+        try:
+            if dialog.ShowModal() != wx.ID_OK:
+                return
+            seconds = _valid_cue_seconds(dialog.GetValue())
+        finally:
+            dialog.Destroy()
+        SETTINGS.progress_cue_seconds = seconds
+        # Choosing an interval says what the sound should do, so the mode
+        # follows: setting an interval while the sound is off or continuous
+        # would otherwise change nothing anyone can hear.
+        SETTINGS.progress_cue = CUE_PERIODIC
+        SETTINGS.save()
+        self._cue_periodic_item.Check(True)
+        if self._turn_in_flight():
+            self.earcons.start_progress()
+        self._announce_setting(f"Working sound every {seconds} seconds")
 
     def _toggle_show_thinking(self) -> None:
         SETTINGS.show_thinking = self._thinking_item.IsChecked()

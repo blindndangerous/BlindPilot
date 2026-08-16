@@ -8,6 +8,7 @@ __pycache__/
 .test-tmp/
 .tmp_*
 dist/
+dist_new/
 build/
 *.spec
 NVIDIA Corporation/

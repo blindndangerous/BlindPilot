@@ -23,7 +23,7 @@ BlindPilot is based on the original **[Claude Code Reader](https://github.com/do
 - Attaches files and pasted clipboard images as explicit prompt paths.
 - Searches responses, jumps between them, and copies a code block, a whole response, or the whole conversation.
 - Picks the model and reasoning effort from whatever the installed CLI actually reports.
-- Marks sent, working, and received with earcons, so a long run is audible without being spoken.
+- Marks sent, working, and received with earcons, so a long run is audible without being spoken. The working cue can be left continuous, played every few seconds, or switched off (**Options → Working sound**).
 - Installs, updates, adds to PATH, and signs into any of the three backends from an accessible wizard.
 - Updates itself from GitHub Releases after verifying the published SHA-256.
 
@@ -38,7 +38,7 @@ BlindPilot is based on the original **[Claude Code Reader](https://github.com/do
 
 FreeBuff ships no JSON or headless API, so BlindPilot runs its terminal interface in a hidden pseudo-terminal, reads the answer off its screen a finished sentence at a time, and captures its chat id so the conversation can be resumed. Terminal redraws and advertisements are filtered out before anything is spoken. Its permission picker and Compact Conversation are disabled because the FreeBuff CLI has no equivalent.
 
-Hermes speaks its gateway JSON-RPC, which runs over both a local pipe and a network socket — so a Hermes on another computer can be driven from the desktop without a terminal (**Options → Remote Hermes**). Its reasoning channel carries a terminal spinner rather than the model's reasoning, so that is filtered out and the real reasoning shown instead. Hermes exposes no per-turn reasoning effort on this protocol, so that picker stays empty.
+Hermes speaks its gateway JSON-RPC, which runs over both a local pipe and a network socket — so a Hermes on another computer can be driven from the desktop without a terminal (**Options → Remote Hermes**). Its answers are streamed a finished sentence at a time, the way FreeBuff's are, so a long turn is read while it is still being written. One connection is kept for the whole conversation rather than opened per message, and it is read continuously: a Hermes bound to a public address pings every twenty seconds and closes a connection that does not answer. Its reasoning channel carries a terminal spinner rather than the model's reasoning, so that is filtered out and the real reasoning shown instead. Hermes exposes no per-turn reasoning effort on this protocol, so that picker stays empty.
 
 ## Download and install
 
