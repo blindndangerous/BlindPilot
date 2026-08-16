@@ -3,10 +3,11 @@
 Every backend BlindPilot drives already keeps its own transcript of each
 conversation, and every one of them can be resumed by id — Claude Code with
 ``--resume``, Codex with the app-server's ``thread/resume``, FreeBuff with
-``--continue``. What was missing was a way to *find* one again, which is what
-this module provides: one list of past conversations across the three
-backends, each titled by its first message, plus a reader that turns any of
-them back into prompt-and-response turns the GUI can put in its rows.
+``--continue``, Hermes with its gateway's ``session.resume``. What was missing
+was a way to *find* one again, which is what this module provides: one list of
+past conversations across the backends, each titled by its first message, plus
+a reader that turns any of them back into prompt-and-response turns the GUI can
+put in its rows.
 
 Where each backend keeps its history:
 
@@ -19,6 +20,10 @@ Where each backend keeps its history:
 * FreeBuff — ``~/.config/manicode/projects/<project>/chats/<chat-id>/``, a
   directory per conversation holding ``chat-messages.json`` and a
   ``chat-meta.json`` that already stores the first prompt.
+* Hermes — ``~/.hermes/state.db``, one SQLite database holding every session it
+  has ever run, opened read-only. It is the odd one out: there is no file per
+  conversation, and Hermes titles its own, so nothing has to be scanned to
+  build the list.
 
 Listing is deliberately cheap: it reads only as far into a transcript as it
 takes to find the first real user message, because the newest conversations
@@ -48,6 +53,7 @@ from agent_backends import (
     BACKEND_CLAUDE,
     BACKEND_CODEX,
     BACKEND_FREEBUFF,
+    BACKEND_HERMES,
     BACKEND_IDS,
     normalize_backend,
 )
@@ -395,6 +401,167 @@ def _codex_turns(path: Path) -> List[HistoryTurn]:
     return turns
 
 
+# ----- Hermes -----
+#
+# Hermes is the one backend that does not keep a file per conversation: every
+# session it has ever run lives in one SQLite database. Two consequences shape
+# the code below.
+#
+# First, the database is opened read-only and queried, rather than parsed. It
+# is Hermes' own live store — the file a running Hermes is writing to — so this
+# never opens it for writing and never runs anything that could block a writer.
+#
+# Second, ``path`` on a Hermes entry is that shared database, so the size guard
+# in ``load_turns`` cannot apply to it: a busy Hermes' store passes tens of
+# megabytes quickly (2 GB is ordinary on a machine that has run it for months),
+# and applying a per-transcript limit to a shared store would silently hide
+# every Hermes conversation. The equivalent protection here is a row limit on
+# the query, which bounds the work regardless of how large the store has grown.
+
+# Rows read back for one conversation. Comfortably more than any conversation a
+# person scrolls through, and it keeps a runaway session from freezing the GUI.
+_HERMES_MAX_ROWS = 4000
+
+# Hermes writes its own bookkeeping into the transcript alongside the
+# conversation. Only "user" and "assistant" rows are ever turned into turns
+# below, so tool traffic is already excluded by that; these are the roles worth
+# skipping before the work of decoding a row happens at all.
+_HERMES_SKIP_ROLES = ("system", "session_meta", "tool")
+# Rows Hermes marks as not for replay.
+_HERMES_HIDDEN_KIND = "hidden"
+
+
+def _hermes_db_path() -> Path:
+    """Hermes' session store. Its home honours HERMES_HOME, like Hermes does."""
+    override = os.environ.get("HERMES_HOME", "").strip()
+    root = Path(override).expanduser() if override else _home() / ".hermes"
+    return root / "state.db"
+
+
+def _hermes_connect(path: Path):
+    """Open Hermes' store read-only, or return None if it cannot be read.
+
+    Read-only matters: this is the database a running Hermes owns. The URI form
+    fails outright rather than creating an empty file when the path is wrong,
+    which is what a plain connect() would do.
+    """
+    if not path.is_file():
+        return None
+    try:
+        import sqlite3
+
+        connection = sqlite3.connect(f"file:{path}?mode=ro&immutable=0", uri=True, timeout=5.0)
+        connection.row_factory = sqlite3.Row
+        return connection
+    except Exception:  # noqa: BLE001 - a locked or corrupt store is just absent
+        return None
+
+
+def _hermes_entries(cwd: Optional[str]) -> List[HistoryEntry]:
+    path = _hermes_db_path()
+    connection = _hermes_connect(path)
+    if connection is None:
+        return []
+    modified = _mtime(path)
+    entries: List[HistoryEntry] = []
+    try:
+        # Hermes titles its own conversations, so unlike the other backends
+        # there is no transcript to scan for a first message. Sessions with no
+        # messages are skipped: they are starts that never went anywhere.
+        rows = connection.execute(
+            """
+            SELECT id, title, cwd, started_at, last_activity_at, message_count
+            FROM sessions
+            WHERE COALESCE(archived, 0) = 0 AND COALESCE(message_count, 0) > 0
+            ORDER BY COALESCE(last_activity_at, started_at) DESC
+            LIMIT 500
+            """
+        ).fetchall()
+    except Exception:  # noqa: BLE001 - an older schema is not a crash
+        return []
+    finally:
+        connection.close()
+
+    for row in rows:
+        session_id = str(row["id"] or "")
+        if not session_id:
+            continue
+        session_cwd = str(row["cwd"] or "")
+        if cwd and not _same_dir(session_cwd, cwd):
+            continue
+        title = make_title(clean_user_text(str(row["title"] or "")))
+        if not title:
+            title = session_id
+        # Prefer the session's own last-activity time over the file's mtime:
+        # one shared store means every conversation would otherwise appear to
+        # have been touched at the same moment, and the list is sorted by this.
+        stamp = row["last_activity_at"] or row["started_at"] or modified
+        entries.append(
+            HistoryEntry(
+                backend=BACKEND_HERMES,
+                session_id=session_id,
+                title=title,
+                path=str(path),
+                modified=float(stamp),
+                cwd=session_cwd,
+                folder=_folder_name(session_cwd),
+            )
+        )
+    return entries
+
+
+def _hermes_turns_for(session_id: str, path: Optional[Path] = None) -> List[HistoryTurn]:
+    """Read one Hermes conversation back as prompt-and-response turns."""
+    store = path or _hermes_db_path()
+    connection = _hermes_connect(store)
+    if connection is None:
+        return []
+    try:
+        rows = connection.execute(
+            """
+            SELECT role, content, display_kind
+            FROM messages
+            WHERE session_id = ?
+            ORDER BY id
+            LIMIT ?
+            """,
+            (session_id, _HERMES_MAX_ROWS),
+        ).fetchall()
+    except Exception:  # noqa: BLE001
+        return []
+    finally:
+        connection.close()
+
+    turns: List[HistoryTurn] = []
+    for row in rows:
+        role = str(row["role"] or "")
+        if role in _HERMES_SKIP_ROLES:
+            continue
+        if str(row["display_kind"] or "") == _HERMES_HIDDEN_KIND:
+            continue
+        text = str(row["content"] or "").strip()
+        if not text:
+            # A turn that only called tools has no text of its own; the tool
+            # rows themselves are Hermes' bookkeeping, not the conversation.
+            continue
+        if role == "user":
+            turns.append(HistoryTurn(prompt=clean_user_text(text)))
+        elif role == "assistant":
+            if not turns:
+                turns.append(HistoryTurn())
+            turns[-1].response = _append(turns[-1].response, text)
+    return turns
+
+
+def _hermes_turns(path: Path) -> List[HistoryTurn]:
+    """Reader signature the public API uses. See :func:`load_turns`.
+
+    Hermes' entries all share one database, so the session id has to come from
+    the entry rather than the path; ``load_turns`` passes it through.
+    """
+    return _hermes_turns_for("", path)
+
+
 # ----- FreeBuff -----
 
 
@@ -535,12 +702,14 @@ _LISTERS = {
     BACKEND_CLAUDE: _claude_entries,
     BACKEND_CODEX: _codex_entries,
     BACKEND_FREEBUFF: _freebuff_entries,
+    BACKEND_HERMES: _hermes_entries,
 }
 
 _READERS = {
     BACKEND_CLAUDE: _claude_turns,
     BACKEND_CODEX: _codex_turns,
     BACKEND_FREEBUFF: _freebuff_turns,
+    BACKEND_HERMES: _hermes_turns,
 }
 
 
@@ -580,10 +749,25 @@ def load_turns(entry: HistoryEntry) -> List[HistoryTurn]:
     Turns with neither a prompt nor an answer are dropped, so an aborted run
     does not leave an empty response in the list.
     """
-    reader = _READERS.get(normalize_backend(entry.backend))
+    backend = normalize_backend(entry.backend)
+    path = Path(entry.path)
+    if backend == BACKEND_HERMES:
+        # Hermes keeps every conversation in one store, so which one to read
+        # comes from the entry, and the per-transcript size guard below cannot
+        # apply: the shared store passes that limit on any machine that has
+        # used Hermes for a while, and applying it would hide all of them. The
+        # row limit inside the reader is what bounds the work instead.
+        try:
+            return [
+                turn
+                for turn in _hermes_turns_for(entry.session_id, path)
+                if turn.prompt.strip() or turn.response.strip()
+            ]
+        except OSError:
+            return []
+    reader = _READERS.get(backend)
     if reader is None:
         return []
-    path = Path(entry.path)
     try:
         if path.is_file() and path.stat().st_size > _MAX_TRANSCRIPT_BYTES:
             return []
