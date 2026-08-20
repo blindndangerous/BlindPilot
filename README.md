@@ -17,7 +17,8 @@ BlindPilot is based on the original **[Claude Code Reader](https://github.com/do
 - Reads answers aloud as they arrive, or stays quiet until the whole answer is ready.
 - Reopens past conversations from any backend, titled by the message that started them, and carries on where they left off.
 - Compacts a long conversation in place so the backend has room to keep going.
-- Runs several project sessions at once, each with its own conversation, folder, model, and permission mode.
+- Runs several project sessions at once, each in its own tab named after the conversation in it, with its own folder, model, and permission mode. **Ctrl+Tab** moves between them.
+- Runs every backend fully automatic by default: nothing stops mid-task to ask permission, because a question nobody is watching for is a task that never finishes.
 - Steers a task while it is still running, or stops it outright and keeps what it produced.
 - Attaches files and pasted clipboard images as explicit prompt paths.
 - Searches responses, jumps between them, and copies a code block, a whole response, or the whole conversation.
@@ -92,7 +93,8 @@ opencode reaches a model through a provider you connect to it, so BlindPilot car
 - **Ctrl+F** search responses, **Ctrl+R** jump to the latest.
 - **Ctrl+/** slash commands, **Ctrl+.** stop the running task.
 - **Ctrl+Shift+A** attach files, **Ctrl+Shift+M** cycle permission modes.
-- **Ctrl+Shift+[** and **Ctrl+Shift+]** move between sessions; **Ctrl+1** to **Ctrl+9** jump straight to one.
+- **Ctrl+Tab** and **Ctrl+Shift+Tab** move between session tabs, as do **Ctrl+Shift+]** and
+  **Ctrl+Shift+[**; **Ctrl+1** to **Ctrl+9** jump straight to one.
 - **Up** from the prompt's first line enters the newest response. At either end,
   arrow keys stay in the responses; press **Tab** to move to the prompt.
 

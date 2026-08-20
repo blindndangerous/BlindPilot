@@ -4,6 +4,16 @@ Readable release history for BlindPilot. When adjacent releases were part of the
 same fix stream, they are combined with a version range such as
 `v0.3.6-v0.3.7`.
 
+## v0.5.0 - 2026-08-20
+
+- Sessions are real tabs. The window's session book is a native tab control now, so a screen reader announces "tab 2 of 4" and the name of the conversation in it, and **Ctrl+Tab** and **Ctrl+Shift+Tab** move between them from anywhere in the window — including from inside the prompt box. The session dropdown stays, for reaching tab 9 of 12 without stepping through the eight in between.
+- A tab is named after the conversation in it, from the moment there is one. The first message names the conversation — the same title Recent Conversations lists it under — and that name goes on the tab. A tab whose conversation has not started yet, or that has just been cleared, falls back to its folder. Two tabs open on the same folder are no longer two tabs with the same name.
+- Every backend starts fully automatic. Bypass-permissions is where a new tab starts and where the quick-cycle chord returns to, so a run never stops mid-task to ask for something nobody was watching for. An existing installation is moved onto it once, on the first launch after upgrading; a mode chosen in the picker afterwards is left exactly where it was put.
+- Activity from a background tab no longer speaks over the tab being read. The check for "is this the tab in front" tested for a control the window did not use, so it never matched and every tab narrated at once.
+- Arrowing along the tab strip keeps focus on the strip. Changing page used to move focus into the prompt, which meant the second arrow press never reached the tabs.
+- Adding a session no longer sets the session dropdown to a row it does not have yet.
+- The permission picker is greyed out from what a backend actually supports rather than from FreeBuff's name, and says so in its own words.
+
 ## v0.4.0 - 2026-08-19
 
 - opencode is a backend, and it does everything the others do: streaming answers, steering a turn while it runs, stopping one, permission modes, compaction, and reopening a past conversation to carry on with it. It is picked from File → Backend like the rest, and installed, updated, and signed into from the same wizard.

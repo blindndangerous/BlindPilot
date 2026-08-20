@@ -13,3 +13,5 @@ build/
 NVIDIA Corporation/
 artifacts/
 .release-setup/
+.freebuff/
+.ruff_cache/

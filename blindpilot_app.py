@@ -105,6 +105,7 @@ from session_history import (
     describe_age,
     list_history,
     load_turns,
+    make_title,
 )
 
 # Optional macOS-only path for posting NSAccessibility announcements so
@@ -184,7 +185,7 @@ def announce(text: str) -> None:
 
 
 APP_NAME = "BlindPilot"
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.5.0"
 
 # Streamed coding-agent output can arrive much faster than a native list and a
 # screen reader can consume it. Process a bounded number of events per GUI turn
@@ -1356,60 +1357,48 @@ def _slash_commands_for_backend(backend: str, cwd: Optional[str] = None) -> list
     return commands
 
 
-_CYCLE_VALUES = ["default", "acceptEdits", "plan"]
+# BlindPilot runs its backends hands-off: a run that stops to ask a question
+# nobody is watching for is a run that never finishes. "bypassPermissions" is
+# what "never stop to ask" means to every provider that has such a mode, so it
+# is where a new tab starts and where the quick-cycle chord returns to.
+DEFAULT_PERMISSION_MODE = "bypassPermissions"
+
+_CYCLE_VALUES = [DEFAULT_PERMISSION_MODE, "acceptEdits", "plan"]
 _MODE_LABELS = [label for _v, label, _d in PERMISSION_MODES]
 _MODE_VALUES = [value for value, _l, _d in PERMISSION_MODES]
 _MODE_DESCRIPTIONS = {value: desc for value, _l, desc in PERMISSION_MODES}
-
-
-def _claude_settings_files(cwd: str) -> List[Path]:
-    """Claude Code's own settings files, lowest precedence first.
-
-    Same order the CLI itself uses: your user settings, then the project's
-    checked-in settings, then the project's local (git-ignored) settings.
-    """
-    user_dir = os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
-    project = Path(cwd) / ".claude"
-    return [
-        Path(user_dir) / "settings.json",
-        project / "settings.json",
-        project / "settings.local.json",
-    ]
-
-
-def _claude_config_permission_mode(cwd: str) -> str:
-    """``permissions.defaultMode`` from Claude Code's settings, or "" if unset."""
-    found = ""
-    for path in _claude_settings_files(cwd):
-        try:
-            with open(path, "r", encoding="utf-8-sig") as fh:
-                data = json.load(fh)
-        except (OSError, ValueError):
-            continue
-        if not isinstance(data, dict):
-            continue
-        perms = data.get("permissions")
-        if not isinstance(perms, dict):
-            continue
-        mode = perms.get("defaultMode")
-        if isinstance(mode, str) and mode in _MODE_VALUES:
-            found = mode  # later file wins
-    return found
 
 
 def _default_permission_mode(cwd: str, backend: str = BACKEND_CLAUDE) -> str:
     """The mode a new session tab starts in.
 
     Your last choice in this app wins, because it was made deliberately.
-    Failing that we use whatever Claude Code itself is configured to use, so
-    the app matches the CLI instead of always starting at "default".
+    Failing that every backend starts fully automatic: BlindPilot is driven by
+    ear, and a backend that stops mid-run to ask permission stops a run its
+    user cannot see is waiting.
+
+    ``cwd`` and ``backend`` are what a per-directory or per-provider default
+    would key off; neither changes the answer today, and both are kept so the
+    call sites do not have to change if one ever does.
     """
     saved = _load_config().get("permission_mode")
     if isinstance(saved, str) and saved in _MODE_VALUES:
         return saved
-    if normalize_backend(backend) == BACKEND_CLAUDE:
-        return _claude_config_permission_mode(cwd) or "default"
-    return "default"
+    return DEFAULT_PERMISSION_MODE
+
+
+def adopt_full_auto_default(config: dict) -> bool:
+    """Move a config written before full-auto was the default onto it.
+
+    Returns whether ``config`` was changed. Only a mode saved by an older
+    BlindPilot is moved: once this has run, a mode chosen in the picker is
+    the user's and is left exactly where they put it.
+    """
+    if config.get("permission_default") == DEFAULT_PERMISSION_MODE:
+        return False
+    config["permission_default"] = DEFAULT_PERMISSION_MODE
+    config["permission_mode"] = DEFAULT_PERMISSION_MODE
+    return True
 
 
 def _remember_permission_mode(value: str) -> None:
@@ -1437,11 +1426,21 @@ def _short_label(path: str) -> str:
 
 
 def _tab_title(text: str, limit: int = 32) -> str:
-    """Tab label for a resumed conversation: its first message, cut to fit."""
+    """A conversation's name, cut to something a tab strip can show."""
     flat = " ".join((text or "").split())
     if len(flat) <= limit:
         return flat
     return flat[: limit - 1].rstrip() + "…"
+
+
+def _tab_label(title: str, cwd: str) -> str:
+    """What a tab is called.
+
+    The conversation in it, which is the one thing that tells two tabs in the
+    same folder apart. A conversation has no name until its first message, so
+    until then the folder is the most useful thing the tab can say.
+    """
+    return _tab_title(title) or _short_label(cwd)
 
 
 def _tool_use_label(name: str, params: dict) -> str:
@@ -2784,7 +2783,8 @@ class SessionPanel(wx.Panel):
     row. Arrow keys remain within the responses, including at the first and last
     rows; Tab is the way to move between the list and the prompt.
 
-    `on_status(panel, text)` lets the frame show only the active tab's status.
+    `on_status(panel, text)` lets the frame show only the active tab's status,
+    and `on_title(panel, text)` names the tab after the conversation in it.
     """
 
     def __init__(
@@ -2792,6 +2792,7 @@ class SessionPanel(wx.Panel):
         parent: wx.Window,
         cwd: str,
         on_status: Callable[["SessionPanel", str], None],
+        on_title: Callable[["SessionPanel", str], None],
         earcons: "Earcons",
         on_side_chat: Callable[[str, str], None],
         get_backend: Callable[[], str],
@@ -2799,6 +2800,7 @@ class SessionPanel(wx.Panel):
         super().__init__(parent)
         self.cwd = cwd
         self._on_status = on_status
+        self._on_title = on_title
         self._earcons = earcons
         self._on_side_chat = on_side_chat
         self._get_backend = get_backend
@@ -3049,7 +3051,7 @@ class SessionPanel(wx.Panel):
             # now spends that wait while the user is still typing. The probe is
             # what starts it, and it caches its answer for /model as well.
             self.warm_model_probe()
-        supports_permissions = selected != BACKEND_FREEBUFF
+        supports_permissions = BACKENDS[selected].supports_permissions
         self.mode_picker.Enable(supports_permissions)
         if supports_permissions:
             self.mode_picker.SetToolTip(
@@ -3057,7 +3059,9 @@ class SessionPanel(wx.Panel):
             )
         else:
             self.mode_picker.SetToolTip(
-                "FreeBuff does not expose permission modes through its command-line interface"
+                f"{backend_label(selected)} does not expose permission modes through "
+                "its command-line interface — it never stops to ask, so there is "
+                "nothing here to choose"
             )
         self.Layout()
 
@@ -3162,7 +3166,11 @@ class SessionPanel(wx.Panel):
         self.prompt.SetFocus()
 
     def cycle_mode(self) -> None:
-        """Quick-cycle the everyday subset (default → accept edits → plan)."""
+        """Quick-cycle the everyday subset (full auto → accept edits → plan).
+
+        Full auto comes first, and is where a mode outside the subset lands, so
+        the chord always has a way back to the mode nothing interrupts.
+        """
         if self.mode in _CYCLE_VALUES:
             nxt = _CYCLE_VALUES[(_CYCLE_VALUES.index(self.mode) + 1) % len(_CYCLE_VALUES)]
         else:
@@ -3480,6 +3488,12 @@ class SessionPanel(wx.Panel):
 
         send_text = self._build_send_text(prompt)
         self._turns.append(Turn(prompt=prompt))
+        if len(self._turns) == 1:
+            # A conversation is named by its first message — that is the title
+            # Recent Conversations lists it under — so the tab holding it takes
+            # the same name the moment there is one. Attachment paths are left
+            # out: the title has to be the words the person typed.
+            self._on_title(self, make_title(prompt))
         self._assistant_narrated_this_turn = False
         self._streamed_assistant = ""
         self._stopping = False
@@ -3615,6 +3629,9 @@ class SessionPanel(wx.Panel):
         self._stream_response = None
         self._streamed_assistant = ""
         self._refresh_list()
+        # Nothing has been said in this conversation yet, so it has no name;
+        # the tab falls back to the folder until the first message gives it one.
+        self._on_title(self, "")
         self._announce("New conversation started. The previous one is in Recent Conversations")
 
     def compact_conversation(self) -> None:
@@ -3677,6 +3694,7 @@ class SessionPanel(wx.Panel):
                 )
             self._rows.extend(parse_response(turn.response, number))
         self._refresh_list()
+        self._on_title(self, entry.title)
         # Picks up the restored session: relabels the backend line, and gives
         # FreeBuff's terminal a head start on the conversation being resumed.
         self.backend_changed()
@@ -3759,9 +3777,9 @@ class SessionPanel(wx.Panel):
             )
             self._say(flat)
         else:
-            # Reuse the Markdown segmenter; drop its header (index 0) since this
-            # turn already has one. The first row of each incoming message is
-            # Mark the first row with the active backend, the way "You:" marks
+            # Reuse the Markdown segmenter; drop its header (index 0) since
+            # this turn already has one. The first row of each incoming message
+            # is marked with the active backend's name, the way "You:" marks
             # the user's own messages.
             speaker = backend_label(self._session_backend)
             segments = parse_response(text, n)[1:]
@@ -3784,8 +3802,8 @@ class SessionPanel(wx.Panel):
         self._set_status(text[:99] + "…" if len(text) > 100 else text)
         if not SETTINGS.speak_live:
             return False
-        notebook = self.GetParent()
-        if isinstance(notebook, wx.Notebook) and notebook.GetCurrentPage() is not self:
+        book = self.GetParent()
+        if isinstance(book, wx.BookCtrlBase) and book.GetCurrentPage() is not self:
             return False
         announce(text)
         return True
@@ -4902,6 +4920,20 @@ class MainFrame(wx.Frame):
             "Search the responses in this session",
         )
         file_menu.AppendSeparator()
+        # No "\t" in these two labels on purpose: that would register a menu
+        # accelerator, and Windows will not fire one whose key is Tab. The
+        # accelerator table below carries the chord; the label just says it.
+        next_tab_item = file_menu.Append(
+            wx.ID_ANY,
+            "Ne&xt Session (Ctrl+Tab)",
+            "Move to the next conversation tab",
+        )
+        prev_tab_item = file_menu.Append(
+            wx.ID_ANY,
+            "Previo&us Session (Ctrl+Shift+Tab)",
+            "Move to the previous conversation tab",
+        )
+        file_menu.AppendSeparator()
         close_item = file_menu.Append(
             wx.ID_CLOSE, "&Close Session\tCtrl+W", "Close the current session tab"
         )
@@ -4980,6 +5012,8 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, lambda _e: self._create_desktop_shortcut(), desktop_item)
         self.Bind(wx.EVT_MENU, lambda _e: self._stop_active(), stop_item)
         self.Bind(wx.EVT_MENU, lambda _e: self._find_active(), find_item)
+        self.Bind(wx.EVT_MENU, lambda _e: self._cycle_tab(+1), next_tab_item)
+        self.Bind(wx.EVT_MENU, lambda _e: self._cycle_tab(-1), prev_tab_item)
         self.Bind(wx.EVT_MENU, lambda _e: self._close_current_session(), close_item)
         self.Bind(wx.EVT_MENU, lambda _e: self.Close(), quit_item)
         self.Bind(wx.EVT_MENU, lambda _e: self._show_about(), about_item)
@@ -4998,9 +5032,12 @@ class MainFrame(wx.Frame):
         picker_row.Add(session_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
         picker_row.Add(self.session_picker, 1, wx.ALIGN_CENTER_VERTICAL)
 
-        # Simplebook = a notebook with no visible tab strip; the dropdown is
-        # the user-facing way to switch sessions.
-        self.notebook = wx.Simplebook(root)
+        # A real notebook, so the tab strip is a native tab control: NVDA and
+        # VoiceOver both announce "tab 2 of 4" and the name of the conversation
+        # in it, and Ctrl+Tab moves between them the way it does everywhere
+        # else. The dropdown above stays as the way to reach tab 9 of 12
+        # without stepping through the eight in between.
+        self.notebook = wx.Notebook(root, style=wx.NB_TOP)
         self.notebook.SetName("Sessions")
         self.notebook.Bind(wx.EVT_BOOKCTRL_PAGE_CHANGED, self._on_tab_changed)
 
@@ -5012,8 +5049,13 @@ class MainFrame(wx.Frame):
         self._set_status_text("Ready")
 
         # Shortcuts. Cmd+L / Cmd+F focus the active tab's prompt / search.
-        # Cmd+Shift+] and Cmd+Shift+[ move between tabs (Mac-standard).
-        # Cmd+1..9 jump directly to tab N.
+        # Ctrl+Tab and Ctrl+Shift+Tab move between tabs, which is what every
+        # other tabbed application does; Cmd+Shift+] and Cmd+Shift+[ do the
+        # same and are what a Mac user reaches for. Cmd+1..9 jump straight to
+        # tab N. Tab shortcuts have to live in the accelerator table rather
+        # than on a menu item: Windows menus will not accept Tab as an
+        # accelerator key, so a tab-prefixed label would be shown and never
+        # fire. The menu items below therefore name the chord in their text.
         id_focus_prompt = wx.NewIdRef()
         id_next_tab = wx.NewIdRef()
         id_prev_tab = wx.NewIdRef()
@@ -5031,6 +5073,8 @@ class MainFrame(wx.Frame):
 
         accel_entries = [
             wx.AcceleratorEntry(wx.ACCEL_CMD, ord("L"), id_focus_prompt),
+            wx.AcceleratorEntry(wx.ACCEL_CTRL, wx.WXK_TAB, id_next_tab),
+            wx.AcceleratorEntry(wx.ACCEL_CTRL | wx.ACCEL_SHIFT, wx.WXK_TAB, id_prev_tab),
             wx.AcceleratorEntry(wx.ACCEL_CMD | wx.ACCEL_SHIFT, ord("]"), id_next_tab),
             wx.AcceleratorEntry(wx.ACCEL_CMD | wx.ACCEL_SHIFT, ord("["), id_prev_tab),
             wx.AcceleratorEntry(wx.ACCEL_CMD | wx.ACCEL_SHIFT, ord("M"), id_cycle_mode),
@@ -5247,11 +5291,12 @@ class MainFrame(wx.Frame):
             self.notebook,
             cwd,
             on_status=self._panel_status_changed,
+            on_title=self._panel_title_changed,
             earcons=self.earcons,
             on_side_chat=self._open_side_chat,
             get_backend=self.current_backend,
         )
-        self.notebook.AddPage(panel, _short_label(cwd), select=True)
+        self.notebook.AddPage(panel, _tab_label("", cwd), select=True)
         self._refresh_picker()
         # Model catalogs are intentionally lazy. FreeBuff's installed catalog
         # is embedded in a large executable, and scanning it here caused a
@@ -5395,14 +5440,10 @@ class MainFrame(wx.Frame):
             self._set_backend(entry.backend)
         cwd = entry.cwd if entry.cwd and os.path.isdir(entry.cwd) else self._history_cwd()
         panel = self._add_session(cwd)
+        # restore_history reports the conversation's name, which is what
+        # renames the tab: that title is what tells this conversation apart
+        # from the others open in the same folder.
         panel.restore_history(entry, turns)
-        # The first message names the tab, because that is what tells this
-        # conversation apart from the others open in the same folder.
-        # _add_session selects the page it adds, so that is the one to rename.
-        self.notebook.SetPageText(
-            self.notebook.GetSelection(), _tab_title(entry.title) or _short_label(cwd)
-        )
-        self._refresh_picker()
         responses = "1 response" if len(turns) == 1 else f"{len(turns)} responses"
         wx.CallAfter(announce, f"Resumed {entry.title}, {responses}")
 
@@ -5466,14 +5507,32 @@ class MainFrame(wx.Frame):
 
     def _on_tab_changed(self, event: wx.BookCtrlEvent) -> None:
         event.Skip()
-        # Keep the picker selection mirroring the notebook.
+        # Keep the picker selection mirroring the notebook. Adding a page
+        # selects it, and that fires this before the picker has been rebuilt,
+        # so the new tab's index is one the picker does not have a row for yet
+        # — _refresh_picker sets it a moment later.
         sel = self.notebook.GetSelection()
-        if sel != wx.NOT_FOUND and self.session_picker.GetSelection() != sel:
+        if 0 <= sel < self.session_picker.GetCount() and self.session_picker.GetSelection() != sel:
             self.session_picker.SetSelection(sel)
         page = self.notebook.GetCurrentPage()
-        if isinstance(page, SessionPanel):
-            self._set_status_text(page.last_status)
-            wx.CallAfter(announce, f"Session: {_short_label(page.cwd)}")
+        if not isinstance(page, SessionPanel) or sel == wx.NOT_FOUND:
+            return
+        self._set_status_text(page.last_status)
+        # The tab's own name first — it is the conversation, and that is what
+        # tells two tabs in the same folder apart — then which tab of how many,
+        # then the folder it runs in.
+        name = self.notebook.GetPageText(sel)
+        folder = _short_label(page.cwd)
+        spoken = name if name and name != folder else folder
+        wx.CallAfter(
+            announce,
+            f"Session {sel + 1} of {self.notebook.GetPageCount()}: {spoken}, in {folder}",
+        )
+        # Arrowing along the tab strip changes the page on every keypress. The
+        # strip has to keep focus through that, or the second arrow press never
+        # reaches it; focus follows the page only when the change came from
+        # somewhere else — a chord, the dropdown, a tab opening or closing.
+        if wx.Window.FindFocus() is not self.notebook:
             wx.CallAfter(page.focus_prompt)
 
     # ----- Status routing -----
@@ -5484,6 +5543,23 @@ class MainFrame(wx.Frame):
         # Only show the status bar message for the currently visible tab.
         if self.notebook.GetCurrentPage() is panel:
             self._set_status_text(text)
+
+    def _panel_title_changed(self, panel: SessionPanel, title: str) -> None:
+        """Name a tab after the conversation in it.
+
+        An empty title means the conversation has no name yet, which is when
+        the folder is the most useful thing the tab can say. The page is found
+        by identity rather than by the current selection: a background tab can
+        finish restoring, or be sent a side chat, while another one is in front.
+        """
+        label = _tab_label(title, panel.cwd)
+        for index in range(self.notebook.GetPageCount()):
+            if self.notebook.GetPage(index) is not panel:
+                continue
+            if self.notebook.GetPageText(index) != label:
+                self.notebook.SetPageText(index, label)
+                self._refresh_picker()
+            return
 
     # ----- Focus delegation -----
     def _focus_active(self, which: str) -> None:
@@ -5587,6 +5663,11 @@ def main() -> int:
     app = wx.App(False)
 
     cfg = _load_config()
+    # Installs that predate full-auto still carry the mode an older BlindPilot
+    # saved for them. Moving them over here is what makes "nothing stops to
+    # ask" true of an upgrade as well as of a fresh install.
+    if adopt_full_auto_default(cfg):
+        _save_config(cfg)
     # A packaged GUI smoke test runs with a clean temporary profile in CI. It
     # must exercise the real main window without waiting in the interactive
     # first-run wizard.
