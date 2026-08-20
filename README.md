@@ -1,6 +1,6 @@
 # BlindPilot
 
-A vibe-coded, screen-reader-friendly desktop front end for AI coding agents on Windows and macOS, built so Claude Code, Codex, and FreeBuff can be driven without reading a terminal.
+A vibe-coded, screen-reader-friendly desktop front end for AI coding agents on Windows and macOS, built so Claude Code, Codex, FreeBuff, and opencode can be driven without reading a terminal.
 
 [![Join SerrebiProjects on Telegram](https://img.shields.io/badge/Telegram-SerrebiProjects-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/SerrebiProjects)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
@@ -12,7 +12,7 @@ BlindPilot is based on the original **[Claude Code Reader](https://github.com/do
 ## Features
 
 - Native wxPython controls throughout, so NVDA, JAWS, and VoiceOver read the app rather than interpreting a terminal.
-- Runs Claude Code, Codex, and FreeBuff, switchable from the File menu and remembered between launches.
+- Runs Claude Code, Codex, FreeBuff, and opencode, switchable from the File menu and remembered between launches.
 - Segments every answer into navigable rows: one per heading, paragraph, list item, quote, code block, thought, tool action, and tool result.
 - Reads answers aloud as they arrive, or stays quiet until the whole answer is ready.
 - Reopens past conversations from any backend, titled by the message that started them, and carries on where they left off.
@@ -23,7 +23,7 @@ BlindPilot is based on the original **[Claude Code Reader](https://github.com/do
 - Searches responses, jumps between them, and copies a code block, a whole response, or the whole conversation.
 - Picks the model and reasoning effort from whatever the installed CLI actually reports.
 - Marks sent, working, and received with earcons, so a long run is audible without being spoken.
-- Installs, updates, adds to PATH, and signs into any of the three backends from an accessible wizard.
+- Installs, updates, adds to PATH, and signs into any of the four backends from an accessible wizard.
 - Updates itself from GitHub Releases after verifying the published SHA-256.
 
 ## Backends
@@ -33,8 +33,11 @@ BlindPilot is based on the original **[Claude Code Reader](https://github.com/do
 | Claude Code | Streaming JSON CLI | Yes | Yes | Yes | Yes |
 | Codex | Official app-server protocol | Yes | Yes, including reasoning effort | Yes | Yes |
 | FreeBuff | Pseudo-terminal adapter | Yes | Yes; DeepSeek V4 Pro by default | Managed by FreeBuff | No |
+| opencode | Its own headless HTTP server | Yes | Yes, including per-model reasoning variants | Yes | Yes |
 
 FreeBuff ships no JSON or headless API, so BlindPilot runs its terminal interface in a hidden pseudo-terminal, reads the answer off its screen a finished sentence at a time, and captures its chat id so the conversation can be resumed. Terminal redraws and advertisements are filtered out before anything is spoken. Its permission picker and Compact Conversation are disabled because the FreeBuff CLI has no equivalent.
+
+opencode is driven through the same headless server its own terminal interface uses. BlindPilot starts one, shared by every tab, on the loopback interface behind a password generated for the run, and reads the turn off its event stream. That is what gives opencode every feature the other backends have — streaming answers, steering a running turn, stopping one, permission modes, compaction, resuming a past conversation — plus `/connect` and a model picker covering every provider it can reach. Past conversations come out of opencode's own SQLite database, read-only.
 
 ## Download and install
 
@@ -59,7 +62,7 @@ Settings live in `%APPDATA%\BlindPilot\config.json` on Windows and `~/.config/bl
 
 ## Set up a backend
 
-BlindPilot's first-run wizard and **File → Manage Backends** can find, install, update, and sign into any of the three. A missing CLI is reported as an actionable error and does not affect the others. To do it by hand:
+BlindPilot's first-run wizard and **File → Manage Backends** can find, install, update, and sign into any of the four. A missing CLI is reported as an actionable error and does not affect the others. To do it by hand:
 
 ```powershell
 # Claude Code
@@ -73,7 +76,13 @@ codex login
 # FreeBuff
 npm install -g freebuff
 freebuff login
+
+# opencode
+npm install -g opencode-ai
+opencode providers login
 ```
+
+opencode reaches a model through a provider you connect to it, so BlindPilot carries opencode's `/connect` as a dialog of its own: type `/connect` in the prompt (or use **Connect a Provider** in the wizard) to pick from every provider opencode knows, give it an API key, or sign in through your browser. Nothing about that flow needs a terminal.
 
 ## Keyboard
 

@@ -2,7 +2,8 @@
 
 BlindPilot began as Claude Code Reader. Claude's adapter remains in
 ``blindpilot_app.py``; this module contains the
-provider-neutral discovery helpers plus Codex and FreeBuff workers.
+provider-neutral discovery helpers plus the Codex, FreeBuff, and opencode
+workers.
 
 Copyright (c) 2026 doubletaponair and BlindPilot contributors.
 Based on the original Claude Code Reader application by doubletaponair:
@@ -204,11 +205,13 @@ def hide_console_windows(roots: Optional[set[int]] = None) -> int:
 BACKEND_CLAUDE = "claude"
 BACKEND_CODEX = "codex"
 BACKEND_FREEBUFF = "freebuff"
-BACKEND_IDS = (BACKEND_CLAUDE, BACKEND_CODEX, BACKEND_FREEBUFF)
+BACKEND_OPENCODE = "opencode"
+BACKEND_IDS = (BACKEND_CLAUDE, BACKEND_CODEX, BACKEND_FREEBUFF, BACKEND_OPENCODE)
 BACKEND_LABELS = {
     BACKEND_CLAUDE: "Claude Code",
     BACKEND_CODEX: "Codex",
     BACKEND_FREEBUFF: "FreeBuff",
+    BACKEND_OPENCODE: "opencode",
 }
 
 # FreeBuff has no model-list or model-selection CLI flags. Its installed
@@ -274,19 +277,32 @@ BACKENDS = {
         True,
         supports_compaction=False,
     ),
+    BACKEND_OPENCODE: BackendInfo(
+        BACKEND_OPENCODE,
+        "opencode",
+        "opencode",
+        "npm install -g opencode-ai",
+        ("providers", "login"),
+        True,
+        True,
+        True,
+        True,
+        supports_compaction=True,
+    ),
 }
 
 # What a "compact this conversation" turn looks like per provider: the text to
 # send, and any extra keyword arguments its worker needs.
 #
 # Claude Code takes ``/compact`` as an ordinary message even in headless
-# streaming mode, and acts on it. Codex has no such message — compaction is a
-# separate app-server request — so its worker is told to compact instead, and
-# ignores the text. The text is still shown to the user either way, so the row
-# in the list says what was asked for.
+# streaming mode, and acts on it. Codex and opencode have no such message —
+# for both it is a request of its own — so their workers are told to compact
+# instead, and ignore the text. The text is still shown to the user either
+# way, so the row in the list says what was asked for.
 _COMPACTION_REQUESTS: dict[str, tuple[str, dict]] = {
     BACKEND_CLAUDE: ("/compact", {}),
     BACKEND_CODEX: ("/compact", {"compact": True}),
+    BACKEND_OPENCODE: ("/compact", {"compact": True}),
 }
 
 
@@ -305,6 +321,8 @@ def normalize_backend(value: object) -> str:
         "claudecode": BACKEND_CLAUDE,
         "codex": BACKEND_CODEX,
         "freebuff": BACKEND_FREEBUFF,
+        "opencode": BACKEND_OPENCODE,
+        "opencodeai": BACKEND_OPENCODE,
     }
     return aliases.get(compact, BACKEND_CLAUDE)
 
@@ -397,9 +415,33 @@ def backend_auth_ok(backend: str, timeout: int = 12) -> bool:
         if backend == BACKEND_FREEBUFF:
             credential = Path.home() / ".config" / "manicode" / "credentials.json"
             return credential.is_file() and credential.stat().st_size > 2
+        if backend == BACKEND_OPENCODE:
+            return _opencode_auth_ok()
     except (OSError, subprocess.TimeoutExpired):
         return False
     return True
+
+
+def _opencode_auth_ok() -> bool:
+    """Whether opencode has a provider it could actually run a model on.
+
+    Answered from the credentials opencode stored when a provider was
+    connected, which is where /connect puts them, plus its own key in the
+    environment. This has to answer without starting a server, because it is
+    asked while the setup wizard is on screen.
+
+    Deliberately not "is any ``*_API_KEY`` set": opencode does read a provider's
+    key straight out of the environment, but so do plenty of programs that have
+    nothing to do with it, and a confident yes that turns into a wall at the
+    first message is worse than an "unconfirmed" the wizard lets you walk past.
+    """
+    try:
+        payload = json.loads((_opencode_data_dir() / "auth.json").read_text(encoding="utf-8"))
+        if isinstance(payload, dict) and payload:
+            return True
+    except (OSError, ValueError):
+        pass
+    return bool(os.environ.get("OPENCODE_API_KEY", "").strip())
 
 
 def _subprocess_env(binary: str) -> dict[str, str]:
@@ -761,6 +803,9 @@ def _freebuff_picker_options(visible: str, models: list[str]) -> tuple[list[str]
 def invalidate_backend_cache(backend: str | None = None) -> None:
     """Drop version-derived provider data before an explicit runtime refresh."""
     global _freebuff_catalog_cache
+    if backend is None or normalize_backend(backend) == BACKEND_OPENCODE:
+        with _OPENCODE_CATALOG_LOCK:
+            _opencode_catalog_cache.clear()
     if backend is None or normalize_backend(backend) == BACKEND_FREEBUFF:
         _freebuff_catalog_cache = None
         try:
@@ -2338,6 +2383,1087 @@ class FreebuffWorker(threading.Thread):
         return self._freebuff_sections(visible)[1]
 
 
+# ------------------------------------------------------------------------
+# opencode
+#
+# opencode is driven through its own headless HTTP server rather than through
+# one process per turn, because the server is the same surface its terminal
+# interface talks to and is the only one that exposes everything BlindPilot
+# needs from a provider: a streaming answer, steering a turn that is already
+# running, answering a permission request, compaction, the catalog behind
+# ``/model``, and the provider catalog behind ``/connect``. One server is
+# started on first use and shared by every tab. It listens on the loopback
+# interface behind a password generated for this run, so nothing else on the
+# machine can drive it.
+
+_OPENCODE_SERVER_LOCK = threading.Lock()
+_opencode_server: Optional["OpencodeServer"] = None
+_OPENCODE_CATALOG_LOCK = threading.Lock()
+# One catalog per working directory: a project can pin its own model list.
+_opencode_catalog_cache: dict[str, dict] = {}
+
+# Effort levels are per-model in opencode — a model's "variants". The picker
+# wants one list, so the levels every model offers are pooled and shown in the
+# order a person would expect rather than the order they were discovered in.
+_OPENCODE_EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "max", "thinking")
+
+# What BlindPilot's provider-neutral permission modes mean to opencode. A rule
+# set is applied in order, so the wildcard comes first and the exceptions
+# follow, which is the shape opencode's own agents use. "default" is absent on
+# purpose: it means "whatever opencode itself is configured to do", so no rule
+# set is sent at all.
+_OPENCODE_PERMISSIONS: dict[str, list[dict[str, str]]] = {
+    "acceptEdits": [
+        {"permission": "*", "pattern": "*", "action": "allow"},
+        {"permission": "bash", "pattern": "*", "action": "ask"},
+        {"permission": "external_directory", "pattern": "*", "action": "ask"},
+        {"permission": "doom_loop", "pattern": "*", "action": "ask"},
+    ],
+    "plan": [
+        {"permission": "*", "pattern": "*", "action": "allow"},
+        {"permission": "edit", "pattern": "*", "action": "deny"},
+        {"permission": "bash", "pattern": "*", "action": "ask"},
+        {"permission": "external_directory", "pattern": "*", "action": "deny"},
+    ],
+    "auto": [
+        {"permission": "*", "pattern": "*", "action": "allow"},
+        {"permission": "external_directory", "pattern": "*", "action": "ask"},
+    ],
+    "bypassPermissions": [
+        {"permission": "*", "pattern": "*", "action": "allow"},
+    ],
+}
+
+# opencode ships a "plan" agent whose whole job is the mode BlindPilot calls
+# plan, so plan mode selects it rather than trying to describe it in rules.
+_OPENCODE_AGENTS = {"plan": "plan"}
+
+
+def _opencode_data_dir() -> Path:
+    """Where opencode keeps its database and credentials, on every platform."""
+    override = os.environ.get("OPENCODE_DATA")
+    if override:
+        return Path(override)
+    base = os.environ.get("XDG_DATA_HOME")
+    root = Path(base) if base else Path.home() / ".local" / "share"
+    return root / "opencode"
+
+
+def _free_port() -> int:
+    """A port the operating system says is free right now."""
+    import socket
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+
+
+def _opencode_server_binary(binary: str) -> str:
+    """Prefer opencode's own executable over an npm wrapper on Windows.
+
+    Same reason Codex gets the same treatment: terminating a ``.cmd`` launcher
+    does not terminate the native child it started, and a server nobody owns
+    keeps both its port and its database open for the rest of the session.
+    """
+    if platform.system() != "Windows" or Path(binary).suffix.casefold() == ".exe":
+        return binary
+    candidate = Path(binary).parent / "node_modules" / "opencode-ai" / "bin" / "opencode.exe"
+    return str(candidate) if candidate.is_file() else binary
+
+
+def opencode_error_text(error: object, fallback: str) -> str:
+    """A sentence worth speaking out of whatever the server or urllib raised."""
+    import urllib.error
+
+    if isinstance(error, urllib.error.HTTPError):
+        try:
+            payload = json.loads(error.read().decode("utf-8", "replace"))
+        except (OSError, ValueError):
+            payload = None
+        if isinstance(payload, dict):
+            data = payload.get("data")
+            if isinstance(data, dict) and isinstance(data.get("message"), str):
+                return data["message"]
+            for key in ("message", "error"):
+                if isinstance(payload.get(key), str) and payload[key]:
+                    return str(payload[key])
+        return f"{fallback} (HTTP {error.code})"
+    if isinstance(error, dict):
+        data = error.get("data")
+        if isinstance(data, dict) and isinstance(data.get("message"), str):
+            return data["message"]
+        for key in ("message", "name"):
+            if isinstance(error.get(key), str) and error[key]:
+                return str(error[key])
+    text = str(error).strip()
+    return text or fallback
+
+
+class OpencodeServer:
+    """The one ``opencode serve`` process BlindPilot talks to."""
+
+    def __init__(self, binary: str) -> None:
+        import base64
+        import secrets
+        from collections import deque
+
+        password = secrets.token_urlsafe(24)
+        env = _subprocess_env(binary)
+        env["OPENCODE_SERVER_PASSWORD"] = password
+        self._log: "deque[str]" = deque(maxlen=50)
+        self._url = ""
+        self._listening = threading.Event()
+        self._auth = "Basic " + base64.b64encode(f"opencode:{password}".encode("utf-8")).decode(
+            "ascii"
+        )
+        # Started from the home directory rather than any one project: one
+        # server serves them all, and the ``directory`` query parameter on each
+        # request is what says which project a call is about.
+        self._proc = subprocess.Popen(
+            [binary, "serve", "--port", str(_free_port()), "--hostname", "127.0.0.1"],
+            cwd=str(Path.home()),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            **no_window_kwargs(),
+        )
+        threading.Thread(target=self._pump, daemon=True).start()
+        self._listening.wait(60)
+        if not self._url:
+            self.stop()
+            detail = "\n".join(list(self._log)[-5:]).strip()
+            raise OSError(detail or "opencode's server did not start.")
+
+    # The reader doubles as the thing that keeps the pipe from filling up, so
+    # it runs for the life of the process rather than only until start-up.
+    def _pump(self) -> None:
+        stdout = self._proc.stdout
+        if stdout is not None:
+            for line in stdout:
+                text = line.rstrip()
+                if text:
+                    self._log.append(text)
+                if not self._url:
+                    found = re.search(r"listening on (http://\S+)", text)
+                    if found:
+                        self._url = found.group(1).rstrip("/")
+                        self._listening.set()
+        # The process ended. Release anyone still waiting to be told the URL.
+        self._listening.set()
+
+    @property
+    def base_url(self) -> str:
+        return self._url
+
+    def alive(self) -> bool:
+        return self._proc.poll() is None
+
+    def open(
+        self,
+        method: str,
+        path: str,
+        params: Optional[dict] = None,
+        body: object = None,
+        timeout: Optional[float] = 120,
+    ):
+        """The raw response, for callers that want to read it as it arrives."""
+        import urllib.parse
+        import urllib.request
+
+        url = self._url + path
+        query = {key: value for key, value in (params or {}).items() if value}
+        if query:
+            url += "?" + urllib.parse.urlencode(query)
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        request = urllib.request.Request(url, data=data, method=method)
+        request.add_header("Authorization", self._auth)
+        if data is not None:
+            request.add_header("Content-Type", "application/json")
+        return urllib.request.urlopen(request, timeout=timeout)
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        params: Optional[dict] = None,
+        body: object = None,
+        timeout: Optional[float] = 120,
+    ) -> object:
+        with self.open(method, path, params, body, timeout) as response:
+            raw = response.read().decode("utf-8", "replace")
+        return json.loads(raw) if raw.strip() else None
+
+    def stop(self) -> None:
+        proc = self._proc
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+
+
+def opencode_server() -> OpencodeServer:
+    """The shared server, started on first use and reused from then on."""
+    global _opencode_server
+    with _OPENCODE_SERVER_LOCK:
+        running = _opencode_server
+        if running is not None and running.alive():
+            return running
+        binary = find_backend_cli(BACKEND_OPENCODE)
+        if not binary:
+            raise OSError("opencode is not installed. Run: npm install -g opencode-ai")
+        _opencode_server = OpencodeServer(_opencode_server_binary(binary))
+        return _opencode_server
+
+
+def stop_opencode_server() -> None:
+    """Shut the shared server down — on exit, and before an update replaces it."""
+    global _opencode_server
+    with _OPENCODE_SERVER_LOCK:
+        running, _opencode_server = _opencode_server, None
+    if running is not None:
+        running.stop()
+
+
+atexit.register(stop_opencode_server)
+
+
+def _opencode_catalog(cwd: Optional[str] = None, refresh: bool = False) -> dict:
+    """opencode's providers, their models, and the defaults it would pick.
+
+    Asked per directory, because a project's own ``opencode.json`` can pin a
+    model or turn providers off, and cached per directory for the same reason.
+    Caching matters: the catalog is hundreds of models across nearly two
+    hundred providers, and the picker is opened far more often than a
+    project's set of providers changes.
+    """
+    key = cwd or ""
+    with _OPENCODE_CATALOG_LOCK:
+        cached = _opencode_catalog_cache.get(key)
+    if cached is not None and not refresh:
+        return cached
+    server = opencode_server()
+    params = {"directory": cwd} if cwd else None
+    providers = server.request("GET", "/config/providers", params=params, timeout=60)
+    config = server.request("GET", "/config", params=params, timeout=60)
+    commands = server.request("GET", "/command", params=params, timeout=60)
+    providers = providers if isinstance(providers, dict) else {}
+    config = config if isinstance(config, dict) else {}
+    catalog = {
+        "providers": providers.get("providers") or [],
+        "default": providers.get("default") or {},
+        "model": config.get("model") or "",
+        "commands": _opencode_command_list(commands),
+    }
+    with _OPENCODE_CATALOG_LOCK:
+        _opencode_catalog_cache[key] = catalog
+    return catalog
+
+
+def _opencode_command_list(payload: object) -> list[tuple[str, str]]:
+    """opencode's slash commands, as (name, description).
+
+    Only the commands proper: opencode lists installed skills here as well, and
+    a picker a person arrows through is worth keeping to the length of what
+    they typed a slash to find.
+    """
+    commands: list[tuple[str, str]] = []
+    for entry in payload if isinstance(payload, list) else []:
+        if not isinstance(entry, dict) or entry.get("source") != "command":
+            continue
+        name = str(entry.get("name") or "")
+        if name:
+            commands.append((name, str(entry.get("description") or "")))
+    commands.sort()
+    return commands
+
+
+def opencode_commands(cwd: Optional[str] = None) -> list[tuple[str, str]]:
+    """The commands read for this directory, or none if it has not been read.
+
+    Deliberately never asks the server: the slash picker opens on a key press,
+    and the catalog is already read in the background whenever opencode is the
+    chosen backend.
+    """
+    with _OPENCODE_CATALOG_LOCK:
+        catalog = _opencode_catalog_cache.get(cwd or "")
+    commands = catalog.get("commands") if catalog else None
+    return list(commands) if isinstance(commands, list) else []
+
+
+def _opencode_models_from_cli() -> list[str]:
+    """The catalog as the CLI prints it, for when the server will not start."""
+    binary = find_backend_cli(BACKEND_OPENCODE)
+    if not binary:
+        return []
+    try:
+        result = subprocess.run(
+            [binary, "models"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+            env=_subprocess_env(binary),
+            **no_window_kwargs(),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    models: list[str] = []
+    for line in (result.stdout or "").splitlines():
+        name = line.strip()
+        if name and "/" in name and " " not in name and name not in models:
+            models.append(name)
+    return models
+
+
+def opencode_model_options(
+    cwd: Optional[str] = None,
+) -> tuple[list[str], list[str], str, str, str]:
+    """Every model opencode can reach, the effort levels they offer, and the
+    model it would use if BlindPilot named none."""
+    try:
+        catalog = _opencode_catalog(cwd)
+    except (OSError, ValueError) as exc:
+        models = _opencode_models_from_cli()
+        if not models:
+            return [], [], "", "", opencode_error_text(exc, "opencode's model list is unavailable.")
+        return (
+            models,
+            list(_OPENCODE_EFFORT_ORDER),
+            "",
+            "",
+            "Could not reach opencode's server; showing the list its CLI prints.",
+        )
+
+    models = []
+    efforts: list[str] = []
+    for provider in catalog["providers"]:
+        if not isinstance(provider, dict):
+            continue
+        provider_id = str(provider.get("id") or "")
+        entries = provider.get("models")
+        if not provider_id or not isinstance(entries, dict):
+            continue
+        for model_id, model in sorted(entries.items()):
+            models.append(f"{provider_id}/{model_id}")
+            variants = model.get("variants") if isinstance(model, dict) else None
+            if isinstance(variants, dict):
+                for variant in variants:
+                    if variant not in efforts:
+                        efforts.append(variant)
+
+    known = [effort for effort in _OPENCODE_EFFORT_ORDER if effort in efforts]
+    efforts = known + sorted(effort for effort in efforts if effort not in known)
+    if not models:
+        return [], efforts, "", "", "opencode has no connected providers yet. Type /connect."
+    return models, efforts, opencode_default_model(catalog=catalog), "", ""
+
+
+def opencode_default_model(cwd: Optional[str] = None, catalog: Optional[dict] = None) -> str:
+    """The ``provider/model`` opencode itself would run, or "" if it has none."""
+    try:
+        catalog = catalog if catalog is not None else _opencode_catalog(cwd)
+    except (OSError, ValueError):
+        return ""
+    configured = catalog.get("model")
+    if isinstance(configured, str) and "/" in configured:
+        return configured
+    defaults = catalog.get("default") or {}
+    for provider in catalog.get("providers") or []:
+        if not isinstance(provider, dict):
+            continue
+        provider_id = str(provider.get("id") or "")
+        model_id = defaults.get(provider_id)
+        if provider_id and isinstance(model_id, str) and model_id:
+            return f"{provider_id}/{model_id}"
+    return ""
+
+
+def opencode_split_model(model: str) -> tuple[str, str]:
+    """``provider/model`` as the two halves the server asks for separately."""
+    provider, _, name = (model or "").partition("/")
+    return (provider.strip(), name.strip()) if name.strip() else ("", "")
+
+
+def opencode_model_efforts(model: str, cwd: Optional[str] = None) -> list[str]:
+    """The effort levels this one model offers, so an unusable one is dropped.
+
+    opencode rejects a variant a model does not define, and the picker offers
+    the levels pooled across every model, so the choice has to be checked
+    against the model it is about to be sent with.
+    """
+    provider_id, model_id = opencode_split_model(model)
+    if not provider_id:
+        return []
+    try:
+        catalog = _opencode_catalog(cwd)
+    except (OSError, ValueError):
+        return []
+    for provider in catalog["providers"]:
+        if isinstance(provider, dict) and provider.get("id") == provider_id:
+            entry = (provider.get("models") or {}).get(model_id)
+            variants = entry.get("variants") if isinstance(entry, dict) else None
+            return list(variants) if isinstance(variants, dict) else []
+    return []
+
+
+# ---- /connect: the providers, and the credentials that reach them ----
+
+
+def opencode_providers() -> tuple[list[tuple[str, str]], set[str], str]:
+    """Every provider opencode knows, and which of them are already connected.
+
+    This is what its ``/connect`` command offers. The ones already reachable
+    come first, so the list opens on what is actually in use.
+    """
+    try:
+        server = opencode_server()
+        payload = server.request("GET", "/provider", timeout=60)
+    except (OSError, ValueError) as exc:
+        return [], set(), opencode_error_text(exc, "Could not read opencode's provider list.")
+    if not isinstance(payload, dict):
+        return [], set(), "opencode returned no provider list."
+    connected = {str(name) for name in (payload.get("connected") or [])}
+    everything: list[tuple[str, str]] = []
+    for provider in payload.get("all") or []:
+        if not isinstance(provider, dict):
+            continue
+        provider_id = str(provider.get("id") or "")
+        if provider_id:
+            everything.append((provider_id, str(provider.get("name") or provider_id)))
+    everything.sort(key=lambda item: (item[0] not in connected, item[1].casefold()))
+    return everything, connected, ""
+
+
+def opencode_auth_methods(provider_id: str) -> list[dict]:
+    """How this provider can be signed in to.
+
+    Providers with nothing special to say are absent from opencode's own list;
+    for them the only way in is an API key, which is what the fallback says.
+    """
+    try:
+        server = opencode_server()
+        payload = server.request("GET", "/provider/auth", timeout=60)
+    except (OSError, ValueError):
+        payload = None
+    methods = payload.get(provider_id) if isinstance(payload, dict) else None
+    if isinstance(methods, list) and methods:
+        return [method for method in methods if isinstance(method, dict)]
+    return [{"type": "api", "label": "Manually enter API key"}]
+
+
+def opencode_connect_api_key(provider_id: str, key: str, metadata: Optional[dict] = None) -> str:
+    """Store an API key for a provider. Returns "" on success, else the error."""
+    body: dict = {"type": "api", "key": key}
+    if metadata:
+        body["metadata"] = {str(k): str(v) for k, v in metadata.items() if v}
+    try:
+        opencode_server().request("PUT", f"/auth/{provider_id}", body=body, timeout=60)
+    except (OSError, ValueError) as exc:
+        return opencode_error_text(exc, f"Could not connect {provider_id}.")
+    invalidate_backend_cache(BACKEND_OPENCODE)
+    return ""
+
+
+def opencode_disconnect(provider_id: str) -> str:
+    """Forget a provider's credentials. Returns "" on success, else the error."""
+    try:
+        opencode_server().request("DELETE", f"/auth/{provider_id}", timeout=60)
+    except (OSError, ValueError) as exc:
+        return opencode_error_text(exc, f"Could not disconnect {provider_id}.")
+    invalidate_backend_cache(BACKEND_OPENCODE)
+    return ""
+
+
+def opencode_oauth_start(
+    provider_id: str, method: int, inputs: Optional[dict] = None
+) -> tuple[dict, str]:
+    """Begin a browser sign-in. Returns (authorization, error).
+
+    The authorization carries the URL to open, instructions worth reading out,
+    and whether the provider finishes on its own ("auto") or hands back a code
+    the user has to paste ("code").
+    """
+    body: dict = {"method": method}
+    if inputs:
+        body["inputs"] = {str(k): str(v) for k, v in inputs.items() if v}
+    try:
+        payload = opencode_server().request(
+            "POST", f"/provider/{provider_id}/oauth/authorize", body=body, timeout=120
+        )
+    except (OSError, ValueError) as exc:
+        return {}, opencode_error_text(exc, f"Could not start sign-in for {provider_id}.")
+    return (payload if isinstance(payload, dict) else {}), ""
+
+
+def opencode_oauth_finish(provider_id: str, method: int, code: str = "") -> str:
+    """Complete a browser sign-in. Returns "" on success, else the error."""
+    body: dict = {"method": method}
+    if code:
+        body["code"] = code
+    try:
+        opencode_server().request(
+            "POST", f"/provider/{provider_id}/oauth/callback", body=body, timeout=300
+        )
+    except (OSError, ValueError) as exc:
+        return opencode_error_text(exc, f"Could not finish signing in to {provider_id}.")
+    invalidate_backend_cache(BACKEND_OPENCODE)
+    return ""
+
+
+def _opencode_tool_label(name: str, arguments: object) -> str:
+    """One spoken line for a tool that has just started."""
+    values = arguments if isinstance(arguments, dict) else {}
+    detail = ""
+    for key in ("command", "filePath", "path", "pattern", "query", "url", "description"):
+        value = values.get(key)
+        if isinstance(value, str) and value.strip():
+            detail = " ".join(value.split())
+            break
+    verbs = {
+        "bash": "Running",
+        "edit": "Editing",
+        "write": "Writing",
+        "read": "Reading",
+        "glob": "Finding files",
+        "grep": "Searching",
+        "list": "Listing",
+        "webfetch": "Fetching",
+        "websearch": "Searching the web",
+        "task": "Delegating",
+    }
+    verb = verbs.get(name, f"Using {name}")
+    return f"{verb}: {detail}" if detail else verb
+
+
+class OpencodeWorker(threading.Thread):
+    """Run one opencode turn against the shared headless server."""
+
+    def __init__(
+        self,
+        prompt: str,
+        session_id: Optional[str],
+        cwd: str,
+        permission_mode: str,
+        *,
+        model: str = "",
+        effort: str = "",
+        compact: bool = False,
+        on_session: Callable[[str], None],
+        on_started: Callable[[], None],
+        on_activity: Callable[[str, str], None],
+        on_complete: Callable[[str], None],
+        on_failed: Callable[[str], None],
+        on_done: Callable[[], None],
+    ) -> None:
+        super().__init__(daemon=True)
+        self._prompt = prompt
+        self._session_id = session_id or ""
+        self._cwd = cwd
+        self._permission_mode = permission_mode
+        self._model = model
+        self._effort = effort
+        # Compaction is a request of its own rather than a message, so this
+        # turn summarises the conversation instead of adding to it.
+        self._compact = compact
+        self._on_session = on_session
+        self._on_started = on_started
+        self._on_activity = on_activity
+        self._on_complete = on_complete
+        self._on_failed = on_failed
+        self._on_done = on_done
+        self._server: Optional[OpencodeServer] = None
+        self._stream: object = None
+        # Resolved once the turn starts. Working out whether a model offers the
+        # chosen effort can mean reading opencode's catalog, and a message can
+        # be steered into a running turn from the window's own thread.
+        self._variant = ""
+        self._cancelled = False
+        self._accepting_input = threading.Event()
+        self._roles: dict[str, str] = {}
+        self._emitted: set[str] = set()
+        # A command runs on a request that only answers once the turn is over,
+        # so a failure can be noticed from either thread. This is what keeps
+        # the turn from being reported as failed twice.
+        self._settled = threading.Event()
+        self._answer: list[str] = []
+        self._tools_running: set[str] = set()
+
+    # ----- what the window drives -----
+
+    def accepting_input(self) -> bool:
+        return self._accepting_input.is_set() and not self._cancelled
+
+    def steer(self, text: str) -> bool:
+        """Add a message to the turn that is already running.
+
+        opencode admits a prompt sent mid-turn and hands it to the model at the
+        next step, which is exactly what steering means here.
+
+        Answers from what this worker already knows and sends on a thread of
+        its own, because this is called from the window's thread: a request
+        waited on there is a window that stops answering the screen reader.
+        Whether the turn is still accepting input is the question being asked,
+        and that is known here; a message opencode then refuses is rare enough
+        to belong in the transcript rather than in a frozen window.
+        """
+        if not self.accepting_input() or not self._session_id or self._server is None:
+            return False
+        server, session, body = self._server, self._session_id, self._prompt_body(text)
+
+        def deliver() -> None:
+            try:
+                server.request(
+                    "POST",
+                    f"/session/{session}/prompt_async",
+                    params={"directory": self._cwd},
+                    body=body,
+                    timeout=60,
+                )
+            except (OSError, ValueError) as exc:
+                if not self._cancelled:
+                    detail = opencode_error_text(exc, "the request failed")
+                    self._on_activity(
+                        "tool", f"opencode did not take the steering message: {detail}"
+                    )
+
+        threading.Thread(target=deliver, daemon=True).start()
+        return True
+
+    def cancel(self) -> None:
+        self._cancelled = True
+        self._accepting_input.clear()
+        server, session = self._server, self._session_id
+        if server is not None and session:
+            try:
+                server.request(
+                    "POST",
+                    f"/session/{session}/abort",
+                    params={"directory": self._cwd},
+                    timeout=30,
+                )
+            except (OSError, ValueError):
+                pass
+        # Closing the event stream is what unblocks the run loop. The server
+        # itself is shared, and stays up for the next turn.
+        self._close_stream()
+
+    def run(self) -> None:
+        try:
+            self._do_run()
+        finally:
+            self._accepting_input.clear()
+            self._close_stream()
+            self._on_done()
+
+    def _close_stream(self) -> None:
+        stream = self._stream
+        if stream is not None:
+            try:
+                stream.close()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+    # ----- the turn -----
+
+    def _fail(self, message: str) -> None:
+        if not self._settled.is_set():
+            self._settled.set()
+            self._on_failed(message)
+
+    def _prompt_body(self, text: str) -> dict:
+        body: dict = {"parts": [{"type": "text", "text": text}]}
+        provider_id, model_id = opencode_split_model(self._model)
+        if provider_id:
+            body["model"] = {"providerID": provider_id, "modelID": model_id}
+        agent = _OPENCODE_AGENTS.get(self._permission_mode)
+        if agent:
+            body["agent"] = agent
+        if self._variant:
+            body["variant"] = self._variant
+        return body
+
+    def _do_run(self) -> None:
+        try:
+            self._server = opencode_server()
+        except OSError as exc:
+            self._fail(opencode_error_text(exc, "opencode's server could not be started."))
+            return
+        if self._compact and not self._session_id:
+            self._fail("There is no opencode conversation to compact yet")
+            return
+        # Effort levels are per model in opencode, and it rejects one the model
+        # does not define, so the pooled choice from the picker is checked
+        # against the model this turn will use.
+        if self._effort:
+            model = self._model or opencode_default_model(self._cwd)
+            if self._effort in opencode_model_efforts(model, self._cwd):
+                self._variant = self._effort
+
+        # Subscribing before anything is asked for is what makes the first
+        # words of the answer part of this turn rather than of the next one.
+        try:
+            self._stream = self._server.open(
+                "GET", "/event", params={"directory": self._cwd}, timeout=None
+            )
+        except (OSError, ValueError) as exc:
+            self._fail(opencode_error_text(exc, "Could not follow opencode's progress."))
+            return
+
+        try:
+            self._open_session()
+        except (OSError, ValueError) as exc:
+            self._fail(opencode_error_text(exc, "Could not start an opencode conversation."))
+            return
+        self._on_session(self._session_id)
+
+        command = self._as_command()
+        try:
+            if self._compact:
+                self._start_compaction()
+            elif command is not None:
+                self._start_command(*command)
+            else:
+                self._server.request(
+                    "POST",
+                    f"/session/{self._session_id}/prompt_async",
+                    params={"directory": self._cwd},
+                    body=self._prompt_body(self._prompt),
+                    timeout=120,
+                )
+        except (OSError, ValueError) as exc:
+            self._fail(opencode_error_text(exc, "opencode would not accept the message."))
+            return
+
+        self._accepting_input.set()
+        self._on_started()
+        self._read_events()
+
+    def _open_session(self) -> None:
+        assert self._server is not None
+        rules = _OPENCODE_PERMISSIONS.get(self._permission_mode)
+        if self._session_id:
+            # A resumed conversation keeps its id, but the permission mode may
+            # have been changed since, so its rules are re-stated every turn.
+            if rules is not None:
+                self._server.request(
+                    "PATCH",
+                    f"/session/{self._session_id}",
+                    params={"directory": self._cwd},
+                    body={"permission": rules},
+                    timeout=60,
+                )
+            return
+        body: dict = {}
+        if rules is not None:
+            body["permission"] = rules
+        agent = _OPENCODE_AGENTS.get(self._permission_mode)
+        if agent:
+            body["agent"] = agent
+        provider_id, model_id = opencode_split_model(self._model)
+        if provider_id:
+            body["model"] = {"providerID": provider_id, "id": model_id}
+        created = self._server.request(
+            "POST", "/session", params={"directory": self._cwd}, body=body, timeout=120
+        )
+        session_id = created.get("id") if isinstance(created, dict) else None
+        if not session_id:
+            raise OSError("opencode did not return a conversation id")
+        self._session_id = str(session_id)
+
+    def _as_command(self) -> Optional[tuple[str, str]]:
+        """(command, arguments) if the prompt names one of opencode's commands.
+
+        opencode's commands are prompt templates its server expands — the text
+        "/init" sent as a message is just those five characters, and would be
+        answered rather than run. Anything it does not recognise stays an
+        ordinary message, so a sentence that happens to start with a slash is
+        not swallowed.
+        """
+        text = self._prompt.strip()
+        if not text.startswith("/"):
+            return None
+        # Split on any whitespace, not a space: a command sent with attached
+        # files has their paths on the lines after it.
+        parts = text[1:].split(None, 1)
+        if not parts:
+            return None
+        name, arguments = parts[0], parts[1] if len(parts) > 1 else ""
+        known = {command for command, _description in opencode_commands(self._cwd)}
+        return (name, arguments.strip()) if name in known else None
+
+    def _start_command(self, command: str, arguments: str) -> None:
+        """Run one of opencode's commands, and narrate it like any other turn.
+
+        Its command request only answers once the whole turn is over, so it is
+        made from a thread of its own and the event stream is what the window
+        hears from — the same way it hears an ordinary message.
+        """
+        body: dict = {"command": command, "arguments": arguments}
+        provider_id, model_id = opencode_split_model(self._model)
+        if provider_id:
+            body["model"] = f"{provider_id}/{model_id}"
+        agent = _OPENCODE_AGENTS.get(self._permission_mode)
+        if agent:
+            body["agent"] = agent
+
+        def work() -> None:
+            try:
+                assert self._server is not None
+                self._server.request(
+                    "POST",
+                    f"/session/{self._session_id}/command",
+                    params={"directory": self._cwd},
+                    body=body,
+                    timeout=None,
+                )
+            except (OSError, ValueError) as exc:
+                if self._cancelled:
+                    return
+                detail = opencode_error_text(exc, "the request failed")
+                self._fail(f"opencode could not run /{command}: {detail}")
+                # Nothing else will end the turn now, so release the reader.
+                self._close_stream()
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _start_compaction(self) -> None:
+        assert self._server is not None
+        provider_id, model_id = opencode_split_model(
+            self._model or opencode_default_model(self._cwd)
+        )
+        if not provider_id:
+            raise OSError("Choose an opencode model before compacting")
+        self._server.request(
+            "POST",
+            f"/session/{self._session_id}/summarize",
+            params={"directory": self._cwd},
+            body={"providerID": provider_id, "modelID": model_id},
+            timeout=120,
+        )
+
+    def _read_events(self) -> None:
+        stream = self._stream
+        assert stream is not None
+        try:
+            for raw in stream:  # type: ignore[attr-defined]
+                if self._cancelled:
+                    return
+                line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+                line = line.strip()
+                if not line.startswith("data:"):
+                    continue
+                try:
+                    event = json.loads(line[5:].strip())
+                except ValueError:
+                    continue
+                kind = str(event.get("type") or "")
+                properties = event.get("properties") or {}
+                # Every session on the server shares one stream — the title
+                # writer and any subagent included — so anything that names a
+                # different conversation belongs to somebody else's turn.
+                if properties.get("sessionID") not in (None, self._session_id):
+                    continue
+                if kind == "session.error":
+                    self._fail(
+                        opencode_error_text(properties.get("error"), "opencode reported an error")
+                    )
+                    return
+                if kind in ("session.idle", "session.compacted"):
+                    self._finish()
+                    return
+                self._handle(kind, properties)
+        except Exception as exc:
+            # Deliberately broad: Stop closes this connection from another
+            # thread, mid-read, and what a socket torn out from under the HTTP
+            # reader raises is not something to enumerate. A stop is expected
+            # and silent; anything else is still reported as the failure it is.
+            if not self._cancelled:
+                self._fail(opencode_error_text(exc, "opencode's event stream ended"))
+            return
+        finally:
+            self._accepting_input.clear()
+        if not self._cancelled:
+            self._fail("opencode closed the connection before the turn finished")
+
+    def _finish(self) -> None:
+        if self._settled.is_set():
+            return
+        self._settled.set()
+        if self._compact:
+            # A compaction produces no answer of its own, so say what happened
+            # rather than finishing in silence.
+            self._on_complete("Conversation compacted.")
+        else:
+            # opencode writes an answer as one text part per step, and a step
+            # boundary is a paragraph boundary — run together they read as one
+            # sentence that was never written.
+            self._on_complete("\n\n".join(self._answer).strip())
+
+    def _handle(self, kind: str, properties: dict) -> None:
+        if kind == "message.updated":
+            info = properties.get("info") or {}
+            if isinstance(info, dict) and info.get("id"):
+                self._roles[str(info["id"])] = str(info.get("role") or "")
+        elif kind == "message.part.updated":
+            self._part(properties.get("part") or {})
+        elif kind in ("permission.asked", "permission.v2.asked"):
+            self._answer_permission(properties)
+        elif kind in ("question.asked", "question.v2.asked"):
+            self._reject_question(properties)
+        elif kind == "session.status":
+            status = properties.get("status") or {}
+            if isinstance(status, dict) and status.get("type") == "retry":
+                self._on_activity(
+                    "tool", f"opencode is retrying (attempt {status.get('attempt') or 1})"
+                )
+
+    def _part(self, part: object) -> None:
+        if not isinstance(part, dict):
+            return
+        part_id = str(part.get("id") or "")
+        kind = str(part.get("type") or "")
+        if kind in ("text", "reasoning"):
+            # The user's own message arrives as a part too; only the model's
+            # side of the conversation belongs in the response rows.
+            if self._roles.get(str(part.get("messageID") or "")) != "assistant":
+                return
+            # opencode opens a part empty, streams it a token at a time, then
+            # repeats it in full: that last repeat is what says it is finished
+            # and can be read out as one row rather than a hundred.
+            text = str(part.get("text") or "").strip()
+            if not text or part_id in self._emitted:
+                return
+            self._emitted.add(part_id)
+            if kind == "reasoning":
+                self._on_activity("thinking", text)
+            else:
+                self._answer.append(text)
+                self._on_activity("assistant", text)
+        elif kind == "tool":
+            self._tool(part_id, part)
+
+    def _tool(self, part_id: str, part: dict) -> None:
+        state = part.get("state")
+        if not isinstance(state, dict):
+            return
+        status = str(state.get("status") or "")
+        name = str(part.get("tool") or "tool")
+        if status == "running" and part_id not in self._tools_running:
+            self._tools_running.add(part_id)
+            self._on_activity("tool", _opencode_tool_label(name, state.get("input")))
+        elif status == "completed":
+            output = str(state.get("output") or "").strip()
+            if output:
+                self._on_activity("result", output)
+        elif status == "error":
+            message = str(state.get("error") or "").strip()
+            self._on_activity("result", message or f"{name} failed")
+
+    def _post(self, routes: list[tuple[str, Optional[dict]]], what: str) -> bool:
+        """POST to the first of these routes opencode accepts.
+
+        A permission request and a question both hold the turn open until they
+        are answered, and opencode is in the middle of moving both onto new
+        endpoints. Trying the old one and then the new one costs one failed
+        request in the worst case; getting it wrong costs a turn that never
+        ends, so the routes are tried rather than guessed at.
+        """
+        if self._server is None:
+            return False
+        problem = ""
+        for path, body in routes:
+            try:
+                self._server.request(
+                    "POST", path, params={"directory": self._cwd}, body=body, timeout=30
+                )
+                return True
+            except (OSError, ValueError) as exc:
+                problem = opencode_error_text(exc, f"opencode would not accept {what}")
+        # Saying so matters: unanswered, the turn waits for an answer that is
+        # never coming, and silence would look like the model thinking.
+        self._on_activity("tool", f"Could not answer {what}: {problem}")
+        return False
+
+    def _answer_permission(self, properties: dict) -> None:
+        """Answer a permission request the way the chosen mode says to.
+
+        BlindPilot decides from the permission mode rather than interrupting
+        with a dialog, the same way its Codex adapter does, so a run never
+        stops waiting on an answer nobody was asked for.
+        """
+        request_id = str(properties.get("id") or "")
+        if not request_id or self._server is None:
+            return
+        permission = str(properties.get("permission") or "")
+        mode = self._permission_mode
+        if mode == "bypassPermissions":
+            reply = "always"
+        elif mode == "auto":
+            reply = "once"
+        elif mode == "acceptEdits" and permission in ("edit", "write", "patch"):
+            reply = "once"
+        else:
+            reply = "reject"
+        answered = self._post(
+            [
+                (
+                    f"/session/{self._session_id}/permissions/{request_id}",
+                    {"response": reply},
+                ),
+                (
+                    f"/api/session/{self._session_id}/permission/{request_id}/reply",
+                    {"reply": reply},
+                ),
+            ],
+            "a permission request",
+        )
+        if answered and reply == "reject":
+            self._on_activity(
+                "tool",
+                f"Declined {permission or 'a request'} — the permission mode does not allow it",
+            )
+
+    def _reject_question(self, properties: dict) -> None:
+        """Turn down a mid-run question, so the turn is never left hanging.
+
+        opencode can stop to ask the user something. BlindPilot has no way to
+        put that question in front of the user mid-turn, and one nobody answers
+        stalls the run for good, so it is declined and reported instead.
+        """
+        request_id = str(properties.get("id") or "")
+        if not request_id or self._server is None:
+            return
+        questions = properties.get("questions") or []
+        asked = ""
+        if isinstance(questions, list) and questions and isinstance(questions[0], dict):
+            asked = str(questions[0].get("question") or "")
+        if not self._post(
+            [
+                (f"/question/{request_id}/reject", None),
+                (f"/api/session/{self._session_id}/question/{request_id}/reject", None),
+            ],
+            "a question",
+        ):
+            return
+        self._on_activity(
+            "tool",
+            "opencode asked a question, which BlindPilot declined: "
+            + (asked or "no details given")
+            + " — answer it in your next message.",
+        )
+
+
 class AgentWorker(Protocol):
     """The part of a backend's worker that the window actually drives.
 
@@ -2370,4 +3496,6 @@ def worker_class(backend: str, claude_worker: AgentWorkerFactory) -> AgentWorker
         return CodexWorker
     if backend == BACKEND_FREEBUFF:
         return FreebuffWorker
+    if backend == BACKEND_OPENCODE:
+        return OpencodeWorker
     return claude_worker

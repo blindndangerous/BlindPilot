@@ -1,31 +1,49 @@
-# BlindPilot 0.3.14
+# BlindPilot 0.4.0
 
-BlindPilot is an accessible desktop reader for Claude Code, Codex, and FreeBuff. It is
-based on Claude Code Reader and remains available under the MIT License, with credit to
-the original project throughout the application and documentation.
+BlindPilot is an accessible desktop reader for AI coding agents. It is based on Claude
+Code Reader and remains available under the MIT License, with credit to the original
+project throughout the application and documentation.
 
-## Nothing you can see
+## opencode is the fourth backend
 
-This release changes nothing about what BlindPilot does. If 0.3.13 is working, there is
-no reason to hurry.
+Pick it from File → Backend, or install and sign into it from the setup wizard, the same
+way as the other three. Everything BlindPilot does for Claude Code and Codex, it now does
+for opencode: answers read out as they arrive, tool activity and reasoning as navigable
+rows, steering a turn while it runs, stopping one, permission modes, compacting a
+conversation, and reopening a past one to carry on with it.
 
-A type checker was run over the three modules that ship, and the thirty-two things it
-objected to were settled. Most were objects the code passed around without naming,
-because they honestly come from more than one place — the worker for whichever backend
-you picked, the terminal FreeBuff runs under, which is winpty's on Windows and pexpect's
-elsewhere. Each now states what is asked of it, which is both shorter than the comment
-explaining it would have been and still true when a fourth backend arrives.
+It is driven through the headless server opencode's own terminal interface talks to,
+rather than a process per turn. BlindPilot starts one, shared by every tab, on the
+loopback interface behind a password made up for that run. That is the only surface that
+exposes all of this at once, which is why nothing had to be left out.
 
-Two were worth the trouble on their own. Neither could happen as the code stood; both
-depended on an argument the next reader would have had to reconstruct.
+- **`/model` covers everything opencode can reach**, named `provider/model`, with the
+  reasoning variants each model offers. The list is read per directory, because a
+  project's own `opencode.json` can pin a model or turn providers off, and a reasoning
+  level a model does not offer is never sent with it.
+- **`/connect` is opencode's own command, as a dialog.** Every provider it knows, the
+  connected ones first, signed in with an API key or through your browser. Providers that
+  want an account id or a self-hosted address ask for it in opencode's own words. It is
+  also the wizard's sign-in step, because opencode's command-line sign-in is a terminal
+  prompt nobody using a screen reader can answer.
+- **Its own commands run as commands.** `/init`, `/review`, and anything the project
+  defines are offered in the slash picker and handed to opencode to expand. A `/name` it
+  does not recognise is left alone, so a sentence that happens to start with a slash is
+  still a sentence.
+- **Permission modes are rules opencode enforces**, not instructions to a model. Plan mode
+  selects opencode's own plan agent and denies edits outright; accept-edits allows edits
+  while a shell command keeps the normal safeguard; default leaves opencode's own
+  configuration alone. A question opencode stops to ask mid-turn is declined and reported
+  — unanswered, it would hold the turn open for good.
+- **Past conversations come out of opencode's database**, read-only, titled by their first
+  message where opencode has not titled them itself.
 
-- The macOS announcement that VoiceOver speaks read six names that exist only on macOS.
-  Nothing on Windows or Linux reached them, but nothing there said so either. It now
-  loads them where it uses them, and a failed announcement no longer travels any further
-  than the announcement.
-- The sign-in helper killed a process in a handler that could be entered before that
-  process existed. Only the wait can time out, so it never was — the timeout is now
-  caught where the process is known to be there.
+## Also in this release
 
-The upgrade fix from 0.3.13 is unchanged and still the reason to be on a recent version:
-running the setup program by hand no longer stops on a file it cannot replace.
+- Steering an opencode turn no longer waits on a request from the window's own thread.
+- Every opencode conversation in a directory is offered, not only the ones among its most
+  recent few hundred across all directories.
+- opencode's sign-in check no longer counts any `*_API_KEY` in your environment as an
+  opencode sign-in.
+
+Nothing about Claude Code, Codex, or FreeBuff changes in this release.

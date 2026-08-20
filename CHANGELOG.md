@@ -4,6 +4,19 @@ Readable release history for BlindPilot. When adjacent releases were part of the
 same fix stream, they are combined with a version range such as
 `v0.3.6-v0.3.7`.
 
+## v0.4.0 - 2026-08-19
+
+- opencode is a backend, and it does everything the others do: streaming answers, steering a turn while it runs, stopping one, permission modes, compaction, and reopening a past conversation to carry on with it. It is picked from File → Backend like the rest, and installed, updated, and signed into from the same wizard.
+- It is driven through the headless server its own terminal interface talks to, rather than through one process per turn. BlindPilot starts one server, shared by every tab, on the loopback interface behind a password generated for that run, and reads each turn off its event stream. That is the only surface that exposes everything at once, which is why nothing about opencode had to be left out.
+- `/model` covers every model opencode can reach, named `provider/model`, with the reasoning variants each one offers. The list is read per directory, because a project's own `opencode.json` can pin a model or turn providers off, and an effort a model does not offer is never sent with it.
+- `/connect` is opencode's own command, carried over as a dialog: every provider it knows, the connected ones first, with an API key or a browser sign-in depending on what the provider offers. Providers that need an account id or a self-hosted address ask for it in opencode's own words. It is also the Connect a Provider step in the setup wizard, because opencode's command-line sign-in is a terminal prompt nobody using a screen reader can answer.
+- Permission modes reach opencode as rules it enforces rather than as instructions to a model: plan mode selects opencode's own plan agent and denies edits outright, accept-edits allows edits while a shell command keeps the normal safeguard, and default leaves opencode's own configuration alone. A request that still needs answering is answered from the mode, and a question opencode stops to ask mid-turn is declined and reported — unanswered, it would hold the turn open for good.
+- opencode's own slash commands are run as commands rather than typed at the model: the picker offers whichever ones the current directory has — its built-in `/init` and `/review`, plus anything the project defines — and a `/name` it does not recognise is left alone, so a sentence that happens to start with a slash is still a sentence.
+- Past opencode conversations are read straight out of its SQLite database, read-only, titled by their first message where opencode has not titled them itself. Subagent conversations are left out of the list: nobody had those.
+- Steering an opencode turn is answered from what the window already knows and delivered on a thread of its own. It used to wait on a request, and on the window's own thread — a window that stops answering is a window a screen reader cannot describe.
+- Every conversation opencode has had in a directory is offered, not just the ones among the most recent few hundred. Its conversations for every directory share one database, so a limit on rows read was a limit on how far back this project's history went.
+- opencode's sign-in check no longer reads any `*_API_KEY` in the environment as a signed-in opencode. Plenty of programs set one and have nothing to do with opencode; a confident yes that turns into a wall at the first message is worse than an unconfirmed you can walk past.
+
 ## v0.3.14 - 2026-08-12
 
 - Nothing here changes what BlindPilot does. A type checker was run over the three modules that ship, and the 32 things it objected to were settled — most of them objects passed around unnamed because they come from more than one library, which now say what is asked of them.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import platform
@@ -14,8 +15,10 @@ from agent_backends import (
     BACKEND_CLAUDE,
     BACKEND_CODEX,
     BACKEND_FREEBUFF,
+    BACKEND_OPENCODE,
     CodexWorker,
     FreebuffWorker,
+    OpencodeWorker,
     backend_label,
     codex_model_options,
     freebuff_model_options,
@@ -775,3 +778,519 @@ def test_only_the_backends_with_a_compaction_command_offer_one():
     assert compaction_request(BACKEND_CLAUDE) == ("/compact", {})
     assert compaction_request(BACKEND_CODEX) == ("/compact", {"compact": True})
     assert compaction_request(BACKEND_FREEBUFF) is None
+
+
+class _ScriptedOpencodeServer:
+    """An opencode server that answers from a script instead of over a socket.
+
+    It records every request the worker makes, and plays back a canned event
+    stream — which is all the worker actually reads, so a whole turn can be
+    replayed without a provider, a network, or a subprocess.
+    """
+
+    def __init__(self, events: list[dict], session_id: str = "ses_test") -> None:
+        self.calls: list[tuple[str, str, object]] = []
+        self.session_id = session_id
+        self.events = events
+        self.closed = False
+        self.fail: set[str] = set()
+
+    def paths(self) -> list[str]:
+        return [path for _method, path, _body in self.calls]
+
+    def body(self, needle: str) -> object:
+        for _method, path, body in self.calls:
+            if needle in path:
+                return body
+        return None
+
+    def request(self, method, path, params=None, body=None, timeout=None):
+        self.calls.append((method, path, body))
+        if any(marker in path for marker in self.fail):
+            raise OSError(f"no route for {path}")
+        if method == "POST" and path == "/session":
+            return {"id": self.session_id}
+        return {}
+
+    def open(self, method, path, params=None, body=None, timeout=None):
+        self.calls.append((method, path, body))
+        server = self
+
+        class Stream:
+            def __iter__(self):
+                for event in server.events:
+                    yield ("data: " + json.dumps(event)).encode("utf-8")
+
+            def close(self):
+                server.closed = True
+
+        return Stream()
+
+
+def _wait_for(condition, timeout: float = 5.0) -> None:
+    """Give a worker's own thread a moment to get where the test is looking."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if condition():
+            return
+        time.sleep(0.005)
+    raise AssertionError("the worker never got there")
+
+
+def _opencode_event(kind: str, session_id: str = "ses_test", **properties) -> dict:
+    return {"type": kind, "properties": {"sessionID": session_id, **properties}}
+
+
+def _opencode_turn(events: list[dict], monkeypatch, **kwargs) -> tuple[dict, object]:
+    """Run one OpencodeWorker turn against a scripted server."""
+    server = _ScriptedOpencodeServer(events)
+    monkeypatch.setattr(agent_backends, "opencode_server", lambda: server)
+    monkeypatch.setattr(agent_backends, "opencode_default_model", lambda *_a, **_k: "")
+    monkeypatch.setattr(agent_backends, "opencode_model_efforts", lambda *_a, **_k: [])
+    known = kwargs.pop("commands", [])
+    monkeypatch.setattr(agent_backends, "opencode_commands", lambda *_a, **_k: known)
+    seen: dict = {"activity": [], "complete": [], "failed": [], "session": []}
+    callbacks = _callbacks()
+    callbacks["on_activity"] = lambda kind, value: seen["activity"].append((kind, value))
+    callbacks["on_complete"] = seen["complete"].append
+    callbacks["on_failed"] = seen["failed"].append
+    callbacks["on_session"] = seen["session"].append
+    worker = OpencodeWorker(
+        kwargs.pop("prompt", "hello"),
+        kwargs.pop("session_id", None),
+        kwargs.pop("cwd", "/work"),
+        kwargs.pop("permission_mode", "default"),
+        **kwargs,
+        **callbacks,
+    )
+    worker._do_run()
+    return seen, server
+
+
+def test_opencode_is_one_of_the_backends():
+    assert normalize_backend("OpenCode") == BACKEND_OPENCODE
+    assert normalize_backend("opencode-ai") == BACKEND_OPENCODE
+    assert backend_label(BACKEND_OPENCODE) == "opencode"
+    assert BACKEND_OPENCODE in agent_backends.BACKEND_IDS
+
+
+def test_opencode_worker_is_the_adapter_for_opencode():
+    class Claude:
+        pass
+
+    assert worker_class(BACKEND_OPENCODE, Claude) is OpencodeWorker
+
+
+def test_opencode_permission_modes_translate_to_rule_sets_and_agents(monkeypatch):
+    """Plan mode has to reach opencode as something it enforces, not as prose."""
+    events = [_opencode_event("session.idle")]
+
+    _seen, server = _opencode_turn(events, monkeypatch, permission_mode="plan")
+    created = server.body("/session")
+    assert created["agent"] == "plan"
+    assert {"permission": "edit", "pattern": "*", "action": "deny"} in created["permission"]
+
+    _seen, server = _opencode_turn(events, monkeypatch, permission_mode="bypassPermissions")
+    assert server.body("/session")["permission"] == [
+        {"permission": "*", "pattern": "*", "action": "allow"}
+    ]
+
+    # "Default" means whatever opencode itself is configured to do, so it must
+    # not quietly install rules of BlindPilot's own.
+    _seen, server = _opencode_turn(events, monkeypatch, permission_mode="default")
+    assert "permission" not in server.body("/session")
+
+
+def test_opencode_stream_becomes_accessible_rows_and_one_answer(monkeypatch):
+    events = [
+        _opencode_event("message.updated", info={"id": "msg_1", "role": "assistant"}),
+        _opencode_event(
+            "message.part.updated",
+            part={"id": "prt_1", "messageID": "msg_1", "type": "reasoning", "text": ""},
+        ),
+        _opencode_event(
+            "message.part.updated",
+            part={
+                "id": "prt_1",
+                "messageID": "msg_1",
+                "type": "reasoning",
+                "text": "Working it out.",
+            },
+        ),
+        _opencode_event(
+            "message.part.updated",
+            part={
+                "id": "prt_2",
+                "messageID": "msg_1",
+                "type": "tool",
+                "tool": "bash",
+                "state": {"status": "running", "input": {"command": "wc -l app.py"}},
+            },
+        ),
+        _opencode_event(
+            "message.part.updated",
+            part={
+                "id": "prt_2",
+                "messageID": "msg_1",
+                "type": "tool",
+                "tool": "bash",
+                "state": {"status": "completed", "output": "42"},
+            },
+        ),
+        _opencode_event(
+            "message.part.updated",
+            part={"id": "prt_3", "messageID": "msg_1", "type": "text", "text": "First half."},
+        ),
+        _opencode_event(
+            "message.part.updated",
+            part={"id": "prt_4", "messageID": "msg_1", "type": "text", "text": "Second half."},
+        ),
+        _opencode_event("session.idle"),
+    ]
+
+    seen, server = _opencode_turn(events, monkeypatch)
+
+    assert seen["session"] == ["ses_test"]
+    assert seen["activity"] == [
+        ("thinking", "Working it out."),
+        ("tool", "Running: wc -l app.py"),
+        ("result", "42"),
+        ("assistant", "First half."),
+        ("assistant", "Second half."),
+    ]
+    # A part is opened empty and streamed before it is repeated in full, so the
+    # empty opening must not be read out as an answer of its own.
+    # Two text parts are two paragraphs, not one run-together sentence.
+    assert seen["complete"] == ["First half.\n\nSecond half."]
+    assert not seen["failed"]
+    assert server.closed is False  # only Stop closes the stream early
+
+
+def test_opencode_only_reads_its_own_conversation(monkeypatch):
+    """One event stream carries every session, subagents and titles included."""
+    events = [
+        _opencode_event("message.updated", info={"id": "msg_1", "role": "assistant"}),
+        _opencode_event(
+            "message.part.updated",
+            session_id="ses_someone_else",
+            part={"id": "prt_9", "messageID": "msg_1", "type": "text", "text": "Not ours."},
+        ),
+        _opencode_event("session.idle", session_id="ses_someone_else"),
+        _opencode_event(
+            "message.part.updated",
+            part={"id": "prt_1", "messageID": "msg_1", "type": "text", "text": "Ours."},
+        ),
+        _opencode_event("session.idle"),
+    ]
+
+    seen, _server = _opencode_turn(events, monkeypatch)
+
+    assert seen["complete"] == ["Ours."]
+
+
+def test_opencode_never_reads_the_users_own_message_back_as_an_answer(monkeypatch):
+    events = [
+        _opencode_event("message.updated", info={"id": "msg_user", "role": "user"}),
+        _opencode_event(
+            "message.part.updated",
+            part={"id": "prt_0", "messageID": "msg_user", "type": "text", "text": "hello"},
+        ),
+        _opencode_event("message.updated", info={"id": "msg_1", "role": "assistant"}),
+        _opencode_event(
+            "message.part.updated",
+            part={"id": "prt_1", "messageID": "msg_1", "type": "text", "text": "Hi."},
+        ),
+        _opencode_event("session.idle"),
+    ]
+
+    seen, _server = _opencode_turn(events, monkeypatch)
+
+    assert seen["activity"] == [("assistant", "Hi.")]
+    assert seen["complete"] == ["Hi."]
+
+
+def test_opencode_declines_a_mid_turn_question_instead_of_waiting_forever(monkeypatch):
+    """An unanswered question holds the turn open for good."""
+    events = [
+        _opencode_event(
+            "question.asked",
+            id="que_1",
+            questions=[{"question": "Tabs or spaces?", "header": "Indent", "options": []}],
+        ),
+        _opencode_event("session.idle"),
+    ]
+
+    seen, server = _opencode_turn(events, monkeypatch)
+
+    assert "/question/que_1/reject" in server.paths()
+    assert seen["activity"] and "Tabs or spaces?" in seen["activity"][0][1]
+
+
+def test_opencode_answers_a_permission_request_from_the_chosen_mode(monkeypatch):
+    events = [
+        _opencode_event("permission.asked", id="per_1", permission="bash"),
+        _opencode_event("session.idle"),
+    ]
+
+    _seen, server = _opencode_turn(events, monkeypatch, permission_mode="auto")
+    assert server.body("/permissions/per_1") == {"response": "once"}
+
+    seen, server = _opencode_turn(events, monkeypatch, permission_mode="acceptEdits")
+    # Accept edits accepts edits; a shell command keeps the normal safeguard.
+    assert server.body("/permissions/per_1") == {"response": "reject"}
+    assert any("Declined bash" in text for _kind, text in seen["activity"])
+
+
+def test_opencode_says_so_when_it_cannot_answer_a_permission_request(monkeypatch):
+    """Silence here reads as thinking, while the turn waits for good."""
+    events = [
+        _opencode_event("permission.asked", id="per_1", permission="bash"),
+        _opencode_event("session.idle"),
+    ]
+    server = _ScriptedOpencodeServer(events)
+    server.fail = {"/permissions/", "/permission/"}
+    monkeypatch.setattr(agent_backends, "opencode_server", lambda: server)
+    monkeypatch.setattr(agent_backends, "opencode_default_model", lambda *_a, **_k: "")
+    activity: list[tuple[str, str]] = []
+    callbacks = _callbacks()
+    callbacks["on_activity"] = lambda kind, value: activity.append((kind, value))
+    OpencodeWorker("hi", None, "/work", "auto", **callbacks)._do_run()
+
+    assert any("Could not answer a permission request" in text for _kind, text in activity)
+
+
+def test_opencode_error_is_reported_rather_than_left_running(monkeypatch):
+    events = [
+        _opencode_event(
+            "session.error",
+            error={"name": "UnknownError", "data": {"message": "5-hour usage limit reached."}},
+        ),
+    ]
+
+    seen, _server = _opencode_turn(events, monkeypatch)
+
+    assert seen["failed"] == ["5-hour usage limit reached."]
+    assert not seen["complete"]
+
+
+def test_opencode_compaction_is_a_request_of_its_own_not_a_message(monkeypatch):
+    events = [_opencode_event("session.compacted")]
+    monkeypatch.setattr(agent_backends, "opencode_default_model", lambda *_a, **_k: "")
+
+    seen, server = _opencode_turn(
+        events,
+        monkeypatch,
+        prompt="/compact",
+        session_id="ses_test",
+        model="opencode/flash",
+        compact=True,
+    )
+
+    assert "/session/ses_test/summarize" in server.paths()
+    # The prompt text is never sent: a compaction is not a message.
+    assert not any("prompt_async" in path for path in server.paths())
+    assert seen["complete"] == ["Conversation compacted."]
+
+
+def test_opencode_will_not_compact_a_conversation_that_has_not_started(monkeypatch):
+    seen, _server = _opencode_turn([], monkeypatch, prompt="/compact", compact=True)
+
+    assert seen["failed"] == ["There is no opencode conversation to compact yet"]
+
+
+def test_opencode_sends_a_model_only_when_a_tab_chose_one(monkeypatch):
+    events = [_opencode_event("session.idle")]
+
+    _seen, server = _opencode_turn(events, monkeypatch, model="opencode-go/glm-5.3")
+    assert server.body("prompt_async")["model"] == {
+        "providerID": "opencode-go",
+        "modelID": "glm-5.3",
+    }
+
+    # No choice means opencode's own default, which is a flag left unsent.
+    _seen, server = _opencode_turn(events, monkeypatch)
+    assert "model" not in server.body("prompt_async")
+
+
+def test_opencode_steering_adds_to_the_turn_already_running(monkeypatch):
+    server = _ScriptedOpencodeServer([])
+    monkeypatch.setattr(agent_backends, "opencode_server", lambda: server)
+    worker = OpencodeWorker("hello", "ses_test", "/work", "default", **_callbacks())
+    worker._server = server
+    worker._session_id = "ses_test"
+
+    assert worker.steer("actually, stop at three") is False  # not started yet
+    worker._accepting_input.set()
+    assert worker.steer("actually, stop at three") is True
+    # Delivered from a thread of its own: this is called from the window's
+    # thread, which must not wait on a request.
+    _wait_for(lambda: server.body("prompt_async") is not None)
+    assert server.body("prompt_async")["parts"] == [
+        {"type": "text", "text": "actually, stop at three"}
+    ]
+
+    # Once the turn is over there is nothing left to steer, and saying so is
+    # what lets the window offer to send the text as the next message instead.
+    worker._accepting_input.clear()
+    assert worker.steer("too late") is False
+
+
+def test_opencode_stop_interrupts_the_turn_and_releases_the_reader(monkeypatch):
+    server = _ScriptedOpencodeServer([])
+    monkeypatch.setattr(agent_backends, "opencode_server", lambda: server)
+    worker = OpencodeWorker("hello", "ses_test", "/work", "default", **_callbacks())
+    worker._server = server
+    worker._stream = server.open("GET", "/event")
+
+    worker.cancel()
+
+    assert "/session/ses_test/abort" in server.paths()
+    # Closing the stream is what unblocks the thread reading it.
+    assert server.closed is True
+
+
+def test_opencode_catalog_names_models_by_provider_and_pools_their_efforts(monkeypatch):
+    catalog = {
+        "providers": [
+            {
+                "id": "opencode-go",
+                "models": {
+                    "glm-5.3": {"variants": {"high": {}, "low": {}}},
+                    "kimi-k3": {"variants": {"max": {}}},
+                },
+            }
+        ],
+        "default": {"opencode-go": "kimi-k3"},
+        "model": "",
+    }
+    monkeypatch.setattr(agent_backends, "_opencode_catalog", lambda *_a, **_k: catalog)
+
+    models, efforts, current, effort, error = agent_backends.opencode_model_options("/work")
+
+    assert models == ["opencode-go/glm-5.3", "opencode-go/kimi-k3"]
+    # Pooled across every model, and in the order a person would expect them.
+    assert efforts == ["low", "high", "max"]
+    assert (current, effort, error) == ("opencode-go/kimi-k3", "", "")
+    # Effort is per model, so the picker's pooled list has to be checked
+    # against the model it is about to be sent with.
+    assert agent_backends.opencode_model_efforts("opencode-go/kimi-k3") == ["max"]
+
+
+def test_opencode_never_sends_an_effort_the_chosen_model_does_not_offer(monkeypatch):
+    monkeypatch.setattr(agent_backends, "opencode_model_efforts", lambda *_a, **_k: ["max"])
+    monkeypatch.setattr(agent_backends, "opencode_default_model", lambda *_a, **_k: "")
+    server = _ScriptedOpencodeServer([_opencode_event("session.idle")])
+    monkeypatch.setattr(agent_backends, "opencode_server", lambda: server)
+
+    OpencodeWorker(
+        "hi", None, "/work", "default", model="p/m", effort="low", **_callbacks()
+    )._do_run()
+    assert "variant" not in server.body("prompt_async")
+
+    server.calls.clear()
+    OpencodeWorker(
+        "hi", None, "/work", "default", model="p/m", effort="max", **_callbacks()
+    )._do_run()
+    assert server.body("prompt_async")["variant"] == "max"
+
+
+def test_opencode_server_is_reached_over_loopback_behind_a_password(monkeypatch):
+    """Anything on the machine could drive an unsecured server."""
+    started: dict = {}
+
+    class FakeProcess:
+        stdout = io.StringIO("opencode server listening on http://127.0.0.1:41234\n")
+
+        def poll(self):
+            return None
+
+    def fake_popen(argv, **kwargs):
+        started["argv"] = argv
+        started["env"] = kwargs.get("env") or {}
+        return FakeProcess()
+
+    monkeypatch.setattr(agent_backends.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(agent_backends, "_free_port", lambda: 41234)
+    monkeypatch.setattr(agent_backends, "_subprocess_env", lambda _binary: {})
+
+    server = agent_backends.OpencodeServer("opencode")
+
+    assert server.base_url == "http://127.0.0.1:41234"
+    assert started["argv"][1:] == ["serve", "--port", "41234", "--hostname", "127.0.0.1"]
+    assert started["env"]["OPENCODE_SERVER_PASSWORD"]
+    assert server._auth.startswith("Basic ")
+
+
+def test_opencode_prefers_its_own_executable_over_the_npm_wrapper(monkeypatch, tmp_path):
+    wrapper = tmp_path / "npm" / "opencode.cmd"
+    native = wrapper.parent / "node_modules" / "opencode-ai" / "bin" / "opencode.exe"
+    native.parent.mkdir(parents=True)
+    native.touch()
+    monkeypatch.setattr(agent_backends.platform, "system", lambda: "Windows")
+
+    # Terminating a .cmd launcher leaves the server it started holding the port.
+    assert agent_backends._opencode_server_binary(str(wrapper)) == str(native)
+
+
+def test_opencode_compaction_is_offered_and_freebuffs_is_not():
+    from agent_backends import BACKENDS, compaction_request
+
+    assert BACKENDS[BACKEND_OPENCODE].supports_compaction is True
+    assert compaction_request(BACKEND_OPENCODE) == ("/compact", {"compact": True})
+
+
+def test_opencode_commands_are_run_as_commands_not_typed_at_the_model(monkeypatch):
+    """ "/init" sent as a message is five characters, not opencode's command."""
+    events = [_opencode_event("session.idle")]
+
+    _seen, server = _opencode_turn(
+        events,
+        monkeypatch,
+        prompt="/init focus on the tests",
+        commands=[("init", "guided setup")],
+    )
+
+    assert not any("prompt_async" in path for path in server.paths())
+    assert server.body("/command") == {
+        "command": "init",
+        "arguments": "focus on the tests",
+    }
+
+
+def test_opencode_leaves_a_slash_it_does_not_know_as_an_ordinary_message(monkeypatch):
+    """A sentence that happens to start with a slash is still a sentence."""
+    events = [_opencode_event("session.idle")]
+
+    _seen, server = _opencode_turn(
+        events,
+        monkeypatch,
+        prompt="/usr/bin/env is on the path?",
+        commands=[("init", "guided setup")],
+    )
+
+    assert server.body("prompt_async")["parts"] == [
+        {"type": "text", "text": "/usr/bin/env is on the path?"}
+    ]
+    assert not any(path.endswith("/command") for path in server.paths())
+
+
+def test_opencode_reports_a_command_that_will_not_run_exactly_once(monkeypatch):
+    """Its command request answers only when the turn ends, so a failure can be
+    noticed from either thread — and the user should hear about it once."""
+    monkeypatch.setattr(
+        agent_backends, "opencode_commands", lambda *_a, **_k: [("init", "guided setup")]
+    )
+    monkeypatch.setattr(agent_backends, "opencode_default_model", lambda *_a, **_k: "")
+    server = _ScriptedOpencodeServer([])
+    server.fail = {"/command"}
+    monkeypatch.setattr(agent_backends, "opencode_server", lambda: server)
+    failures: list[str] = []
+    callbacks = _callbacks()
+    callbacks["on_failed"] = failures.append
+    worker = OpencodeWorker("/init", None, "/work", "default", **callbacks)
+
+    worker._do_run()
+    _wait_for(lambda: bool(failures))
+
+    assert len(failures) == 1
+    assert "/init" in failures[0]

@@ -38,6 +38,7 @@ import sys
 import tempfile
 import threading
 import time
+import webbrowser
 from collections import deque
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -62,6 +63,7 @@ from agent_backends import (
     BACKEND_FREEBUFF,
     BACKEND_IDS,
     BACKEND_LABELS,
+    BACKEND_OPENCODE,
     BACKENDS,
     FREEBUFF_PREFERRED_MODEL,
     AgentWorker,
@@ -75,9 +77,18 @@ from agent_backends import (
     freebuff_model_options,
     invalidate_backend_cache,
     normalize_backend,
+    opencode_auth_methods,
+    opencode_commands,
+    opencode_connect_api_key,
+    opencode_disconnect,
+    opencode_model_options,
+    opencode_oauth_finish,
+    opencode_oauth_start,
+    opencode_providers,
     prewarm_freebuff,
     reserve_hidden_console,
     set_freebuff_model,
+    stop_opencode_server,
     worker_class,
 )
 
@@ -173,7 +184,7 @@ def announce(text: str) -> None:
 
 
 APP_NAME = "BlindPilot"
-APP_VERSION = "0.3.14"
+APP_VERSION = "0.4.0"
 
 # Streamed coding-agent output can arrive much faster than a native list and a
 # screen reader can consume it. Process a bounded number of events per GUI turn
@@ -755,6 +766,7 @@ def install_claude(log: Callable[[str], None]) -> Optional[str]:
 _NPM_BACKEND_PACKAGES = {
     BACKEND_CODEX: "@openai/codex",
     BACKEND_FREEBUFF: "freebuff",
+    BACKEND_OPENCODE: "opencode-ai",
 }
 
 
@@ -786,6 +798,9 @@ def install_backend(backend: str, log: Callable[[str], None]) -> Optional[str]:
     if argv is None:
         log(f"npm was not found, so BlindPilot cannot install {label} automatically.")
         return None
+    if backend == BACKEND_OPENCODE:
+        # Same reason as an update: npm cannot replace a running executable.
+        stop_opencode_server()
     log(f"Installing {label} with npm. This can take a minute.")
     try:
         proc = subprocess.Popen(
@@ -886,6 +901,12 @@ def update_backend(backend: str, log: Callable[[str], None]) -> bool:
         if argv is None:
             log(f"npm was not found, so BlindPilot cannot update {label} automatically.")
             return False
+    if backend == BACKEND_OPENCODE:
+        # The server BlindPilot has been talking to *is* the executable npm is
+        # about to replace, and Windows will not overwrite one that is running.
+        # It is started again by the next thing that needs it.
+        log("Stopping opencode's server so its executable can be replaced...")
+        stop_opencode_server()
     log(f"Checking for {label} updates...")
     try:
         proc = subprocess.Popen(
@@ -1155,6 +1176,17 @@ def probe_model_options(
         models, efforts, current_model, current_effort, error = freebuff_model_options()
         return ModelOptions(models, efforts, current_model, current_effort, error)
 
+    if backend == BACKEND_OPENCODE:
+        models, efforts, current_model, current_effort, error = opencode_model_options(cwd)
+        options = ModelOptions(models, efforts, current_model, current_effort, error)
+        if models:
+            with _probe_lock:
+                _probe_cache[(f"{backend}:{cwd or ''}", _cli_stamp(binary))] = (
+                    time.time(),
+                    options,
+                )
+        return options
+
     # The two probes are independent, so the help text is fetched while the
     # slower `/model` status call is still running.
     help_text: List[str] = []
@@ -1286,6 +1318,13 @@ _CLAUDE_SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/status", "Show account and subscription status"),
 ]
 
+# opencode's own commands are not a fixed list: a project can define its own,
+# and BlindPilot reads whichever ones this directory has. Only /connect is
+# always there, because that one is BlindPilot's.
+_OPENCODE_SLASH_COMMANDS: list[tuple[str, str]] = [
+    ("/connect", "Connect a provider to opencode, or disconnect one [BlindPilot]"),
+]
+
 _FREEBUFF_SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/new", "Start a new FreeBuff conversation [BlindPilot]"),
     ("/history", "Open FreeBuff conversation history"),
@@ -1299,13 +1338,21 @@ _FREEBUFF_SLASH_COMMANDS: list[tuple[str, str]] = [
 ]
 
 
-def _slash_commands_for_backend(backend: str) -> list[tuple[str, str]]:
+def _slash_commands_for_backend(backend: str, cwd: Optional[str] = None) -> list[tuple[str, str]]:
     commands = list(_BLINDPILOT_SLASH_COMMANDS)
     backend = normalize_backend(backend)
     if backend == BACKEND_CLAUDE:
         commands.extend(_CLAUDE_SLASH_COMMANDS)
     elif backend == BACKEND_FREEBUFF:
         commands.extend(_FREEBUFF_SLASH_COMMANDS)
+    elif backend == BACKEND_OPENCODE:
+        commands.extend(_OPENCODE_SLASH_COMMANDS)
+        # Whatever this directory's opencode actually offers, which is its two
+        # built-in commands plus any the project defines for itself.
+        commands.extend(
+            (f"/{name}", description or f"Run opencode's {name} command")
+            for name, description in opencode_commands(cwd)
+        )
     return commands
 
 
@@ -2154,6 +2201,338 @@ class ModelDialog(wx.Dialog):
         )
 
 
+class ConnectDialog(wx.Dialog):
+    """/connect — sign opencode in to a provider, or sign it out of one.
+
+    opencode reaches a model through a provider you have connected, and it can
+    reach nearly two hundred of them. This is that list: the ones already
+    connected first, so the dialog opens on what is in use, and everything else
+    after. Connecting either stores an API key or walks a browser sign-in,
+    whichever the provider offers; both are done through opencode's own server,
+    so the result is the same as having typed /connect in its terminal.
+
+    Every call to the server happens off the UI thread, because a sign-in can
+    take as long as it takes somebody to finish it in a browser, and a dialog
+    that stops answering is a dialog a screen reader cannot describe.
+    """
+
+    def __init__(self, parent: wx.Window):
+        super().__init__(parent, title="Connect a provider to opencode")
+        self._providers: List[tuple[str, str]] = []
+        self._connected: set[str] = set()
+        self._busy = False
+
+        self.status = wx.StaticText(self, label="Reading opencode's provider list…")
+        self.status.Wrap(520)
+
+        list_label = wx.StaticText(self, label="&Providers:")
+        self.list = wx.ListBox(self, choices=[], style=wx.LB_SINGLE)
+        self.list.SetName("Providers")
+        self.list.SetMinSize(wx.Size(420, 260))
+
+        self.connect_btn = wx.Button(self, label="&Connect…")
+        self.disconnect_btn = wx.Button(self, label="&Disconnect")
+        close_btn = wx.Button(self, wx.ID_CANCEL, "Close")
+        self.connect_btn.Bind(wx.EVT_BUTTON, lambda _e: self._connect())
+        self.disconnect_btn.Bind(wx.EVT_BUTTON, lambda _e: self._disconnect())
+        self.list.Bind(wx.EVT_LISTBOX_DCLICK, lambda _e: self._connect())
+
+        buttons = wx.BoxSizer(wx.HORIZONTAL)
+        buttons.Add(self.connect_btn, 0, wx.RIGHT, 8)
+        buttons.Add(self.disconnect_btn, 0, wx.RIGHT, 8)
+        buttons.Add(close_btn, 0)
+
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        sizer.Add(self.status, 0, wx.ALL, 12)
+        sizer.Add(list_label, 0, wx.LEFT | wx.RIGHT, 12)
+        sizer.Add(self.list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 12)
+        sizer.Add(buttons, 0, wx.ALIGN_RIGHT | wx.ALL, 12)
+        self.SetSizerAndFit(sizer)
+
+        self.Bind(wx.EVT_CHAR_HOOK, self._on_key)
+        self.list.SetFocus()
+        self._refresh()
+
+    # ----- the list -----
+
+    def _refresh(self) -> None:
+        self._set_busy(True, "Reading opencode's provider list…")
+
+        def work() -> None:
+            providers, connected, error = opencode_providers()
+            wx.CallAfter(self._show, providers, connected, error)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show(self, providers: List[tuple[str, str]], connected: set, error: str) -> None:
+        if not self:  # closed while the list was being read
+            return
+        # Read what was selected against the list it was selected in: connecting
+        # a provider moves it to the top, so the position no longer means what
+        # it did, and re-reading it afterwards would land on somebody else.
+        selected = self._selected_id()
+        self._providers = list(providers)
+        self._connected = set(connected)
+        self.list.Set(
+            [
+                f"{name} — connected" if provider_id in self._connected else name
+                for provider_id, name in self._providers
+            ]
+        )
+        if self._providers:
+            index = next((i for i, (pid, _n) in enumerate(self._providers) if pid == selected), 0)
+            self.list.SetSelection(index)
+        message = error or (
+            f"{len(self._connected)} of {len(self._providers)} providers connected."
+        )
+        self._set_busy(False, message)
+
+    def _selected_id(self) -> str:
+        index = self.list.GetSelection()
+        if 0 <= index < len(self._providers):
+            return self._providers[index][0]
+        return ""
+
+    def _selected_name(self) -> str:
+        index = self.list.GetSelection()
+        if 0 <= index < len(self._providers):
+            return self._providers[index][1]
+        return ""
+
+    def _set_busy(self, busy: bool, message: str) -> None:
+        self._busy = busy
+        self.connect_btn.Enable(not busy)
+        self.disconnect_btn.Enable(not busy)
+        self.status.SetLabel(message)
+        self.status.Wrap(520)
+        self.Layout()
+        announce(message)
+
+    def _on_key(self, event: wx.KeyEvent) -> None:
+        if event.GetKeyCode() == wx.WXK_ESCAPE and not self._busy:
+            self.EndModal(wx.ID_CANCEL)
+            return
+        event.Skip()
+
+    # ----- connecting -----
+
+    def _ask(self, prompts: object, secret_key: str = "") -> Optional[dict]:
+        """Collect whatever a provider needs before it can be signed in to.
+
+        Providers ask for anything from an account id to a self-hosted URL, and
+        say so in their own words, so each question is asked as opencode words
+        it rather than as something guessed here. Returns None if cancelled.
+        """
+        answers: dict = {}
+        for prompt in prompts if isinstance(prompts, list) else []:
+            if not isinstance(prompt, dict):
+                continue
+            when = prompt.get("when")
+            if isinstance(when, dict):
+                # Some questions only apply given an earlier answer.
+                if answers.get(str(when.get("key"))) != when.get("value"):
+                    continue
+            key = str(prompt.get("key") or "")
+            message = str(prompt.get("message") or key)
+            if not key:
+                continue
+            if prompt.get("type") == "select":
+                options = [
+                    option for option in (prompt.get("options") or []) if isinstance(option, dict)
+                ]
+                labels = [
+                    " — ".join(
+                        part
+                        for part in (str(option.get("label") or ""), str(option.get("hint") or ""))
+                        if part
+                    )
+                    for option in options
+                ]
+                if not options:
+                    # A choice with nothing to choose from would be a dialog
+                    # with no answer; ask for the value in words instead.
+                    prompt = {**prompt, "type": "text"}
+                else:
+                    with wx.SingleChoiceDialog(self, message, "Connect", labels) as dlg:
+                        chosen = dlg.GetSelection() if dlg.ShowModal() == wx.ID_OK else -1
+                    if chosen < 0:
+                        return None
+                    answers[key] = str(options[chosen].get("value") or "")
+                    continue
+            placeholder = str(prompt.get("placeholder") or "")
+            label = f"{message}\n{placeholder}" if placeholder else message
+            with wx.TextEntryDialog(self, label, "Connect") as dlg:
+                if dlg.ShowModal() != wx.ID_OK:
+                    return None
+                answers[key] = dlg.GetValue().strip()
+        if secret_key:
+            with wx.TextEntryDialog(
+                self,
+                f"Paste the API key for {self._selected_name()}.\n"
+                "It is stored by opencode, not by BlindPilot.",
+                "Connect",
+                style=wx.TE_PASSWORD | wx.OK | wx.CANCEL,
+            ) as dlg:
+                if dlg.ShowModal() != wx.ID_OK:
+                    return None
+                key = dlg.GetValue().strip()
+            if not key:
+                return None
+            answers[secret_key] = key
+        return answers
+
+    def _connect(self) -> None:
+        if self._busy:
+            return
+        provider_id = self._selected_id()
+        if not provider_id:
+            announce("Choose a provider first.")
+            return
+        name = self._selected_name()
+        self._set_busy(True, f"Asking opencode how {name} can be signed in to…")
+
+        def work() -> None:
+            methods = opencode_auth_methods(provider_id)
+            wx.CallAfter(self._choose_method, provider_id, name, methods)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _choose_method(self, provider_id: str, name: str, methods: List[dict]) -> None:
+        if not self:
+            return
+        self._set_busy(False, f"{name}: choose how to sign in.")
+        if len(methods) == 1:
+            index = 0
+        else:
+            labels = [str(method.get("label") or method.get("type") or "") for method in methods]
+            with wx.SingleChoiceDialog(
+                self, f"How do you want to sign in to {name}?", "Connect", labels
+            ) as dlg:
+                if dlg.ShowModal() != wx.ID_OK:
+                    self._set_busy(False, "Sign-in cancelled.")
+                    return
+                index = dlg.GetSelection()
+        method = methods[index]
+        if str(method.get("type")) == "oauth":
+            self._oauth(provider_id, name, index, method)
+        else:
+            self._api_key(provider_id, name, method)
+
+    def _api_key(self, provider_id: str, name: str, method: dict) -> None:
+        answers = self._ask(method.get("prompts"), secret_key="__key__")
+        if answers is None:
+            self._set_busy(False, "Sign-in cancelled.")
+            return
+        key = answers.pop("__key__", "")
+        self._set_busy(True, f"Connecting {name}…")
+
+        def work() -> None:
+            error = opencode_connect_api_key(provider_id, key, answers)
+            wx.CallAfter(self._finished, name, error, "connected")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _oauth(self, provider_id: str, name: str, index: int, method: dict) -> None:
+        answers = self._ask(method.get("prompts"))
+        if answers is None:
+            self._set_busy(False, "Sign-in cancelled.")
+            return
+        self._set_busy(True, f"Starting the {name} sign-in…")
+
+        def work() -> None:
+            authorization, error = opencode_oauth_start(provider_id, index, answers)
+            wx.CallAfter(self._opened, provider_id, name, index, authorization, error)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _opened(
+        self, provider_id: str, name: str, index: int, authorization: dict, error: str
+    ) -> None:
+        if not self:
+            return
+        if error:
+            self._set_busy(False, error)
+            return
+        url = str(authorization.get("url") or "")
+        instructions = str(authorization.get("instructions") or "")
+        if url:
+            # Opening the browser is a convenience; the address is spoken and
+            # shown either way, so a machine with no default browser is not
+            # left with nothing to go on.
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass
+        if str(authorization.get("method")) == "code":
+            self._set_busy(False, f"Finish signing in to {name} in your browser.")
+            with wx.TextEntryDialog(
+                self,
+                f"{instructions or 'Sign in, then paste the code it gives you.'}\n\n{url}",
+                "Connect",
+            ) as dlg:
+                if dlg.ShowModal() != wx.ID_OK:
+                    self._set_busy(False, "Sign-in cancelled.")
+                    return
+                code = dlg.GetValue().strip()
+            if not code:
+                self._set_busy(False, "Sign-in cancelled — no code was pasted.")
+                return
+            self._set_busy(True, f"Waiting for {name} to confirm the sign-in…")
+        else:
+            code = ""
+            message = instructions or f"Finish signing in to {name} in your browser."
+            if url:
+                message = f"{message} The address is {url}"
+            self._set_busy(True, f"{message} Waiting for {name} to confirm it…")
+
+        def work() -> None:
+            failure = opencode_oauth_finish(provider_id, index, code)
+            wx.CallAfter(self._finished, name, failure, "connected")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _disconnect(self) -> None:
+        if self._busy:
+            return
+        provider_id = self._selected_id()
+        name = self._selected_name()
+        if not provider_id:
+            announce("Choose a provider first.")
+            return
+        if provider_id not in self._connected:
+            announce(f"{name} is not connected.")
+            return
+        if (
+            wx.MessageBox(
+                f"Sign opencode out of {name}?",
+                "Disconnect",
+                wx.YES_NO | wx.NO_DEFAULT | wx.ICON_QUESTION,
+                self,
+            )
+            != wx.YES
+        ):
+            return
+        self._set_busy(True, f"Disconnecting {name}…")
+
+        def work() -> None:
+            error = opencode_disconnect(provider_id)
+            wx.CallAfter(self._finished, name, error, "disconnected")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finished(self, name: str, error: str, what: str) -> None:
+        if not self:
+            return
+        if error:
+            self._set_busy(False, error)
+            return
+        # The model list is drawn from the connected providers, so it has to be
+        # re-read before /model is opened again.
+        invalidate_model_options(BACKEND_OPENCODE)
+        self._set_busy(False, f"{name} {what}. Type /model to pick one of its models.")
+        self._refresh()
+
+
 class NewSessionDialog(wx.Dialog):
     """New Session: a blank folder field, a Browse button, OK and Cancel.
 
@@ -2664,6 +3043,12 @@ class SessionPanel(wx.Panel):
             # be given a message. Start one now, so the first message of the
             # conversation does not spend that wait in silence.
             prewarm_freebuff(self.cwd, self._session_id, self.model)
+        if selected == BACKEND_OPENCODE:
+            # Same idea: opencode's server takes a few seconds to come up, and
+            # the model list and the first message both wait on it. Starting it
+            # now spends that wait while the user is still typing. The probe is
+            # what starts it, and it caches its answer for /model as well.
+            self.warm_model_probe()
         supports_permissions = selected != BACKEND_FREEBUFF
         self.mode_picker.Enable(supports_permissions)
         if supports_permissions:
@@ -2748,6 +3133,20 @@ class SessionPanel(wx.Panel):
             dlg.Destroy()
         self.set_model(model, effort)
 
+    def open_connect_dialog(self) -> None:
+        """/connect — opencode's provider list, as its own command offers it."""
+        if self.selected_backend() != BACKEND_OPENCODE:
+            self._announce(
+                "Error: /connect belongs to opencode. Switch the backend from the File menu first"
+            )
+            return
+        dlg = ConnectDialog(self)
+        try:
+            dlg.ShowModal()
+        finally:
+            dlg.Destroy()
+        self.prompt.SetFocus()
+
     def set_model(self, model: str, effort: str = "") -> None:
         """Apply the model / effort to every message sent from here on."""
         if self.selected_backend() == BACKEND_FREEBUFF and model != self.model:
@@ -2785,7 +3184,7 @@ class SessionPanel(wx.Panel):
 
     def _pick_slash_command(self) -> None:
         """Slash-command picker: choose a command to insert into the prompt."""
-        commands = _slash_commands_for_backend(self.selected_backend())
+        commands = _slash_commands_for_backend(self.selected_backend(), self.cwd)
         labels = [f"{cmd}  —  {desc}" for cmd, desc in commands]
         dlg = wx.SingleChoiceDialog(
             self,
@@ -3041,6 +3440,10 @@ class SessionPanel(wx.Panel):
             open_history = getattr(wx.GetTopLevelParent(self), "_open_history", None)
             if callable(open_history):
                 wx.CallAfter(open_history)
+            return
+        if low == "/connect":
+            self.prompt.SetValue("")
+            self.open_connect_dialog()
             return
 
         if (
@@ -3939,6 +4342,9 @@ class SetupWizard(wx.Dialog):
         info = BACKENDS[self.backend]
         label = info.label
         login = " ".join((info.executable, *info.login_args))
+        self._signin_btn.SetLabel(
+            "Connect a Provider" if self.backend == BACKEND_OPENCODE else "Sign In"
+        )
         self._welcome_text.SetLabel(
             "Welcome to BlindPilot.\n\n"
             "Choose the coding-agent backend you want to use first. This wizard "
@@ -3949,12 +4355,20 @@ class SetupWizard(wx.Dialog):
         self._welcome_text.Wrap(520)
         self._cli_install_btn.SetLabel(f"Install {label}")
         self._cli_update_btn.SetLabel(f"Update {label}")
-        self._signin_intro.SetLabel(
-            f"BlindPilot needs you to be signed in to use {label}.\n\n"
-            f"If you have already run '{login}' in a terminal, choose Already "
-            "Signed In. Otherwise choose Sign In and complete any browser or "
-            "terminal authentication that opens."
-        )
+        if self.backend == BACKEND_OPENCODE:
+            self._signin_intro.SetLabel(
+                f"{label} reaches a model through a provider you connect it to.\n\n"
+                "Choose Connect a Provider to pick one and give it an API key, or to "
+                "sign in through your browser. If you have already connected one, or "
+                f"already ran '{login}' in a terminal, choose Already Signed In."
+            )
+        else:
+            self._signin_intro.SetLabel(
+                f"BlindPilot needs you to be signed in to use {label}.\n\n"
+                f"If you have already run '{login}' in a terminal, choose Already "
+                "Signed In. Otherwise choose Sign In and complete any browser or "
+                "terminal authentication that opens."
+            )
         self._signin_intro.Wrap(520)
         limitations = ""
         if not info.supports_model:
@@ -4302,6 +4716,18 @@ class SetupWizard(wx.Dialog):
         announce(self._signin_status.GetLabel())
 
     def _do_login(self) -> None:
+        if self.backend == BACKEND_OPENCODE:
+            # opencode signs in by picking a provider and giving it a key or a
+            # browser round-trip, which is exactly what /connect does. Shelling
+            # out to the CLI's version of it would leave a terminal prompt
+            # nobody can see, waiting on input nobody can give it.
+            dlg = ConnectDialog(self)
+            try:
+                dlg.ShowModal()
+            finally:
+                dlg.Destroy()
+            self._check_signin()
+            return
         if not self._backend_path:
             self._backend_path = self._find_selected_cli()
         if not self._backend_path:
@@ -4440,7 +4866,7 @@ class MainFrame(wx.Frame):
         manage_backends_item = file_menu.Append(
             wx.ID_ANY,
             "&Manage Backends...",
-            "Install, update, or sign in to Claude Code, Codex, or FreeBuff",
+            "Install, update, or sign in to Claude Code, Codex, FreeBuff, or opencode",
         )
         set_pf_item = file_menu.Append(
             wx.ID_ANY,

@@ -52,7 +52,7 @@ jobs:
           python -m ruff format --check .
 
       - name: Compile source
-        run: python -m py_compile blind_pilot.py blindpilot_app.py app_updater.py claude_reader.py agent_backends.py markdown_rows.py
+        run: python -m py_compile blind_pilot.py blindpilot_app.py app_updater.py claude_reader.py agent_backends.py markdown_rows.py session_history.py
 
       - name: Build Windows application
         if: matrix.kind == 'windows'
