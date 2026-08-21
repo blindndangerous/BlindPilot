@@ -63,7 +63,7 @@ Settings live in `%APPDATA%\BlindPilot\config.json` on Windows and `~/.config/bl
 
 ## Set up a backend
 
-BlindPilot's first-run wizard and **File → Manage Backends** can find, install, update, and sign into any of the four. A missing CLI is reported as an actionable error and does not affect the others. To do it by hand:
+BlindPilot's first-run wizard and **File → Manage Backends** can find, install, update, and sign into any of the four. Claude Code uses its official native installer. For Codex, FreeBuff, and opencode, BlindPilot installs a current Node.js LTS for the user automatically when npm is missing, installs the CLI into a writable per-user folder, adds it to PATH, and verifies that the CLI starts. FreeBuff's verification also downloads its native binary before setup continues. No administrator rights are required. A failed backend remains isolated from the others. To do it by hand:
 
 ```powershell
 # Claude Code

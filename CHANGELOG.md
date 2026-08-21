@@ -4,6 +4,13 @@ Readable release history for BlindPilot. When adjacent releases were part of the
 same fix stream, they are combined with a version range such as
 `v0.3.6-v0.3.7`.
 
+## v0.5.1 - 2026-08-20
+
+- A clean computer can now install every backend from the setup wizard. Codex, FreeBuff, and opencode no longer stop at "npm was not found": BlindPilot downloads the current official Node.js LTS for that user, verifies its published SHA-256, installs the CLI into a writable per-user prefix, puts both on PATH, and proves the CLI starts before calling the install complete. FreeBuff's thin npm launcher is forced to download and verify its native binary during this check rather than surprising the first conversation with it.
+- FreeBuff sign-in now opens the URL its CLI prints. FreeBuff intentionally does not open a browser itself, while BlindPilot hid the terminal and all of its output; the old wizard therefore waited five minutes for a sign-in page the user had never been shown.
+- FreeBuff's current DeepSeek V4 Pro remains in the model picker. FreeBuff 0.0.152 changed its availability marker from `always` to `off_peak_only`; the binary catalog reader treated that as no model at all and quietly dropped the documented default.
+- A non-empty but malformed or partial FreeBuff credential file no longer counts as signed in. The check now requires the device token and both fingerprint fields FreeBuff itself needs.
+
 ## v0.5.0 - 2026-08-20
 
 - Sessions are real tabs. The window's session book is a native tab control now, so a screen reader announces "tab 2 of 4" and the name of the conversation in it, and **Ctrl+Tab** and **Ctrl+Shift+Tab** move between them from anywhere in the window — including from inside the prompt box. The session dropdown stays, for reaching tab 9 of 12 without stepping through the eight in between.

@@ -19,6 +19,7 @@ from agent_backends import (
     CodexWorker,
     FreebuffWorker,
     OpencodeWorker,
+    backend_auth_ok,
     backend_label,
     codex_model_options,
     freebuff_model_options,
@@ -45,6 +46,31 @@ def test_backend_names_are_normalized_and_claude_is_the_fallback():
     assert normalize_backend("Free Buff") == BACKEND_FREEBUFF
     assert normalize_backend("unknown") == BACKEND_CLAUDE
     assert backend_label(BACKEND_FREEBUFF) == "FreeBuff"
+
+
+def test_freebuff_auth_requires_a_complete_parseable_credential(monkeypatch, tmp_path):
+    credential = tmp_path / ".config" / "manicode" / "credentials.json"
+    credential.parent.mkdir(parents=True)
+    monkeypatch.setattr(agent_backends.Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setattr(agent_backends, "find_backend_cli", lambda _backend: "freebuff")
+
+    credential.write_text("not json", encoding="utf-8")
+    assert not backend_auth_ok(BACKEND_FREEBUFF)
+    credential.write_text(json.dumps({"default": {"authToken": "token"}}), encoding="utf-8")
+    assert not backend_auth_ok(BACKEND_FREEBUFF)
+    credential.write_text(
+        json.dumps(
+            {
+                "default": {
+                    "authToken": "token",
+                    "fingerprintId": "id",
+                    "fingerprintHash": "hash",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert backend_auth_ok(BACKEND_FREEBUFF)
 
 
 def test_worker_class_selects_each_adapter():
@@ -173,6 +199,34 @@ def test_freebuff_catalog_is_discovered_at_runtime_and_pro_is_default(monkeypatc
         (tmp_path / ".config" / "manicode" / "settings.json").read_text(encoding="utf-8")
     )
     assert settings["freebuffModel"] == "openai/gpt-next"
+
+
+def test_freebuff_catalog_keeps_the_current_off_peak_pro_model(monkeypatch, tmp_path):
+    """Freebuff 0.0.152 changed Pro from always to off_peak_only."""
+    wrapper = tmp_path / "npm" / "freebuff.cmd"
+    readme = wrapper.parent / "node_modules" / "freebuff" / "README.md"
+    executable = tmp_path / ".config" / "manicode" / "freebuff.exe"
+    readme.parent.mkdir(parents=True)
+    executable.parent.mkdir(parents=True)
+    wrapper.touch()
+    readme.write_text("DeepSeek V4 Pro\nDeepSeek V4 Flash\n", encoding="utf-8")
+    executable.write_text(
+        'pro="deepseek/deepseek-v4-pro",flash="deepseek/deepseek-v4-flash";'
+        'a={id:pro,displayName:"DeepSeek V4 Pro",availability:"off_peak_only"};'
+        'b={id:flash,displayName:"DeepSeek V4 Flash",availability:"always"};',
+        encoding="latin-1",
+    )
+    monkeypatch.setattr(agent_backends.Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setattr(agent_backends.platform, "system", lambda: "Windows")
+    monkeypatch.setenv("APPDATA", str(tmp_path / "AppData"))
+    monkeypatch.setattr(agent_backends, "find_backend_cli", lambda _backend: str(wrapper))
+    agent_backends.invalidate_backend_cache()
+
+    models, _efforts, current, _current_effort, error = freebuff_model_options()
+
+    assert models == ["deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash"]
+    assert current == "deepseek/deepseek-v4-pro"
+    assert error == ""
 
 
 def test_freebuff_catalog_keeps_a_model_the_readme_names_without_its_date(monkeypatch, tmp_path):

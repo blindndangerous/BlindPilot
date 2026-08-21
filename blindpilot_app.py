@@ -27,18 +27,24 @@ terminal sessions in different project folders.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
 import platform
+import queue
 import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 import webbrowser
+import zipfile
 from collections import deque
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -70,6 +76,7 @@ from agent_backends import (
     backend_auth_ok,
     backend_label,
     blindpilot_config_dir,
+    blindpilot_data_dir,
     codex_model_options,
     compaction_request,
     discard_freebuff_prewarm,
@@ -185,7 +192,7 @@ def announce(text: str) -> None:
 
 
 APP_NAME = "BlindPilot"
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.5.1"
 
 # Streamed coding-agent output can arrive much faster than a native list and a
 # screen reader can consume it. Process a bounded number of events per GUI turn
@@ -771,38 +778,266 @@ _NPM_BACKEND_PACKAGES = {
 }
 
 
+NODE_RELEASE_INDEX_URL = "https://nodejs.org/dist/index.json"
+NODE_RELEASE_BASE_URL = "https://nodejs.org/dist"
+_NODE_MINIMUM_MAJOR = 18
+
+
+def _managed_npm_prefix() -> Path:
+    """A writable per-user prefix owned by BlindPilot, never a system folder."""
+    return blindpilot_data_dir() / "npm"
+
+
+def _managed_npm_bin_dir() -> Path:
+    prefix = _managed_npm_prefix()
+    return prefix if platform.system() == "Windows" else prefix / "bin"
+
+
+def _node_runtime_root() -> Path:
+    return blindpilot_data_dir() / "runtimes" / "node"
+
+
+def _node_archive_spec(
+    version: str, system: Optional[str] = None, machine: Optional[str] = None
+) -> Optional[tuple[str, str]]:
+    """Return the official Node archive name and its extracted folder."""
+    system = system or platform.system()
+    machine = (machine or platform.machine()).casefold()
+    os_name = {"Windows": "win", "Darwin": "darwin", "Linux": "linux"}.get(system)
+    arch = {
+        "amd64": "x64",
+        "x86_64": "x64",
+        "arm64": "arm64",
+        "aarch64": "arm64",
+    }.get(machine)
+    if not os_name or not arch:
+        return None
+    stem = f"node-{version}-{os_name}-{arch}"
+    extension = ".zip" if system == "Windows" else ".tar.gz"
+    return stem + extension, stem
+
+
+def _managed_node_dir() -> Optional[Path]:
+    """Newest complete portable Node runtime previously installed by BlindPilot."""
+    spec = _node_archive_spec("v0.0.0")
+    if spec is None:
+        return None
+    marker = "-".join(spec[1].split("-")[-2:])
+    executable = "node.exe" if platform.system() == "Windows" else "bin/node"
+    npm = "npm.cmd" if platform.system() == "Windows" else "bin/npm"
+    candidates: list[tuple[tuple[int, ...], Path]] = []
+    try:
+        folders = _node_runtime_root().glob(f"node-v*-{marker}")
+        for folder in folders:
+            match = re.match(r"node-v(\d+(?:\.\d+)+)-", folder.name)
+            if match and (folder / executable).is_file() and (folder / npm).is_file():
+                candidates.append((tuple(int(part) for part in match.group(1).split(".")), folder))
+    except OSError:
+        return None
+    return max(candidates, default=((), None), key=lambda item: item[0])[1]
+
+
+def _managed_npm() -> Optional[str]:
+    runtime = _managed_node_dir()
+    if runtime is None:
+        return None
+    relative = "npm.cmd" if platform.system() == "Windows" else "bin/npm"
+    return str(runtime / relative)
+
+
+def activate_managed_cli_paths() -> None:
+    """Make BlindPilot-managed Node and backend launchers usable this run."""
+    runtime = _managed_node_dir()
+    if runtime is not None:
+        _add_to_process_path(runtime if platform.system() == "Windows" else runtime / "bin")
+    managed_bin = _managed_npm_bin_dir()
+    if managed_bin.is_dir():
+        _add_to_process_path(managed_bin)
+
+
+def _find_npm() -> Optional[str]:
+    return shutil.which("npm") or _managed_npm()
+
+
+def _automatic_npm_install_available() -> bool:
+    return _find_npm() is not None or _node_archive_spec("v0.0.0") is not None
+
+
+def _fetch_url_bytes(url: str, timeout: int = 30) -> bytes:
+    request = urllib.request.Request(url, headers={"User-Agent": f"BlindPilot/{APP_VERSION}"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read()
+
+
+def _safe_extract_node_archive(archive_path: Path, destination: Path) -> None:
+    """Extract one verified Node archive without permitting path traversal."""
+    destination.mkdir(parents=True, exist_ok=True)
+    root = destination.resolve()
+    if archive_path.suffix.casefold() == ".zip":
+        with zipfile.ZipFile(archive_path) as archive:
+            for member in archive.infolist():
+                target = (destination / member.filename).resolve()
+                if os.path.commonpath((str(root), str(target))) != str(root):
+                    raise OSError("The Node.js archive contains an unsafe path.")
+            archive.extractall(destination)
+        return
+    with tarfile.open(archive_path, mode="r:gz") as archive:
+        archive.extractall(destination, filter="data")
+
+
+def install_portable_node(log: Callable[[str], None]) -> Optional[str]:
+    """Install the latest Node LTS and npm for this user, with no elevation."""
+    existing = _managed_npm()
+    if existing:
+        node_bin = Path(existing).parent
+        try:
+            changed = ensure_on_path(node_bin)
+            if changed:
+                log(f"Added {node_bin} to {changed}.")
+        except OSError as exc:
+            log(f"Node.js is installed, but adding it to PATH failed: {exc}")
+        return existing
+    if _node_archive_spec("v0.0.0") is None:
+        log(
+            f"Automatic Node.js installation is not available for "
+            f"{platform.system()} {platform.machine()}."
+        )
+        return None
+
+    log("Node.js and npm were not found. Installing the latest Node.js LTS for this user.")
+    try:
+        releases = json.loads(_fetch_url_bytes(NODE_RELEASE_INDEX_URL).decode("utf-8"))
+        release = next(
+            item
+            for item in releases
+            if isinstance(item, dict)
+            and item.get("lts")
+            and isinstance(item.get("version"), str)
+            and int(item["version"].lstrip("v").split(".", 1)[0]) >= _NODE_MINIMUM_MAJOR
+        )
+        version = release["version"]
+        archive_name, extracted_name = _node_archive_spec(version) or ("", "")
+        if not archive_name:
+            raise OSError("No official Node.js archive is available for this computer.")
+        release_url = f"{NODE_RELEASE_BASE_URL}/{version}"
+        checksums = _fetch_url_bytes(f"{release_url}/SHASUMS256.txt").decode("utf-8")
+        checksum = next(
+            line.split()[0] for line in checksums.splitlines() if line.split()[1:] == [archive_name]
+        )
+    except (OSError, ValueError, StopIteration, urllib.error.URLError) as exc:
+        log(f"Could not discover the current Node.js LTS release: {exc}")
+        return None
+
+    runtime_root = _node_runtime_root()
+    destination = runtime_root / extracted_name
+    if destination.is_dir():
+        npm = destination / ("npm.cmd" if platform.system() == "Windows" else "bin/npm")
+        return str(npm) if npm.is_file() else None
+
+    try:
+        runtime_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="install-", dir=runtime_root) as temporary:
+            temporary_path = Path(temporary)
+            archive_path = temporary_path / archive_name
+            log(f"Downloading Node.js {version} from nodejs.org...")
+            request = urllib.request.Request(
+                f"{release_url}/{archive_name}",
+                headers={"User-Agent": f"BlindPilot/{APP_VERSION}"},
+            )
+            digest = hashlib.sha256()
+            with (
+                urllib.request.urlopen(request, timeout=60) as response,
+                open(archive_path, "wb") as output,
+            ):
+                while chunk := response.read(1024 * 1024):
+                    output.write(chunk)
+                    digest.update(chunk)
+            if digest.hexdigest().casefold() != checksum.casefold():
+                raise OSError("The downloaded Node.js archive failed SHA-256 verification.")
+            extract_root = temporary_path / "extracted"
+            _safe_extract_node_archive(archive_path, extract_root)
+            extracted = extract_root / extracted_name
+            if not extracted.is_dir():
+                raise OSError("The Node.js archive did not contain its expected folder.")
+            try:
+                os.replace(extracted, destination)
+            except FileExistsError:
+                pass  # Another install thread completed the same release first.
+    except (OSError, tarfile.TarError, zipfile.BadZipFile, urllib.error.URLError) as exc:
+        log(f"Node.js installation failed: {exc}")
+        return None
+
+    npm_path = destination / ("npm.cmd" if platform.system() == "Windows" else "bin/npm")
+    node_bin = destination if platform.system() == "Windows" else destination / "bin"
+    if not npm_path.is_file():
+        log("Node.js was extracted, but npm was missing from the installed runtime.")
+        return None
+    try:
+        changed = ensure_on_path(node_bin)
+        if changed:
+            log(f"Added {node_bin} to {changed}.")
+    except OSError as exc:
+        log(f"Node.js was installed, but adding it to PATH failed: {exc}")
+    log(f"Installed Node.js and npm: {npm_path}")
+    return str(npm_path)
+
+
+def _npm_environment(npm: str) -> dict[str, str]:
+    env = os.environ.copy()
+    directory = str(Path(npm).parent)
+    if not any(_same_dir(item, directory) for item in env.get("PATH", "").split(os.pathsep)):
+        env["PATH"] = directory + os.pathsep + env.get("PATH", "")
+    return env
+
+
 def _npm_install_argv(backend: str) -> Optional[List[str]]:
     """Return the npm command for a backend, or None if npm is unavailable."""
     package = _NPM_BACKEND_PACKAGES.get(normalize_backend(backend))
-    npm = shutil.which("npm")
+    npm = _find_npm()
     if not package or not npm:
         return None
-    return [npm, "install", "--global", package]
+    return [
+        npm,
+        "install",
+        "--global",
+        "--prefix",
+        str(_managed_npm_prefix()),
+        package,
+    ]
 
 
 def _npm_update_argv(backend: str) -> Optional[List[str]]:
     """Return an npm update command pinned to the package's latest tag."""
     package = _NPM_BACKEND_PACKAGES.get(normalize_backend(backend))
-    npm = shutil.which("npm")
+    npm = _find_npm()
     if not package or not npm:
         return None
-    return [npm, "install", "--global", f"{package}@latest"]
+    return [
+        npm,
+        "install",
+        "--global",
+        "--prefix",
+        str(_managed_npm_prefix()),
+        f"{package}@latest",
+    ]
 
 
-def install_backend(backend: str, log: Callable[[str], None]) -> Optional[str]:
-    """Install one selected backend and return its discovered executable."""
-    backend = normalize_backend(backend)
-    if backend == BACKEND_CLAUDE:
-        return install_claude(log)
-    argv = _npm_install_argv(backend)
-    label = backend_label(backend)
-    if argv is None:
-        log(f"npm was not found, so BlindPilot cannot install {label} automatically.")
-        return None
-    if backend == BACKEND_OPENCODE:
-        # Same reason as an update: npm cannot replace a running executable.
-        stop_opencode_server()
-    log(f"Installing {label} with npm. This can take a minute.")
+def _managed_backend_binary(backend: str) -> Optional[str]:
+    executable = BACKENDS[normalize_backend(backend)].executable
+    suffixes = (".exe", ".cmd", ".ps1", "") if platform.system() == "Windows" else ("",)
+    return next(
+        (
+            str(candidate)
+            for suffix in suffixes
+            if (candidate := _managed_npm_bin_dir() / f"{executable}{suffix}").is_file()
+        ),
+        None,
+    )
+
+
+def _run_logged_process(
+    argv: List[str], log: Callable[[str], None], env: Optional[dict[str, str]] = None
+) -> Optional[int]:
     try:
         proc = subprocess.Popen(
             argv,
@@ -812,6 +1047,7 @@ def install_backend(backend: str, log: Callable[[str], None]) -> Optional[str]:
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=env,
             **_no_window_kwargs(),
         )
     except OSError as exc:
@@ -822,12 +1058,48 @@ def install_backend(backend: str, log: Callable[[str], None]) -> Optional[str]:
         line = line.rstrip()
         if line:
             log(line)
-    rc = proc.wait()
-    binary = find_backend_cli(backend)
+    return proc.wait()
+
+
+def install_backend(backend: str, log: Callable[[str], None]) -> Optional[str]:
+    """Install one selected backend and return its discovered executable."""
+    backend = normalize_backend(backend)
+    if backend == BACKEND_CLAUDE:
+        return install_claude(log)
+    label = backend_label(backend)
+    npm = _find_npm()
+    if npm is None:
+        npm = install_portable_node(log)
+    argv = _npm_install_argv(backend) if npm else None
+    if argv is None:
+        log(f"npm could not be installed, so BlindPilot cannot install {label} automatically.")
+        return None
+    if backend == BACKEND_OPENCODE:
+        # Same reason as an update: npm cannot replace a running executable.
+        stop_opencode_server()
+    log(f"Installing {label} with npm. This can take a minute.")
+    rc = _run_logged_process(argv, log, env=_npm_environment(npm))
+    _add_to_process_path(_managed_npm_bin_dir())
+    binary = _managed_backend_binary(backend) or find_backend_cli(backend)
     if binary is None:
         log(f"npm finished with exit code {rc}, but {label} was not found afterwards.")
         return None
-    log(f"Installed: {binary}")
+    try:
+        changed = ensure_on_path(Path(binary).parent)
+        if changed:
+            log(f"Added {Path(binary).parent} to {changed}.")
+    except OSError as exc:
+        log(f"Installed, but adding it to PATH failed: {exc}")
+
+    # Freebuff's npm package is only a launcher. Asking every backend for its
+    # version both verifies it can start and makes Freebuff download and verify
+    # the native binary before the setup wizard advances to sign-in.
+    log(f"Verifying the {label} installation...")
+    verify_rc = _run_logged_process([binary, "--version"], log, env=_npm_environment(npm))
+    if verify_rc != 0:
+        log(f"{label} was installed but failed its startup check (exit code {verify_rc}).")
+        return None
+    log(f"Installed and verified: {binary}")
     return binary
 
 
@@ -898,9 +1170,12 @@ def update_backend(backend: str, log: Callable[[str], None]) -> bool:
     if backend == BACKEND_CLAUDE:
         argv = [binary, "update"]
     else:
+        if _find_npm() is None and install_portable_node(log) is None:
+            log(f"npm could not be installed, so BlindPilot cannot update {label} automatically.")
+            return False
         argv = _npm_update_argv(backend)
         if argv is None:
-            log(f"npm was not found, so BlindPilot cannot update {label} automatically.")
+            log(f"npm could not be found, so BlindPilot cannot update {label} automatically.")
             return False
     if backend == BACKEND_OPENCODE:
         # The server BlindPilot has been talking to *is* the executable npm is
@@ -909,31 +1184,31 @@ def update_backend(backend: str, log: Callable[[str], None]) -> bool:
         log("Stopping opencode's server so its executable can be replaced...")
         stop_opencode_server()
     log(f"Checking for {label} updates...")
-    try:
-        proc = subprocess.Popen(
-            argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            **_no_window_kwargs(),
-        )
-    except OSError as exc:
-        log(f"The updater could not be started: {exc}")
-        return False
-    assert proc.stdout is not None
-    for line in proc.stdout:
-        line = line.rstrip()
-        if line:
-            log(line)
-    rc = proc.wait()
+    npm = _find_npm() if backend != BACKEND_CLAUDE else None
+    rc = _run_logged_process(argv, log, env=_npm_environment(npm) if npm else None)
     if rc != 0:
         log(f"{label} update exited with code {rc}.")
         return False
     if backend == BACKEND_CLAUDE and not _repair_claude_native_update(binary, log):
         return False
+    if backend != BACKEND_CLAUDE:
+        _add_to_process_path(_managed_npm_bin_dir())
+        managed_binary = _managed_backend_binary(backend)
+        if managed_binary is None:
+            log(f"{label} updated, but its executable was not found afterwards.")
+            return False
+        try:
+            changed = ensure_on_path(Path(managed_binary).parent)
+            if changed:
+                log(f"Added {Path(managed_binary).parent} to {changed}.")
+        except OSError as exc:
+            log(f"{label} updated, but adding it to PATH failed: {exc}")
+        verify_rc = _run_logged_process(
+            [managed_binary, "--version"], log, env=_npm_environment(npm or "")
+        )
+        if verify_rc != 0:
+            log(f"{label} updated but failed its startup check (exit code {verify_rc}).")
+            return False
     if backend == BACKEND_FREEBUFF:
         invalidate_backend_cache(BACKEND_FREEBUFF)
         models, _efforts, _current, _effort, _error = freebuff_model_options()
@@ -4148,6 +4423,15 @@ class SessionPanel(wx.Panel):
             self._worker.join(timeout=3)
 
 
+_LOGIN_URL_RE = re.compile(r"https?://[^\s\x1b<>]+", re.IGNORECASE)
+
+
+def _first_login_url(text: str) -> str:
+    """Extract a browser-safe URL from plain CLI login output."""
+    match = _LOGIN_URL_RE.search(text)
+    return match.group(0).rstrip(".,;:)]}'\"") if match else ""
+
+
 class SetupWizard(wx.Dialog):
     """Choose, install, and authenticate a BlindPilot backend."""
 
@@ -4426,7 +4710,12 @@ class SetupWizard(wx.Dialog):
     def _selected_install_argv(self) -> Optional[List[str]]:
         if self.backend == BACKEND_CLAUDE:
             return _install_argv()
-        return _npm_install_argv(self.backend)
+        argv = _npm_install_argv(self.backend)
+        if argv is not None:
+            return argv
+        # The actual Node.js command is discovered at install time. A sentinel
+        # keeps the accessible Install button available on a clean computer.
+        return ["managed-node-lts"] if _automatic_npm_install_available() else None
 
     # ---- navigation ----
 
@@ -4575,10 +4864,21 @@ class SetupWizard(wx.Dialog):
             self._next_btn.Enable(True)
         elif self._selected_install_argv() is not None:
             self._cli_status.SetLabel(f"{info.label} is not installed.")
-            self._cli_detail.SetLabel(
-                f"Choose Install {info.label} to run:\n\n{info.install_command}\n\n"
-                "You can also run that command in a terminal and choose Check Again."
-            )
+            if _find_npm() is None:
+                self._cli_detail.SetLabel(
+                    f"Choose Install {info.label}. BlindPilot will first install the "
+                    "latest Node.js LTS and npm for your user account, without administrator "
+                    f"rights, then install and verify {info.label} and add it to PATH.\n\n"
+                    f"To do it yourself, install Node.js and run:\n\n{info.install_command}\n\n"
+                    "Then choose Check Again."
+                )
+            else:
+                self._cli_detail.SetLabel(
+                    f"Choose Install {info.label} to run:\n\n{info.install_command}\n\n"
+                    "BlindPilot installs it for your user account, verifies that it starts, "
+                    "and adds it to PATH. You can also run the command in a terminal and "
+                    "choose Check Again."
+                )
             self._cli_install_btn.Show()
             self._cli_update_btn.Hide()
             self._cli_path_btn.Hide()
@@ -4588,9 +4888,9 @@ class SetupWizard(wx.Dialog):
         else:
             self._cli_status.SetLabel(f"{info.label} was not found.")
             self._cli_detail.SetLabel(
-                f"npm is required for automatic installation. Install Node.js and npm, "
-                f"then run:\n\n{info.install_command}\n\nThen choose Check Again, "
-                "or go Back and select another backend."
+                f"Automatic Node.js installation is unavailable on this computer. Install "
+                f"Node.js and npm, then run:\n\n{info.install_command}\n\nThen choose "
+                "Check Again, or go Back and select another backend."
             )
             self._cli_install_btn.Hide()
             self._cli_update_btn.Hide()
@@ -4783,19 +5083,79 @@ class SetupWizard(wx.Dialog):
                 errors="replace",
                 **_no_window_kwargs(),
             )
-            # Only the wait can time out, and killing the process is only
-            # possible once there is one, so the timeout is caught here rather
-            # than beside the failures that can happen before it starts.
-            try:
-                _out, _ = proc.communicate(timeout=300)
-                rc = proc.returncode
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.communicate()
-                rc = -1
+            if self.backend == BACKEND_FREEBUFF:
+                # Freebuff's plain login deliberately prints a URL instead of
+                # opening it. BlindPilot runs without a visible console, so
+                # swallowing that output leaves the user waiting on a browser
+                # that can never appear. Pump the URL out immediately and open
+                # it on the user's behalf while the CLI polls for completion.
+                assert proc.stdout is not None
+                output: queue.Queue[Optional[str]] = queue.Queue()
+
+                def pump() -> None:
+                    try:
+                        for raw in proc.stdout:
+                            output.put(raw.rstrip())
+                    finally:
+                        output.put(None)
+
+                threading.Thread(target=pump, daemon=True).start()
+                deadline = time.monotonic() + 300
+                saw_end = False
+                login_url = ""
+                while time.monotonic() < deadline and not (saw_end and proc.poll() is not None):
+                    try:
+                        line = output.get(timeout=0.2)
+                    except queue.Empty:
+                        continue
+                    if line is None:
+                        saw_end = True
+                        continue
+                    if not line:
+                        continue
+                    url = _first_login_url(line)
+                    if url and not login_url:
+                        login_url = url
+                        try:
+                            opened = bool(webbrowser.open(url))
+                        except Exception:
+                            opened = False
+                        wx.CallAfter(self._on_freebuff_login_url, url, opened)
+                    elif not login_url:
+                        wx.CallAfter(self._on_login_progress, line)
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+                    rc = -1
+                else:
+                    rc = proc.returncode
+            else:
+                # Only the wait can time out, and killing the process is only
+                # possible once there is one, so the timeout is caught here.
+                try:
+                    _out, _ = proc.communicate(timeout=300)
+                    rc = proc.returncode
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.communicate()
+                    rc = -1
         except Exception:
             rc = -2
         wx.CallAfter(self._on_login_done, rc)
+
+    def _on_login_progress(self, text: str) -> None:
+        self._signin_status.SetLabel(text)
+        self._signin_status.Wrap(520)
+        self._pages[2].Layout()
+        self.Layout()
+        announce(text)
+
+    def _on_freebuff_login_url(self, url: str, opened: bool) -> None:
+        if opened:
+            text = "FreeBuff sign-in opened in your browser. Complete it, then return here."
+        else:
+            text = f"Could not open the browser automatically. Open this sign-in URL: {url}"
+        self._on_login_progress(text)
 
     def _on_login_done(self, rc: int) -> None:
         self._signin_btn.Enable()
@@ -5656,6 +6016,7 @@ def main() -> int:
     # PATH that points back into its own install folder, or the files there
     # stay open long after BlindPilot has closed and cannot be updated.
     keep_bundle_off_child_path()
+    activate_managed_cli_paths()
     # Claim the console before anything can create one on screen. Doing it here,
     # rather than when a terminal is first needed, keeps it out of the way of
     # the first message as well as every later one.

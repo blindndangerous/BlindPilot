@@ -333,6 +333,8 @@ def backend_label(backend: str) -> str:
 
 def _fallback_cli_paths(name: str) -> tuple[Path, ...]:
     home = Path.home()
+    managed = blindpilot_data_dir() / "npm"
+    managed_bin = managed if platform.system() == "Windows" else managed / "bin"
     if platform.system() == "Windows":
         appdata = Path(os.environ.get("APPDATA", home / "AppData" / "Roaming"))
         local = Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local"))
@@ -341,6 +343,7 @@ def _fallback_cli_paths(name: str) -> tuple[Path, ...]:
             filename = name + suffix
             candidates.extend(
                 [
+                    managed_bin / filename,
                     appdata / "npm" / filename,
                     home / ".local" / "bin" / filename,
                     home / ".volta" / "bin" / filename,
@@ -350,6 +353,7 @@ def _fallback_cli_paths(name: str) -> tuple[Path, ...]:
             )
         return tuple(candidates)
     return (
+        managed_bin / name,
         home / ".local" / "bin" / name,
         Path("/opt/homebrew/bin") / name,
         Path("/usr/local/bin") / name,
@@ -361,6 +365,16 @@ def _fallback_cli_paths(name: str) -> tuple[Path, ...]:
 def find_backend_cli(backend: str) -> Optional[str]:
     """Find a provider CLI even in the restricted PATH inherited by a GUI."""
     info = BACKENDS[normalize_backend(backend)]
+    # A backend BlindPilot installed itself is complete, writable by this user,
+    # and updated through the same prefix. Prefer it over an older system/npm
+    # copy that happens to occur earlier on PATH.
+    managed = blindpilot_data_dir() / "npm"
+    managed_bin = managed if platform.system() == "Windows" else managed / "bin"
+    suffixes = (".exe", ".cmd", ".ps1", "") if platform.system() == "Windows" else ("",)
+    for suffix in suffixes:
+        candidate = managed_bin / f"{info.executable}{suffix}"
+        if candidate.is_file():
+            return str(candidate)
     found = shutil.which(info.executable)
     if found:
         return found
@@ -414,7 +428,15 @@ def backend_auth_ok(backend: str, timeout: int = 12) -> bool:
             return proc.returncode == 0
         if backend == BACKEND_FREEBUFF:
             credential = Path.home() / ".config" / "manicode" / "credentials.json"
-            return credential.is_file() and credential.stat().st_size > 2
+            try:
+                payload = json.loads(credential.read_text(encoding="utf-8"))
+                account = payload.get("default") if isinstance(payload, dict) else None
+                return isinstance(account, dict) and all(
+                    isinstance(account.get(field), str) and account[field].strip()
+                    for field in ("authToken", "fingerprintId", "fingerprintHash")
+                )
+            except (OSError, ValueError):
+                return False
         if backend == BACKEND_OPENCODE:
             return _opencode_auth_ok()
     except (OSError, subprocess.TimeoutExpired):
@@ -539,6 +561,15 @@ def blindpilot_config_dir() -> Path:
         base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
         return Path(base) / "BlindPilot"
     return Path.home() / ".config" / "blindpilot"
+
+
+def blindpilot_data_dir() -> Path:
+    """Per-user, non-roaming storage for managed runtimes and CLI packages."""
+    if platform.system() == "Windows":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(base) / "BlindPilot"
+    base = os.environ.get("XDG_DATA_HOME")
+    return (Path(base) if base else Path.home() / ".local" / "share") / "blindpilot"
 
 
 def _freebuff_choice_path() -> Path:
@@ -705,7 +736,7 @@ def _freebuff_models_from_install(binary: Optional[str]) -> list[str]:
 
     pattern = re.compile(
         r'([A-Za-z_$][\w$]*)=\{id:([^,}]+),displayName:"([^"]+)"'
-        r'[^{}]{0,1000}?availability:"always"'
+        r'[^{}]{0,1000}?availability:"(?:always|off_peak_only)"'
     )
     matches = list(pattern.finditer(source))
     if not matches:
