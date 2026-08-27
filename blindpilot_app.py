@@ -48,7 +48,7 @@ import zipfile
 from collections import deque
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Sequence
 
 import wx
 
@@ -73,6 +73,9 @@ from agent_backends import (
     BACKENDS,
     FREEBUFF_PREFERRED_MODEL,
     AgentWorker,
+    AskQuestions,
+    Question,
+    QuestionOption,
     backend_auth_ok,
     backend_label,
     blindpilot_config_dir,
@@ -93,6 +96,7 @@ from agent_backends import (
     opencode_oauth_start,
     opencode_providers,
     prewarm_freebuff,
+    question_summary,
     reserve_hidden_console,
     set_freebuff_model,
     stop_opencode_server,
@@ -192,7 +196,7 @@ def announce(text: str) -> None:
 
 
 APP_NAME = "BlindPilot"
-APP_VERSION = "0.5.1"
+APP_VERSION = "0.6.0"
 
 # Streamed coding-agent output can arrive much faster than a native list and a
 # screen reader can consume it. Process a bounded number of events per GUI turn
@@ -2051,6 +2055,50 @@ class Turn:
     response: str = ""
 
 
+# The tool Claude Code stops a turn to ask a multiple-choice question with.
+ASK_USER_QUESTION_TOOL = "AskUserQuestion"
+
+# What to pass to `--permission-prompt-tool`. "stdio" means "this host answers
+# permission prompts on the JSON stream it is already reading", which is what
+# makes AskUserQuestion available at all in headless mode. Cleared for the rest
+# of the session if the installed Claude Code turns out not to know the flag,
+# so an older CLI keeps working exactly as it did — without questions.
+_CLAUDE_PERMISSION_PROMPT_TOOL = "stdio"
+
+
+def _claude_questions(raw: list) -> tuple[Question, ...]:
+    """Read AskUserQuestion's input into BlindPilot's own question shape.
+
+    Claude Code always offers an "Other" answer of its own, whatever the
+    question says, so `allow_custom` is not read from the payload.
+    """
+    questions: list[Question] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        text = str(entry.get("question") or "").strip()
+        if not text:
+            continue
+        options: list[QuestionOption] = []
+        for option in entry.get("options") or []:
+            if isinstance(option, dict) and option.get("label"):
+                options.append(
+                    QuestionOption(
+                        str(option["label"]),
+                        str(option.get("description") or ""),
+                    )
+                )
+        questions.append(
+            Question(
+                question=text,
+                header=str(entry.get("header") or ""),
+                options=tuple(options),
+                multi_select=bool(entry.get("multiSelect")),
+            )
+        )
+    return tuple(questions)
+
+
 class ClaudeWorker(threading.Thread):
     """Runs the Claude Code CLI subprocess and delivers results via callbacks.
 
@@ -2073,6 +2121,7 @@ class ClaudeWorker(threading.Thread):
         on_complete: Callable[[str], None],
         on_failed: Callable[[str], None],
         on_done: Callable[[], None],
+        on_question: Optional[AskQuestions] = None,
     ):
         super().__init__(daemon=True)
         self._prompt = prompt
@@ -2087,6 +2136,7 @@ class ClaudeWorker(threading.Thread):
         self._on_complete = on_complete
         self._on_failed = on_failed
         self._on_done = on_done
+        self._on_question = on_question
         self._proc: Optional[subprocess.Popen] = None
         self._cancelled = False
         # Set once the process is up and the opening prompt has gone in, cleared
@@ -2099,12 +2149,23 @@ class ClaudeWorker(threading.Thread):
         """Whether the active Claude turn can accept a steering message."""
         return self._accepting_input.is_set() and not self._cancelled
 
-    def _write_message(self, text: str) -> bool:
-        """Push one user message into the running process. False if it failed."""
+    def _write_json(self, payload: dict) -> bool:
+        """Write one JSON line to the running process. False if it failed."""
         proc = self._proc
         if proc is None or proc.stdin is None:
             return False
-        payload = json.dumps(
+        try:
+            with self._write_lock:
+                proc.stdin.write(json.dumps(payload) + "\n")
+                proc.stdin.flush()
+        except (OSError, ValueError):
+            # Pipe closed underneath us — the turn finished as we wrote.
+            return False
+        return True
+
+    def _write_message(self, text: str) -> bool:
+        """Push one user message into the running process. False if it failed."""
+        return self._write_json(
             {
                 "type": "user",
                 "message": {
@@ -2113,14 +2174,6 @@ class ClaudeWorker(threading.Thread):
                 },
             }
         )
-        try:
-            with self._write_lock:
-                proc.stdin.write(payload + "\n")
-                proc.stdin.flush()
-        except (OSError, ValueError):
-            # Pipe closed underneath us — the turn finished as we wrote.
-            return False
-        return True
 
     def steer(self, text: str) -> bool:
         """Send a follow-up message into the turn that is already running.
@@ -2159,6 +2212,118 @@ class ClaudeWorker(threading.Thread):
             self._close_stdin()
             self._on_done()
 
+    @staticmethod
+    def _retry_without_prompt_tool(stderr_text: str) -> bool:
+        """Whether this failure was `--permission-prompt-tool` and is now off."""
+        global _CLAUDE_PERMISSION_PROMPT_TOOL
+        if not _CLAUDE_PERMISSION_PROMPT_TOOL:
+            return False
+        if "permission-prompt-tool" not in stderr_text:
+            return False
+        _CLAUDE_PERMISSION_PROMPT_TOOL = ""
+        return True
+
+    def _handle_control_request(self, event: dict) -> None:
+        """Answer one control request from the CLI.
+
+        Only `can_use_tool` reaches us, because that is the only kind
+        `--permission-prompt-tool stdio` turns on. AskUserQuestion arrives that
+        way too: the CLI asks permission to run it and takes the answers back in
+        the tool's own input, so the dialog is opened here and what the person
+        chose is written into `answers` before the tool is allowed to run.
+
+        Every request has to be answered. One left hanging holds the turn open
+        for good, which sounds exactly like a model that has stopped thinking.
+        """
+        request = event.get("request") or {}
+        request_id = event.get("request_id")
+        if not isinstance(request, dict) or not isinstance(request_id, str):
+            return
+        if request.get("subtype") != "can_use_tool":
+            # Nothing else is switched on for this session. Say so rather than
+            # stay silent, so an unexpected request cannot stall the turn.
+            self._write_json(
+                {
+                    "type": "control_response",
+                    "response": {
+                        "subtype": "error",
+                        "request_id": request_id,
+                        "error": "BlindPilot does not handle this request",
+                    },
+                }
+            )
+            return
+
+        tool = str(request.get("tool_name") or "")
+        payload = request.get("input")
+        payload = payload if isinstance(payload, dict) else {}
+        if tool == ASK_USER_QUESTION_TOOL and self._on_question is not None:
+            self._answer_ask_user_question(request_id, payload)
+            return
+        # Any other tool: the permission mode decided this before the prompt
+        # tool existed, and it still does. Headless Claude Code denies whatever
+        # its mode leaves to a prompt, so denying here keeps every mode behaving
+        # exactly as it did.
+        self._write_json(
+            {
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": request_id,
+                    "response": {
+                        "behavior": "deny",
+                        "message": (
+                            f"{tool or 'That tool'} needs approval, which the "
+                            f"{self._permission_mode or 'current'} permission mode does not give."
+                        ),
+                    },
+                },
+            }
+        )
+
+    def _answer_ask_user_question(self, request_id: str, payload: dict) -> None:
+        """Put AskUserQuestion in front of the person and send back their answers.
+
+        Claude Code takes the answers as part of the tool's input: a map from
+        each question's own text to the chosen labels, joined by commas when the
+        question allowed more than one. Allowing the call with that map filled in
+        is what makes the tool report the answers to the model.
+        """
+        raw = payload.get("questions")
+        questions = _claude_questions(raw if isinstance(raw, list) else [])
+        answers = self._on_question(questions) if (questions and self._on_question) else None
+        self._on_activity("tool", question_summary(questions, answers))
+        if answers is None:
+            self._write_json(
+                {
+                    "type": "control_response",
+                    "response": {
+                        "subtype": "success",
+                        "request_id": request_id,
+                        "response": {
+                            "behavior": "deny",
+                            "message": "The user closed the question without answering it.",
+                        },
+                    },
+                }
+            )
+            return
+        updated = dict(payload)
+        updated["answers"] = {
+            question.question: ", ".join(answers[index]) if index < len(answers) else ""
+            for index, question in enumerate(questions)
+        }
+        self._write_json(
+            {
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": request_id,
+                    "response": {"behavior": "allow", "updatedInput": updated},
+                },
+            }
+        )
+
     def _do_run(self) -> None:
         binary = _find_claude()
         if binary is None:
@@ -2178,6 +2343,15 @@ class ClaudeWorker(threading.Thread):
             "stream-json",
             "--verbose",
         ]
+        # AskUserQuestion is the tool Claude Code stops a turn to ask with, and
+        # in headless mode the CLI leaves it out of the tool set unless the
+        # host says it can render a permission prompt. "stdio" is how it is
+        # told that: the prompt then arrives as a `can_use_tool` control
+        # request on this same stream, and the answer goes back the same way.
+        # Nothing else changes — every other tool's decision still comes from
+        # the permission mode, exactly as it did before.
+        if _CLAUDE_PERMISSION_PROMPT_TOOL:
+            cmd.extend(["--permission-prompt-tool", _CLAUDE_PERMISSION_PROMPT_TOOL])
         if self._permission_mode:
             cmd.extend(["--permission-mode", self._permission_mode])
         # Left off entirely when unset, so the CLI's own default applies.
@@ -2241,7 +2415,13 @@ class ClaudeWorker(threading.Thread):
 
             etype = event.get("type")
 
-            if etype == "system" and event.get("subtype") == "init":
+            if etype == "control_request":
+                # Answered on this thread, so a question blocks reading the
+                # stream for as long as the dialog is open — which is what a
+                # turn waiting on an answer is supposed to do.
+                self._handle_control_request(event)
+
+            elif etype == "system" and event.get("subtype") == "init":
                 sid = event.get("session_id")
                 if sid:
                     self._on_session(sid)
@@ -2331,6 +2511,12 @@ class ClaudeWorker(threading.Thread):
                     pass
             if _looks_like_auth_error(stderr_text):
                 self._on_failed(AUTH_HINT)
+                return
+            if self._retry_without_prompt_tool(stderr_text):
+                # The installed Claude Code is older than the flag. Turn it off
+                # for the rest of the session and send the message again, so a
+                # missing question feature never costs somebody their turn.
+                self._do_run()
                 return
             detail = f": {stderr_text}" if stderr_text else ""
             self._on_failed(f"Claude Code exited with code {rc}{detail}")
@@ -2473,6 +2659,197 @@ class ModelDialog(wx.Dialog):
             "" if model in (DEFAULT_CHOICE, self._model_keep) else model,
             "" if effort in (DEFAULT_CHOICE, self._effort_keep) else effort,
         )
+
+
+def _question_choice(option: QuestionOption) -> str:
+    """One answer as a single line, because that is how it is read aloud.
+
+    A colon rather than a dash: the descriptions have dashes of their own, and
+    two kinds of dash in one line is a sentence nobody can follow by ear.
+    """
+    if not option.description:
+        return option.label
+    return f"{option.label}: {option.description}"
+
+
+class QuestionDialog(wx.Dialog):
+    """A backend's own mid-run question, asked as a dialog.
+
+    Every backend BlindPilot drives can stop a turn to ask something, and all
+    four ask the same shape of question: some text, a short list of answers,
+    and permission to type one of your own instead. That last one is the
+    "Other" every one of their tools tells the model not to write itself, and
+    it is offered here as the final choice in each list: picking it opens a
+    text box underneath.
+
+    A question that takes one answer gets radio buttons, one that takes several
+    gets a checked list. Esc leaves the question unanswered, which each adapter
+    reports to its backend in whatever way that backend understands.
+    """
+
+    OTHER = "Other: type your own answer"
+
+    def __init__(self, parent: wx.Window, backend: str, questions: Sequence[Question]):
+        plural = "s" if len(questions) > 1 else ""
+        super().__init__(
+            parent,
+            title=f"{backend_label(backend)} question{plural}",
+            style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER,
+        )
+        self._questions = list(questions)
+        self._pickers: list[wx.Window] = []
+        self._texts: list[wx.TextCtrl] = []
+        self._labels: list[wx.StaticText] = []
+
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        intro = wx.StaticText(
+            self,
+            label=(
+                f"{backend_label(backend)} has paused this turn to ask "
+                f"{'you these questions' if plural else 'you a question'}."
+            ),
+        )
+        sizer.Add(intro, 0, wx.ALL, 12)
+
+        for index, question in enumerate(questions):
+            title = question.question
+            if len(questions) > 1:
+                title = f"{index + 1} of {len(questions)}. {title}"
+            if question.header:
+                title = f"{title} ({question.header})"
+            choices = [_question_choice(option) for option in question.options]
+            if question.allow_custom:
+                choices.append(self.OTHER)
+            if question.multi_select:
+                # A checked list is what a screen reader reads as "check box,
+                # not checked" per line, which is what "pick as many as you
+                # like" has to sound like.
+                heading = wx.StaticText(self, label=title)
+                heading.Wrap(560)
+                picker: wx.Window = wx.CheckListBox(self, choices=choices)
+                picker.SetName(question.question)
+                picker.Bind(wx.EVT_CHECKLISTBOX, self._on_choice)
+                sizer.Add(heading, 0, wx.LEFT | wx.RIGHT | wx.TOP, 12)
+                sizer.Add(picker, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 12)
+            else:
+                picker = wx.RadioBox(
+                    self,
+                    label=title,
+                    choices=choices,
+                    majorDimension=1,
+                    style=wx.RA_SPECIFY_COLS,
+                )
+                picker.SetName(question.question)
+                picker.Bind(wx.EVT_RADIOBOX, self._on_choice)
+                sizer.Add(picker, 0, wx.EXPAND | wx.ALL, 12)
+            self._pickers.append(picker)
+
+            label = wx.StaticText(self, label="&Your own answer:")
+            # Codex can mark a question whose answer is a secret. Masking it is
+            # the whole of what that means here: the transcript already keeps
+            # the fact of an answer rather than the answer.
+            style = wx.TE_PROCESS_ENTER | (wx.TE_PASSWORD if question.secret else 0)
+            entry = wx.TextCtrl(self, style=style)
+            entry.SetName(f"Your own answer to {question.question}")
+            label.Hide()
+            entry.Hide()
+            sizer.Add(label, 0, wx.LEFT | wx.RIGHT, 24)
+            sizer.Add(entry, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 24)
+            self._labels.append(label)
+            self._texts.append(entry)
+
+        buttons = self.CreateStdDialogButtonSizer(wx.OK | wx.CANCEL)
+        ok = self.FindWindowById(wx.ID_OK)
+        if isinstance(ok, wx.Button):
+            ok.SetLabel("&Send answer" + plural)
+        cancel = self.FindWindowById(wx.ID_CANCEL)
+        if isinstance(cancel, wx.Button):
+            cancel.SetLabel("&Do not answer")
+        if buttons is not None:
+            sizer.Add(buttons, 0, wx.ALIGN_RIGHT | wx.ALL, 12)
+        self.SetSizerAndFit(sizer)
+
+        self.Bind(wx.EVT_BUTTON, self._on_ok, id=wx.ID_OK)
+        self.Bind(wx.EVT_CHAR_HOOK, self._on_key)
+        if self._pickers:
+            self._pickers[0].SetFocus()
+
+    def _picked(self, index: int) -> list[int]:
+        """Which entries are chosen for one question, by position in its list.
+
+        By position rather than by what the line says: the line is
+        "label — description", and a label with a dash of its own in it would
+        not survive being taken apart again.
+        """
+        picker = self._pickers[index]
+        if isinstance(picker, wx.CheckListBox):
+            return list(picker.GetCheckedItems())
+        if isinstance(picker, wx.RadioBox) and picker.GetSelection() != wx.NOT_FOUND:
+            return [picker.GetSelection()]
+        return []
+
+    def _wants_custom(self, index: int) -> bool:
+        """Whether "Other" is chosen — always the last entry, when offered."""
+        question = self._questions[index]
+        return question.allow_custom and len(question.options) in self._picked(index)
+
+    def _on_choice(self, event: wx.CommandEvent) -> None:
+        """Show the text box as soon as "Other" is chosen, and say so."""
+        event.Skip()
+        changed = False
+        for index in range(len(self._questions)):
+            wanted = self._wants_custom(index)
+            if wanted == self._texts[index].IsShown():
+                continue
+            self._labels[index].Show(wanted)
+            self._texts[index].Show(wanted)
+            changed = True
+        if not changed:
+            return
+        self.Layout()
+        self.Fit()
+        for index in range(len(self._questions)):
+            if self._texts[index].IsShown() and not self._texts[index].GetValue():
+                announce("Your own answer, edit text. Tab to it to type an answer.")
+                break
+
+    def _on_key(self, event: wx.KeyEvent) -> None:
+        if event.GetKeyCode() == wx.WXK_ESCAPE:
+            self.EndModal(wx.ID_CANCEL)
+            return
+        event.Skip()
+
+    def _on_ok(self, event: wx.CommandEvent) -> None:
+        """Refuse a half-filled answer rather than send the backend a blank."""
+        for index, question in enumerate(self._questions):
+            if self._wants_custom(index) and not self._texts[index].GetValue().strip():
+                announce("Error: type your own answer, or pick one of the choices")
+                self._texts[index].SetFocus()
+                return
+            if not self._chosen(index):
+                announce(f"Error: {question.question} has no answer yet")
+                self._pickers[index].SetFocus()
+                return
+        event.Skip()
+
+    def _chosen(self, index: int) -> list[str]:
+        """The answers picked for one question, with "Other" resolved to text."""
+        question = self._questions[index]
+        answers: list[str] = []
+        for position in self._picked(index):
+            if position < len(question.options):
+                # The backend wants its own label back, not the line the
+                # dialog drew from it.
+                answers.append(question.options[position].label)
+                continue
+            typed = self._texts[index].GetValue().strip()
+            if typed:
+                answers.append(typed)
+        return answers
+
+    def answers(self) -> list[list[str]]:
+        """One list of answers per question, in the order they were asked."""
+        return [self._chosen(index) for index in range(len(self._questions))]
 
 
 class ConnectDialog(wx.Dialog):
@@ -3095,6 +3472,10 @@ class SessionPanel(wx.Panel):
         # Set while the user's Stop is being carried out, so the backend's own
         # "cancelled" report is not announced to them as an error.
         self._stopping = False
+        # The backend's own question, while it is on screen. Held so stopping
+        # the run can close it: the worker thread is blocked on the answer, and
+        # the thread that would stop it is the one the dialog is running on.
+        self._question_dialog: Optional["QuestionDialog"] = None
         self._session_id: Optional[str] = None
         self._session_backend = normalize_backend(self._get_backend())
         self._worker: Optional[AgentWorker] = None
@@ -3605,6 +3986,74 @@ class SessionPanel(wx.Panel):
             return
         event.Skip()
 
+    # ----- Mid-run questions -----
+    def _ask_questions(self, questions: Sequence[Question]) -> Optional[list[list[str]]]:
+        """Put a backend's question to the user and wait for the answer.
+
+        Called on the worker thread, and blocks it: the turn that asked is
+        waiting, and every adapter needs the answer on the thread that read the
+        question. The dialog itself has to be opened on the GUI thread, so it is
+        handed there and the answer comes back through this event.
+
+        Returns None when there is nobody to ask - the tab is closing, or the
+        run is being stopped - which every adapter reports to its backend as
+        the question having gone unanswered.
+        """
+        if not questions:
+            return None
+        answered = threading.Event()
+        held: dict[str, Optional[list[list[str]]]] = {"answers": None}
+
+        def show() -> None:
+            try:
+                held["answers"] = self._show_question_dialog(questions)
+            finally:
+                answered.set()
+
+        wx.CallAfter(show)
+        while not answered.wait(0.2):
+            if self._stopping or not self:
+                # Stopped, or the tab went away, while the dialog was open. The
+                # backend is about to be killed either way.
+                return None
+        return held["answers"]
+
+    def _show_question_dialog(self, questions: Sequence[Question]) -> Optional[list[list[str]]]:
+        """Open the question dialog. GUI thread only."""
+        if not self:
+            return None
+        backend = self._session_backend or self.selected_backend()
+        self._announce(f"{backend_label(backend)} is asking a question")
+        # The progress loop means "still working", and it is not: the run is
+        # waiting on this dialog, and a loop under a question is only noise.
+        self._earcons.stop_progress()
+        dlg = QuestionDialog(self, backend, questions)
+        self._question_dialog = dlg
+        try:
+            if dlg.ShowModal() != wx.ID_OK:
+                self._announce("Question left unanswered")
+                return None
+            answers = dlg.answers()
+        finally:
+            self._question_dialog = None
+            dlg.Destroy()
+            if self._worker is not None:
+                self._earcons.start_progress()
+        self._announce("Answer sent")
+        return answers
+
+    def _close_question_dialog(self) -> None:
+        """Take down an open question, because the run it belongs to is going.
+
+        Stopping a run happens on the GUI thread, which is the thread the
+        dialog's own event loop is running on, while the worker waits on the
+        answer. Closing it here is what lets both carry on.
+        """
+        dlg = self._question_dialog
+        if dlg is not None:
+            self._question_dialog = None
+            dlg.EndModal(wx.ID_CANCEL)
+
     # ----- Worker-to-GUI event mailbox -----
     def _queue_worker_event(self, name: str, *args: object) -> None:
         """Queue one worker callback without flooding wx's event loop.
@@ -3797,6 +4246,7 @@ class SessionPanel(wx.Panel):
             on_complete=lambda txt: self._queue_worker_event("complete", txt),
             on_failed=lambda msg: self._queue_worker_event("failed", msg),
             on_done=lambda: self._queue_worker_event("done"),
+            on_question=self._ask_questions,
             **(worker_extra or {}),
         )
         self._worker.start()
@@ -3859,6 +4309,7 @@ class SessionPanel(wx.Panel):
         self.stop_btn.Disable()
         self.steer_btn.Disable()
         self._stopping = True
+        self._close_question_dialog()
         self._announce("Stopping")
         # cancel() waits on the process, so it must not run on the UI thread.
         threading.Thread(target=worker.cancel, daemon=True).start()
@@ -4418,6 +4869,7 @@ class SessionPanel(wx.Panel):
 
     # ----- Cleanup hook -----
     def cancel_worker(self) -> None:
+        self._close_question_dialog()
         if self._worker is not None and self._worker.is_alive():
             self._worker.cancel()
             self._worker.join(timeout=3)

@@ -19,6 +19,7 @@ BlindPilot is based on the original **[Claude Code Reader](https://github.com/do
 - Compacts a long conversation in place so the backend has room to keep going.
 - Runs several project sessions at once, each in its own tab named after the conversation in it, with its own folder, model, and permission mode. **Ctrl+Tab** moves between them.
 - Runs every backend fully automatic by default: nothing stops mid-task to ask permission, because a question nobody is watching for is a task that never finishes.
+- Answers the questions a backend stops to ask. All four can pause a turn to put a multiple-choice question to you; BlindPilot opens a dialog with one radio button per answer, checkboxes where several are allowed, and an "Other" choice that opens a box to type your own answer in.
 - Steers a task while it is still running, or stops it outright and keeps what it produced.
 - Attaches files and pasted clipboard images as explicit prompt paths.
 - Searches responses, jumps between them, and copies a code block, a whole response, or the whole conversation.
@@ -29,12 +30,14 @@ BlindPilot is based on the original **[Claude Code Reader](https://github.com/do
 
 ## Backends
 
-| Backend | Integration | Sessions | Model control | Permission modes | Compaction |
-|---|---|---|---|---|---|
-| Claude Code | Streaming JSON CLI | Yes | Yes | Yes | Yes |
-| Codex | Official app-server protocol | Yes | Yes, including reasoning effort | Yes | Yes |
-| FreeBuff | Pseudo-terminal adapter | Yes | Yes; DeepSeek V4 Pro by default | Managed by FreeBuff | No |
-| opencode | Its own headless HTTP server | Yes | Yes, including per-model reasoning variants | Yes | Yes |
+| Backend | Integration | Sessions | Model control | Permission modes | Compaction | Questions |
+|---|---|---|---|---|---|---|
+| Claude Code | Streaming JSON CLI | Yes | Yes | Yes | Yes | Yes |
+| Codex | Official app-server protocol | Yes | Yes, including reasoning effort | Yes | Yes | Yes |
+| FreeBuff | Pseudo-terminal adapter | Yes | Yes; DeepSeek V4 Pro by default | Managed by FreeBuff | No | Yes |
+| opencode | Its own headless HTTP server | Yes | Yes, including per-model reasoning variants | Yes | Yes | Yes |
+
+Every backend can stop a turn to ask you a multiple-choice question, and each asks in its own way: Claude Code sends its AskUserQuestion tool through the permission channel of the stream it is already writing, Codex sends a `request_user_input` request over the app-server protocol, opencode publishes a `question.asked` event, and FreeBuff draws its `ask_user` tool onto its terminal. All four end up in the same dialog, and the answer goes back the way that backend expects it. A question left unanswered is declined rather than ignored, because a turn waiting on an answer that is never coming sounds exactly like a model that has stopped thinking.
 
 FreeBuff ships no JSON or headless API, so BlindPilot runs its terminal interface in a hidden pseudo-terminal, reads the answer off its screen a finished sentence at a time, and captures its chat id so the conversation can be resumed. Terminal redraws and advertisements are filtered out before anything is spoken. Its permission picker and Compact Conversation are disabled because the FreeBuff CLI has no equivalent.
 

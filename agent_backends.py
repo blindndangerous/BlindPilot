@@ -25,7 +25,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional, Protocol, cast
+from typing import Callable, Optional, Protocol, Sequence, cast
 
 
 # A windowed app owns no console, so every child process Windows considers a
@@ -221,6 +221,83 @@ BACKEND_LABELS = {
 FREEBUFF_PREFERRED_MODEL = "deepseek/deepseek-v4-pro"
 _FREEBUFF_SETTINGS_LOCK = threading.Lock()
 _freebuff_catalog_cache: tuple[tuple[str, float, int], list[str]] | None = None
+
+
+# ----- Mid-run questions -----
+#
+# Every backend BlindPilot drives can stop mid-turn to ask the person a
+# multiple-choice question, and each one describes that question differently:
+# Claude Code sends the AskUserQuestion tool's input through a `can_use_tool`
+# control request, Codex sends an `item/tool/requestUserInput` JSON-RPC
+# request, opencode publishes a `question.asked` event, and FreeBuff draws its
+# `ask_user` tool straight onto its terminal. The window should not have to
+# know any of that, so each adapter translates its provider's shape into the
+# two types below, and translates the answers back on the way out.
+
+
+@dataclass(frozen=True)
+class QuestionOption:
+    """One answer a backend offers for a question."""
+
+    label: str
+    description: str = ""
+
+
+@dataclass(frozen=True)
+class Question:
+    """One question a backend has paused its turn to ask.
+
+    ``id`` is whatever the backend needs to match the answer back to the
+    question — Codex's question id, or an empty string where the provider keys
+    answers by position or by the question's own text instead.
+    """
+
+    question: str
+    header: str = ""
+    options: tuple[QuestionOption, ...] = ()
+    multi_select: bool = False
+    id: str = ""
+    # Whether the provider accepts an answer that is not one of its options.
+    # Every backend does today, and all four say so in their tool descriptions
+    # ("the client will add a free-form Other option automatically"), so this
+    # is the default rather than the exception.
+    allow_custom: bool = True
+    # Codex alone marks a question whose answer should not be echoed back.
+    secret: bool = False
+
+
+# Given the questions, return one list of chosen answers per question — the
+# option labels the person picked, or the text they typed instead — or None if
+# they closed the dialog without answering. Called on the worker thread, and
+# blocks it: the backend's turn is waiting on this answer.
+AskQuestions = Callable[[Sequence[Question]], Optional[list[list[str]]]]
+
+
+def question_summary(questions: Sequence[Question], answers: Optional[list[list[str]]]) -> str:
+    """One row for the transcript saying what was asked and what was said.
+
+    Both halves are kept: read back later, a bare "Spaces" says nothing, and
+    the answer is the reason the rest of the turn went the way it did.
+    """
+    if answers is None:
+        asked = " ".join(question.question for question in questions)
+        return f"Question left unanswered: {asked}"
+    parts = []
+    for index, question in enumerate(questions):
+        chosen = answers[index] if index < len(answers) else []
+        if question.secret:
+            # Codex marks a question whose answer is a secret. The transcript
+            # is read back, copied, and saved, so it gets the fact of an answer
+            # and not the answer itself.
+            parts.append(
+                f'You answered "{question.question}".'
+                if chosen
+                else f'You left "{question.question}" unanswered.'
+            )
+            continue
+        said = ", ".join(chosen) if chosen else "nothing"
+        parts.append(f'You answered "{question.question}" with "{said}".')
+    return " ".join(parts)
 
 
 @dataclass(frozen=True)
@@ -872,6 +949,56 @@ def set_freebuff_model(model: str) -> None:
         os.replace(temporary, settings)
 
 
+# Codex ships `request_user_input` — the tool it stops a turn to ask a
+# multiple-choice question with — switched off, and available only in plan mode
+# even when switched on. Both are settings rather than protocol, so they are
+# passed for this app server alone and nothing is written to the user's
+# ~/.codex/config.toml.
+_CODEX_QUESTION_FEATURE = "default_mode_request_user_input"
+_CODEX_QUESTION_ARGS = (
+    "-c",
+    "tools.experimental_request_user_input={enabled=true}",
+    "--enable",
+    _CODEX_QUESTION_FEATURE,
+)
+
+
+def _codex_questions(raw: object) -> tuple[Question, ...]:
+    """Read request_user_input's params into BlindPilot's own question shape.
+
+    A question with no options is a free-text one; `isOther` is Codex asking
+    for the "Other" answer its tool description tells the model not to write
+    itself, so the two together decide whether typing is offered.
+    """
+    if not isinstance(raw, list):
+        return ()
+    questions: list[Question] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        text = str(entry.get("question") or "").strip()
+        if not text:
+            continue
+        options: list[QuestionOption] = []
+        for option in entry.get("options") or []:
+            if isinstance(option, dict) and option.get("label"):
+                options.append(
+                    QuestionOption(str(option["label"]), str(option.get("description") or ""))
+                )
+        questions.append(
+            Question(
+                question=text,
+                header=str(entry.get("header") or ""),
+                options=tuple(options),
+                multi_select=False,
+                allow_custom=bool(entry.get("isOther")) or not options,
+                secret=bool(entry.get("isSecret")),
+                id=str(entry.get("id") or ""),
+            )
+        )
+    return tuple(questions)
+
+
 class CodexWorker(threading.Thread):
     """Run one Codex turn through the official app-server JSONL protocol."""
 
@@ -891,6 +1018,7 @@ class CodexWorker(threading.Thread):
         on_complete: Callable[[str], None],
         on_failed: Callable[[str], None],
         on_done: Callable[[], None],
+        on_question: Optional[AskQuestions] = None,
     ) -> None:
         super().__init__(daemon=True)
         self._prompt = prompt
@@ -908,6 +1036,7 @@ class CodexWorker(threading.Thread):
         self._on_complete = on_complete
         self._on_failed = on_failed
         self._on_done = on_done
+        self._on_question = on_question
         self._proc: Optional[subprocess.Popen[str]] = None
         self._cancelled = False
         self._write_lock = threading.Lock()
@@ -1013,7 +1142,7 @@ class CodexWorker(threading.Thread):
         try:
             server_binary = _codex_app_server_binary(binary)
             self._proc = subprocess.Popen(
-                [server_binary, "app-server", "--stdio"],
+                [server_binary, *_CODEX_QUESTION_ARGS, "app-server", "--stdio"],
                 cwd=self._cwd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -1042,7 +1171,11 @@ class CodexWorker(threading.Thread):
                         "name": "blindpilot",
                         "title": "BlindPilot",
                         "version": "0.3.0",
-                    }
+                    },
+                    # request_user_input is still marked experimental in the
+                    # app-server protocol, and Codex only sends experimental
+                    # requests to a client that asked for them.
+                    "capabilities": {"experimentalApi": True},
                 },
             }
         )
@@ -1186,7 +1319,11 @@ class CodexWorker(threading.Thread):
                     self._tool_outputs.setdefault(item_id, []).append(delta)
             elif method in ("warning", "configWarning"):
                 warning = str(params.get("message") or params.get("summary") or "")
-                if warning:
+                if warning and _CODEX_QUESTION_FEATURE not in warning:
+                    # The one warning that is skipped is Codex's notice that
+                    # BlindPilot switched a still-developing feature on. It is
+                    # true, it is deliberate, and repeating it at the top of
+                    # every single turn is noise nobody can act on.
                     self._on_activity("tool", f"Codex warning: {warning}")
             elif method == "turn/completed":
                 self._accepting_input.clear()
@@ -1236,6 +1373,8 @@ class CodexWorker(threading.Thread):
                 "accept" if mode in ("acceptEdits", "auto", "bypassPermissions") else "decline"
             )
             self._send({"id": request_id, "result": {"decision": decision}})
+        elif method == "item/tool/requestUserInput":
+            self._answer_user_input(request_id, message.get("params") or {})
         else:
             self._send(
                 {
@@ -1246,6 +1385,26 @@ class CodexWorker(threading.Thread):
                     },
                 }
             )
+
+    def _answer_user_input(self, request_id: object, params: dict) -> None:
+        """Put request_user_input in front of the person and answer it.
+
+        Codex keys the answers by each question's own id, and takes a list per
+        question even where only one answer was asked for. A question nobody
+        answered is sent back with an empty list, which is how Codex reads
+        "the person had nothing to say to this" — the turn then carries on
+        rather than waiting for an answer that is not coming.
+        """
+        questions = _codex_questions(params.get("questions"))
+        answers = self._on_question(questions) if (questions and self._on_question) else None
+        self._on_activity("tool", question_summary(questions, answers))
+        payload = {
+            question.id or question.question: {
+                "answers": answers[index] if answers is not None and index < len(answers) else []
+            }
+            for index, question in enumerate(questions)
+        }
+        self._send({"id": request_id, "result": {"answers": payload}})
 
     def _item_started(self, item: dict) -> None:
         kind = item.get("type")
@@ -1350,6 +1509,125 @@ def _freebuff_chat_path(cwd: str, session_id: str) -> Optional[Path]:
 
 
 _FREEBUFF_INTERRUPTED = "[response interrupted]"
+
+# The title FreeBuff draws on the box its `ask_user` tool opens. It is the one
+# thing on that screen that is always there and never part of an answer, so it
+# is what says a turn has stopped to ask something.
+# What FreeBuff's start screen says while it is waiting for a model to be
+# chosen. The wording has moved between releases - the card was once labelled
+# RECOMMENDED and is now introduced by a heading - so all of it is recognised:
+# a chooser nobody answers is a terminal that never reaches its composer, and a
+# message that is never sent.
+_FREEBUFF_PICKER_RE = re.compile(r"(?i)RECOMMENDED|Start coding for free|See all \d+ models?")
+
+_FREEBUFF_QUESTION_MARKER = "Some questions for you"
+
+# A question in that box: collapsed (right-pointing) or open (down-pointing),
+# numbered only when there is more than one.
+_FREEBUFF_QUESTION_RE = re.compile(r"^([▼▶])\s*(?:\d+\.\s*)?(\S.*?)\s*$")
+
+# One answer in the open question: a radio circle, or a checkbox where the
+# question takes more than one answer.
+_FREEBUFF_OPTION_RE = re.compile(r"^\s+([○●☐☑])\s+(\S.*?)\s*$")
+
+# FreeBuff adds this entry itself, below the model's own options, and opens a
+# text field when it is chosen. BlindPilot's dialog offers the same thing in
+# its own words, so the entry is not repeated there.
+_FREEBUFF_CUSTOM_LABEL = "Custom"
+
+_FREEBUFF_MULTI_MARKER = "(Select multiple options)"
+
+# The box's bottom-left corner, and the side it draws down both edges.
+_FREEBUFF_BOX_BOTTOM = "╰"
+_FREEBUFF_BOX_SIDE = "│"
+_FREEBUFF_OPEN_MARK = "▼"
+_FREEBUFF_CHECKBOXES = ("☐", "☑")
+
+# Keys the box understands. Down moves through the answers, wrapping into the
+# next question once it runs off the end of one; Enter chooses; Tab jumps to
+# Submit; Escape closes the box, which FreeBuff reports to the model as the
+# questions having been skipped.
+_KEY_DOWN = "\x1b[B"
+_KEY_ENTER = "\r"
+_KEY_TAB = "\t"
+_KEY_ESCAPE = "\x1b"
+
+# Long enough for OpenTUI to repaint between keystrokes.
+_FREEBUFF_KEY_SETTLE = 0.15
+
+# FreeBuff's own tool takes at least one question and puts no ceiling on
+# them; this is the point past which a box has stopped being a question
+# and started being a loop.
+_FREEBUFF_MAX_QUESTIONS = 8
+
+
+def _freebuff_question_box(visible: str) -> list[str]:
+    """The lines of FreeBuff's question box, with its border taken off."""
+    lines = visible.split("\n")
+    start = next(
+        (index for index, line in enumerate(lines) if _FREEBUFF_QUESTION_MARKER in line),
+        -1,
+    )
+    if start < 0:
+        return []
+    body: list[str] = []
+    for line in lines[start + 1 :]:
+        stripped = line.strip()
+        if stripped.startswith(_FREEBUFF_BOX_BOTTOM):
+            break
+        if stripped.startswith(_FREEBUFF_BOX_SIDE):
+            stripped = stripped[1:]
+        if stripped.endswith(_FREEBUFF_BOX_SIDE):
+            stripped = stripped[:-1]
+        body.append(stripped.rstrip())
+    return body
+
+
+def _freebuff_open_question(visible: str) -> tuple[int, int, Optional[Question]]:
+    """(how many questions there are, which one is open, and that question).
+
+    FreeBuff shows one question's answers at a time and keeps the rest folded
+    away, so this reads whichever one is open. The count is what says how many
+    more are still to come.
+    """
+    body = _freebuff_question_box(visible)
+    if not body:
+        return 0, -1, None
+    total = 0
+    open_index = -1
+    text = ""
+    options: list[QuestionOption] = []
+    multi = False
+    for line in body:
+        header = _FREEBUFF_QUESTION_RE.match(line)
+        if header:
+            if header.group(1) == _FREEBUFF_OPEN_MARK:
+                if open_index >= 0:
+                    # Two open questions at once is a half-drawn frame; keep
+                    # the first, which is the one already read.
+                    break
+                open_index = total
+                text = header.group(2)
+                options = []
+                multi = False
+            total += 1
+            continue
+        if open_index < 0 or total != open_index + 1:
+            continue
+        if _FREEBUFF_MULTI_MARKER in line:
+            multi = True
+            continue
+        option = _FREEBUFF_OPTION_RE.match(line)
+        if option:
+            if option.group(1) in _FREEBUFF_CHECKBOXES:
+                multi = True
+            options.append(QuestionOption(option.group(2)))
+    if open_index < 0 or not text:
+        return total, -1, None
+    if options and options[-1].label == _FREEBUFF_CUSTOM_LABEL:
+        options = options[:-1]
+    return total, open_index, Question(question=text, options=tuple(options), multi_select=multi)
+
 
 # How long a frame must hold still before it is read out. The terminal repaints
 # in bursts, so this is only long enough to let one burst land whole.
@@ -1855,6 +2133,7 @@ class FreebuffWorker(threading.Thread):
         on_complete: Callable[[str], None],
         on_failed: Callable[[str], None],
         on_done: Callable[[], None],
+        on_question: Optional[AskQuestions] = None,
     ) -> None:
         super().__init__(daemon=True)
         self._prompt = prompt
@@ -1867,6 +2146,7 @@ class FreebuffWorker(threading.Thread):
         self._on_complete = on_complete
         self._on_failed = on_failed
         self._on_done = on_done
+        self._on_question = on_question
         self._cancelled = False
         self._accepting_input = threading.Event()
         self._write_lock = threading.Lock()
@@ -2019,6 +2299,28 @@ class FreebuffWorker(threading.Thread):
         completion_seen_at: Optional[float] = None
         deadline = time.monotonic() + 60 * 60
 
+        def refresh(wait: float) -> str:
+            """Feed whatever the terminal has produced and re-read the screen.
+
+            The question box is driven a keystroke at a time, and every one of
+            them has to be seen to land before the next is sent. This is the
+            main loop's own reading, pulled out so both can use it.
+            """
+            nonlocal last_visible, screen_changed_at, screen_dirty
+            until = time.monotonic() + max(0.0, wait)
+            while True:
+                waiting = read(0.03)
+                if waiting:
+                    stream.feed(waiting)
+                if time.monotonic() >= until:
+                    break
+            current = "\n".join(line.rstrip() for line in screen.display).strip()
+            if current != last_visible:
+                last_visible = current
+                screen_changed_at = time.monotonic()
+                screen_dirty = True
+            return current
+
         def restart() -> Optional[Callable[[float], str]]:
             """Replace a terminal that was waiting and is no longer usable.
 
@@ -2089,10 +2391,14 @@ class FreebuffWorker(threading.Thread):
                     screen_changed_at = time.monotonic()
                     screen_dirty = True
 
-            # The first FreeBuff launch opens an accessible model chooser.
-            # Accept its highlighted recommended model so the hidden terminal
-            # reaches the composer; later launches remember the selection.
-            if not accepted_recommended_model and not sent and "RECOMMENDED" in last_visible:
+            # FreeBuff opens on a model chooser rather than the composer.
+            # Accept its highlighted model, or navigate to the chosen one, so
+            # the hidden terminal reaches a prompt it can be given a message at.
+            if (
+                not accepted_recommended_model
+                and not sent
+                and _FREEBUFF_PICKER_RE.search(last_visible)
+            ):
                 if not models:
                     models = freebuff_model_options()[0]
                 picker_models, focused = _freebuff_picker_options(last_visible, models)
@@ -2127,6 +2433,20 @@ class FreebuffWorker(threading.Thread):
                 if time.monotonic() - picker_expanded_at >= 5:
                     self._on_failed(f"FreeBuff's model picker did not offer {self._model}")
                     return
+
+            if (
+                sent
+                and _FREEBUFF_QUESTION_MARKER in last_visible
+                # An answered box stays on screen with every question folded
+                # away, so the title alone is not enough: it is a question
+                # actually being asked that stops the turn.
+                and _freebuff_open_question(last_visible)[2] is not None
+            ):
+                # The turn has stopped to ask something and will not move again
+                # until it is answered, so this takes over the loop until the
+                # box is gone.
+                if self._answer_questions(refresh):
+                    continue
 
             at_prompt = bool(self._PROMPT_RE.search(last_visible))
             busy = bool(self._BUSY_RE.search(last_visible))
@@ -2271,6 +2591,114 @@ class FreebuffWorker(threading.Thread):
         # terminal to start, so start one now, while nobody is waiting on it.
         if session:
             prewarm_freebuff(self._cwd, session, self._model, delay=1.0)
+
+    def _press(self, key: str, times: int = 1) -> None:
+        """Send one of the box's keys, giving OpenTUI time to repaint."""
+        for _ in range(max(0, times)):
+            self._write(key)
+            time.sleep(_FREEBUFF_KEY_SETTLE)
+
+    def _answer_questions(self, refresh: Callable[[float], str]) -> bool:
+        """Work through FreeBuff's question box and submit the answers.
+
+        FreeBuff has no way to be told an answer other than the box it drew, so
+        this is the box being used: each question is put to the person in a
+        dialog, and what they chose is walked to with the arrow keys and chosen
+        with Enter. Only one question's answers are on screen at a time, which
+        is why they are asked one at a time rather than all at once.
+
+        Returns whether the box was dealt with, so a frame that turned out to
+        be half-drawn can be left for the next pass.
+        """
+        answered: set[str] = set()
+        submit = False
+        # Bounded so a box that never changes cannot spin: two passes per
+        # question is already more than any answer needs.
+        for _pass in range(2 * _FREEBUFF_MAX_QUESTIONS):
+            if self._cancelled:
+                return True
+            visible = refresh(_FREEBUFF_KEY_SETTLE)
+            if _FREEBUFF_QUESTION_MARKER not in visible:
+                # FreeBuff closed the box itself; nothing left to answer.
+                return bool(answered)
+            total, index, question = _freebuff_open_question(visible)
+            if question is None:
+                visible = refresh(0.5)
+                total, index, question = _freebuff_open_question(visible)
+                if question is None:
+                    return False
+            if question.question in answered:
+                # The same question is still open, so the keystrokes did not
+                # land where they were meant to. Send what has been answered
+                # rather than ask again in a loop.
+                submit = True
+                break
+            chosen = self._ask_one(question)
+            if chosen is None:
+                # Escape closes the box, and FreeBuff tells the model the
+                # questions were skipped — which is the truth.
+                self._press(_KEY_ESCAPE)
+                refresh(0.5)
+                return True
+            answered.add(question.question)
+            self._choose(question, chosen)
+            if index >= total - 1:
+                submit = True
+                break
+        if submit:
+            # Tab moves to Submit from an answer and is ignored once Submit
+            # already has the focus, so it is safe either way.
+            self._press(_KEY_TAB)
+            self._press(_KEY_ENTER)
+        refresh(0.5)
+        return True
+
+    def _ask_one(self, question: Question) -> Optional[list[str]]:
+        """Put one question to the person. None if they closed the dialog."""
+        if self._on_question is None:
+            return None
+        answers = self._on_question([question])
+        chosen = answers[0] if answers else None
+        self._on_activity("tool", question_summary([question], answers))
+        if not chosen:
+            return None
+        return chosen
+
+    def _choose(self, question: Question, chosen: list[str]) -> None:
+        """Walk the box to the chosen answers and take them."""
+        # The focus opens on the first answer, and "Custom" sits one past the
+        # last of the model's own, which is where anything typed goes.
+        labels = [option.label for option in question.options]
+        custom = len(labels)
+        position = 0
+        if not question.multi_select:
+            answer = chosen[0]
+            target = labels.index(answer) if answer in labels else custom
+            self._press(_KEY_DOWN, target)
+            self._press(_KEY_ENTER)
+            if target == custom:
+                # Choosing "Custom" opens a text field with the cursor in it;
+                # Enter closes it and moves on to the next question.
+                self._write(answer)
+                time.sleep(_FREEBUFF_KEY_SETTLE)
+                self._press(_KEY_ENTER)
+            # A chosen answer moves the box on by itself.
+            return
+        typed = [text for text in chosen if text not in labels]
+        for target in sorted(labels.index(text) for text in chosen if text in labels):
+            self._press(_KEY_DOWN, target - position)
+            self._press(_KEY_ENTER)
+            position = target
+        if typed:
+            self._press(_KEY_DOWN, custom - position)
+            self._press(_KEY_ENTER)
+            self._write(", ".join(typed))
+            time.sleep(_FREEBUFF_KEY_SETTLE)
+            self._press(_KEY_ENTER)
+            position = custom
+        # Ticking a box leaves the focus where it was, so the next question has
+        # to be walked to: one step past the last answer wraps onto it.
+        self._press(_KEY_DOWN, custom - position + 1)
 
     def _emit_screen_delta(self, kind: str, spoken: str, current: str, whole: bool = False) -> str:
         """Read out whatever the screen has gained since the last frame.
@@ -2977,6 +3405,40 @@ def _opencode_tool_label(name: str, arguments: object) -> str:
     return f"{verb}: {detail}" if detail else verb
 
 
+def _opencode_questions(raw: object) -> tuple[Question, ...]:
+    """Read a question.asked event into BlindPilot's own question shape.
+
+    opencode's own flags are `multiple` for more than one answer and `custom`
+    for a typed one. Only `multiple` is trusted as written: its tool tells the
+    model not to offer an "Other" of its own because the client adds one, so a
+    typed answer is offered whether or not `custom` was set.
+    """
+    if not isinstance(raw, list):
+        return ()
+    questions: list[Question] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        text = str(entry.get("question") or "").strip()
+        if not text:
+            continue
+        options: list[QuestionOption] = []
+        for option in entry.get("options") or []:
+            if isinstance(option, dict) and option.get("label"):
+                options.append(
+                    QuestionOption(str(option["label"]), str(option.get("description") or ""))
+                )
+        questions.append(
+            Question(
+                question=text,
+                header=str(entry.get("header") or ""),
+                options=tuple(options),
+                multi_select=bool(entry.get("multiple")),
+            )
+        )
+    return tuple(questions)
+
+
 class OpencodeWorker(threading.Thread):
     """Run one opencode turn against the shared headless server."""
 
@@ -2996,6 +3458,7 @@ class OpencodeWorker(threading.Thread):
         on_complete: Callable[[str], None],
         on_failed: Callable[[str], None],
         on_done: Callable[[], None],
+        on_question: Optional[AskQuestions] = None,
     ) -> None:
         super().__init__(daemon=True)
         self._prompt = prompt
@@ -3013,6 +3476,7 @@ class OpencodeWorker(threading.Thread):
         self._on_complete = on_complete
         self._on_failed = on_failed
         self._on_done = on_done
+        self._on_question = on_question
         self._server: Optional[OpencodeServer] = None
         self._stream: object = None
         # Resolved once the turn starts. Working out whether a model offers the
@@ -3351,7 +3815,7 @@ class OpencodeWorker(threading.Thread):
         elif kind in ("permission.asked", "permission.v2.asked"):
             self._answer_permission(properties)
         elif kind in ("question.asked", "question.v2.asked"):
-            self._reject_question(properties)
+            self._answer_question(properties)
         elif kind == "session.status":
             status = properties.get("status") or {}
             if isinstance(status, dict) and status.get("type") == "retry":
@@ -3465,33 +3929,37 @@ class OpencodeWorker(threading.Thread):
                 f"Declined {permission or 'a request'} — the permission mode does not allow it",
             )
 
-    def _reject_question(self, properties: dict) -> None:
-        """Turn down a mid-run question, so the turn is never left hanging.
+    def _answer_question(self, properties: dict) -> None:
+        """Put a mid-run question to the person and send opencode their answers.
 
-        opencode can stop to ask the user something. BlindPilot has no way to
-        put that question in front of the user mid-turn, and one nobody answers
-        stalls the run for good, so it is declined and reported instead.
+        opencode takes one list of chosen labels per question, in the order it
+        asked them, and a question left unanswered has to be rejected rather
+        than replied to — a turn waiting on an answer that is never coming
+        never ends. It is in the middle of moving both onto new endpoints, so
+        each is tried in turn the same way a permission reply is.
         """
         request_id = str(properties.get("id") or "")
         if not request_id or self._server is None:
             return
-        questions = properties.get("questions") or []
-        asked = ""
-        if isinstance(questions, list) and questions and isinstance(questions[0], dict):
-            asked = str(questions[0].get("question") or "")
-        if not self._post(
+        questions = _opencode_questions(properties.get("questions"))
+        answers = self._on_question(questions) if (questions and self._on_question) else None
+        self._on_activity("tool", question_summary(questions, answers))
+        if answers is None:
+            self._post(
+                [
+                    (f"/question/{request_id}/reject", None),
+                    (f"/api/session/{self._session_id}/question/{request_id}/reject", None),
+                ],
+                "a question",
+            )
+            return
+        body = {"answers": [list(answer) for answer in answers]}
+        self._post(
             [
-                (f"/question/{request_id}/reject", None),
-                (f"/api/session/{self._session_id}/question/{request_id}/reject", None),
+                (f"/question/{request_id}/reply", body),
+                (f"/api/session/{self._session_id}/question/{request_id}/reply", body),
             ],
             "a question",
-        ):
-            return
-        self._on_activity(
-            "tool",
-            "opencode asked a question, which BlindPilot declined: "
-            + (asked or "no details given")
-            + " — answer it in your next message.",
         )
 
 

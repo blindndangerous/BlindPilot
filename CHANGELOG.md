@@ -4,6 +4,13 @@ Readable release history for BlindPilot. When adjacent releases were part of the
 same fix stream, they are combined with a version range such as
 `v0.3.6-v0.3.7`.
 
+## v0.6.0 - 2026-08-27
+
+- A backend that stops to ask a question is now answered rather than turned down. All four can pause a turn to put a multiple-choice question to the person driving them, and BlindPilot now opens a dialog for it: one radio button per answer where a single answer is wanted, checkboxes where several are, and an "Other" choice that opens a box to type an answer of your own. The answer goes back the way each backend expects it and the turn carries on; the transcript keeps a row saying what was asked and what was said.
+- Each backend's own question format is handled natively. Claude Code's AskUserQuestion arrives on the permission channel of the stream BlindPilot is already reading, and headless Claude Code is now told the app can show a prompt - without that the tool is not offered at all, which is why Claude could never ask before. Codex's `request_user_input` is switched on for the app server BlindPilot starts and answered by question id. opencode's `question.asked` event is replied to instead of rejected. FreeBuff, which has no API, has its own question box read off the terminal and driven with the keys it understands.
+- A question nobody answers is declined rather than left open. Closing the dialog tells the backend the question went unanswered, so a turn is never left waiting for an answer that is not coming - which sounds exactly like a model that has stopped thinking. Stopping a run closes an open question with it.
+- FreeBuff reaches its composer again. FreeBuff no longer labels the model on its start screen "RECOMMENDED", and BlindPilot waited for that word before answering the chooser - so on current FreeBuff every message sat behind a start screen nobody could see, and the turn never began.
+
 ## v0.5.1 - 2026-08-20
 
 - A clean computer can now install every backend from the setup wizard. Codex, FreeBuff, and opencode no longer stop at "npm was not found": BlindPilot downloads the current official Node.js LTS for that user, verifies its published SHA-256, installs the CLI into a writable per-user prefix, puts both on PATH, and proves the CLI starts before calling the install complete. FreeBuff's thin npm launcher is forced to download and verify its native binary during this check rather than surprising the first conversation with it.

@@ -1348,3 +1348,259 @@ def test_opencode_reports_a_command_that_will_not_run_exactly_once(monkeypatch):
 
     assert len(failures) == 1
     assert "/init" in failures[0]
+
+
+# ----- Mid-run questions -----
+#
+# Every one of the four backends can stop a turn to ask a multiple-choice
+# question, and each describes it differently. These check the translation both
+# ways: the provider's own shape into the one dialog BlindPilot shows, and the
+# chosen answers back into whatever that provider takes.
+
+
+def test_codex_request_user_input_is_answered_by_question_id():
+    asked = []
+    sent = []
+    callbacks = _callbacks()
+    worker = CodexWorker(
+        "test",
+        None,
+        ".",
+        "default",
+        on_question=lambda questions: asked.append(questions) or [["Spaces"]],
+        **callbacks,
+    )
+    worker._send = lambda message: sent.append(message) or True
+
+    worker._answer_user_input(
+        7,
+        {
+            "questions": [
+                {
+                    "id": "indent",
+                    "header": "Indent",
+                    "question": "Tabs or spaces?",
+                    "isOther": True,
+                    "isSecret": False,
+                    "options": [
+                        {"label": "Tabs", "description": "Tab characters."},
+                        {"label": "Spaces", "description": "Space characters."},
+                    ],
+                }
+            ]
+        },
+    )
+
+    (questions,) = asked
+    assert [question.question for question in questions] == ["Tabs or spaces?"]
+    assert [option.label for option in questions[0].options] == ["Tabs", "Spaces"]
+    assert questions[0].allow_custom is True
+    assert sent == [{"id": 7, "result": {"answers": {"indent": {"answers": ["Spaces"]}}}}]
+
+
+def test_codex_question_nobody_answered_still_ends_the_turn():
+    sent = []
+    worker = CodexWorker(
+        "test", None, ".", "default", on_question=lambda _questions: None, **_callbacks()
+    )
+    worker._send = lambda message: sent.append(message) or True
+
+    worker._answer_user_input(
+        3, {"questions": [{"id": "pick", "question": "Which one?", "options": []}]}
+    )
+
+    # An empty answer list is Codex's "the person had nothing to say"; leaving
+    # the request unanswered would hold the turn open for good.
+    assert sent == [{"id": 3, "result": {"answers": {"pick": {"answers": []}}}}]
+
+
+def test_opencode_question_is_replied_to_in_the_order_it_was_asked():
+    posted = []
+    worker = OpencodeWorker(
+        "test",
+        None,
+        ".",
+        "default",
+        on_question=lambda _questions: [["Rust"], ["Tests", "Docs"]],
+        **_callbacks(),
+    )
+    worker._server = object()
+    worker._session_id = "ses_1"
+    worker._post = lambda routes, what: posted.append((routes, what)) or True
+
+    worker._answer_question(
+        {
+            "id": "que_9",
+            "sessionID": "ses_1",
+            "questions": [
+                {
+                    "question": "Which language?",
+                    "header": "Language",
+                    "options": [{"label": "Rust", "description": "Fast."}],
+                },
+                {
+                    "question": "What else?",
+                    "header": "Extras",
+                    "multiple": True,
+                    "options": [
+                        {"label": "Tests", "description": "Add tests."},
+                        {"label": "Docs", "description": "Add docs."},
+                    ],
+                },
+            ],
+        }
+    )
+
+    ((routes, what),) = posted
+    assert what == "a question"
+    assert [path for path, _body in routes] == [
+        "/question/que_9/reply",
+        "/api/session/ses_1/question/que_9/reply",
+    ]
+    assert all(body == {"answers": [["Rust"], ["Tests", "Docs"]]} for _path, body in routes)
+
+
+def test_opencode_question_nobody_answered_is_rejected_not_left_open():
+    posted = []
+    worker = OpencodeWorker(
+        "test", None, ".", "default", on_question=lambda _questions: None, **_callbacks()
+    )
+    worker._server = object()
+    worker._session_id = "ses_1"
+    worker._post = lambda routes, what: posted.append(routes) or True
+
+    worker._answer_question(
+        {"id": "que_9", "questions": [{"question": "Which?", "options": [{"label": "A"}]}]}
+    )
+
+    (routes,) = posted
+    assert [path for path, _body in routes] == [
+        "/question/que_9/reject",
+        "/api/session/ses_1/question/que_9/reject",
+    ]
+
+
+def test_opencode_multiple_flag_is_what_makes_a_question_multi_select():
+    (single, several) = agent_backends._opencode_questions(
+        [
+            {"question": "One?", "options": [{"label": "A"}]},
+            {"question": "Many?", "multiple": True, "options": [{"label": "B"}]},
+        ]
+    )
+    assert single.multi_select is False
+    assert several.multi_select is True
+    # Every provider adds an "Other" of its own, so typing is always offered.
+    assert single.allow_custom is True
+
+
+FREEBUFF_QUESTION_SCREEN = "\n".join(
+    [
+        "  Freebuff will run commands on your behalf to help you build.",
+        "╭──────────────── Some questions for you ────────────────╮",
+        "│                                                Close ✕│",
+        "│                                                       │",
+        "│▼ 1. Tabs or spaces?                                   │",
+        "│     ○ Tabs                                            │",
+        "│     ○ Spaces                                          │",
+        "│     ○ Custom                                          │",
+        "│                                                       │",
+        "│▶ 2. Which language?                                   │",
+        "│   ↳ (click to answer)                                 │",
+        "│                                                       │",
+        "│╭──────────╮                                           │",
+        "││  Submit  │    ↑↓ navigate • Enter select             │",
+        "│╰──────────╯                                           │",
+        "╰───────────────────────────────────────────────────────╯",
+    ]
+)
+
+
+def test_freebuff_reads_the_question_that_is_open_and_counts_the_rest():
+    total, index, question = agent_backends._freebuff_open_question(FREEBUFF_QUESTION_SCREEN)
+
+    assert (total, index) == (2, 0)
+    assert question is not None
+    assert question.question == "Tabs or spaces?"
+    # "Custom" is FreeBuff's own entry, not one of the model's answers: the
+    # dialog offers typing in its own words instead.
+    assert [option.label for option in question.options] == ["Tabs", "Spaces"]
+    assert question.multi_select is False
+
+
+def test_freebuff_checkboxes_mean_the_question_takes_several_answers():
+    screen = FREEBUFF_QUESTION_SCREEN.replace("○ Tabs", "☐ Tabs").replace("○ Spaces", "☑ Spaces")
+    _total, _index, question = agent_backends._freebuff_open_question(screen)
+
+    assert question is not None
+    assert question.multi_select is True
+
+
+def test_freebuff_answers_a_question_with_the_keys_its_box_understands():
+    keys = []
+    worker = FreebuffWorker(
+        "test", None, ".", "default", on_question=lambda _questions: [["Spaces"]], **_callbacks()
+    )
+    worker._write = lambda text: keys.append(text) or True
+
+    _total, _index, question = agent_backends._freebuff_open_question(FREEBUFF_QUESTION_SCREEN)
+    assert question is not None
+    worker._choose(question, ["Spaces"])
+
+    # "Spaces" is the second answer, so one step down and Enter takes it.
+    assert keys == [agent_backends._KEY_DOWN, agent_backends._KEY_ENTER]
+
+
+def test_freebuff_typed_answer_walks_past_the_options_to_its_own_entry():
+    keys = []
+    worker = FreebuffWorker("test", None, ".", "default", **_callbacks())
+    worker._write = lambda text: keys.append(text) or True
+
+    _total, _index, question = agent_backends._freebuff_open_question(FREEBUFF_QUESTION_SCREEN)
+    assert question is not None
+    worker._choose(question, ["four spaces, always"])
+
+    down = agent_backends._KEY_DOWN
+    enter = agent_backends._KEY_ENTER
+    assert keys == [down, down, enter, "four spaces, always", enter]
+
+
+def test_freebuff_a_question_nobody_answered_closes_the_box():
+    keys = []
+    worker = FreebuffWorker(
+        "test", None, ".", "default", on_question=lambda _questions: None, **_callbacks()
+    )
+    worker._write = lambda text: keys.append(text) or True
+
+    assert worker._answer_questions(lambda _wait: FREEBUFF_QUESTION_SCREEN) is True
+    # Escape is how FreeBuff is told the questions were skipped, which is what
+    # it reports to the model.
+    assert keys == [agent_backends._KEY_ESCAPE]
+
+
+def test_freebuff_stops_asking_once_the_box_stops_changing():
+    asked = []
+    worker = FreebuffWorker(
+        "test",
+        None,
+        ".",
+        "default",
+        on_question=lambda questions: asked.append(questions[0].question) or [["Tabs"]],
+        **_callbacks(),
+    )
+    worker._write = lambda _text: True
+
+    # The screen never moves on, which is what a keystroke that did not land
+    # looks like. The same question must not be put up over and over.
+    assert worker._answer_questions(lambda _wait: FREEBUFF_QUESTION_SCREEN) is True
+    assert asked == ["Tabs or spaces?"]
+
+
+def test_freebuff_start_screen_is_recognised_however_it_is_worded():
+    # The chooser is what stands between a hidden terminal and its composer, so
+    # missing it costs the whole message, not just the model. Its wording has
+    # moved between FreeBuff releases; all of it has to count.
+    picker = agent_backends._FREEBUFF_PICKER_RE
+    assert picker.search("  RECOMMENDED  DeepSeek V4 Pro")
+    assert picker.search("  Start coding for free   1 day streak")
+    assert picker.search("  See all 4 models")
+    assert not picker.search("  Enter a coding task or / for commands")
