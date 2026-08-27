@@ -1,3 +1,27 @@
+# BlindPilot 0.6.1
+
+BlindPilot is an accessible desktop reader for AI coding agents. It is based on Claude
+Code Reader and remains available under the MIT License, with credit to the original
+project throughout the application and documentation.
+
+## A conversation survives the questions it asked
+
+Answering a question on the opencode backend could leave the whole conversation
+permanently broken. The provider refused the stored question step when it rebuilt the
+conversation for the next request — "Invalid assistant message: content or tool_calls
+must be set" — and because that rebuild happens on every step, every following message
+failed with the same error no matter what was typed. Three "continue" attempts became
+three identical failures.
+
+BlindPilot now recognises that refusal when a question was answered during the turn,
+removes the broken step and everything after it, and sends the message again on the
+repaired conversation. The transcript keeps its row saying what was asked and what was
+answered, so nothing the person said is lost, and the turn carries on instead of
+ending. Only one repair is attempted per turn: if the provider refuses the conversation
+again, that second refusal is reported rather than looping. The same refusal with no
+question in the turn — or where the question was dismissed rather than answered — is
+still reported as the plain failure it is.
+
 # BlindPilot 0.6.0
 
 BlindPilot is an accessible desktop reader for AI coding agents. It is based on Claude

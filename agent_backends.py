@@ -3405,6 +3405,24 @@ def _opencode_tool_label(name: str, arguments: object) -> str:
     return f"{verb}: {detail}" if detail else verb
 
 
+# An assistant message the provider refuses on replay poisons the whole
+# conversation: opencode rebuilds the request from its stored history every
+# step, so once one malformed message is in, every later turn fails with the
+# same 400 until the message is gone. DeepSeek-class providers report it as
+# "content or tool_calls must be set"; the paired complaint about tool results
+# left dangling is the same break in a different coat.
+_POISON_HISTORY_RE = re.compile(
+    r"Invalid assistant message|tool_calls['?]? must be followed by tool messages"
+    r"|missing in assistant tool call message|reasoning_content.*must be passed back",
+    re.IGNORECASE,
+)
+
+
+def _poison_history_error(text: str) -> bool:
+    """Whether a backend error says the stored history itself was refused."""
+    return bool(_POISON_HISTORY_RE.search(text or ""))
+
+
 def _opencode_questions(raw: object) -> tuple[Question, ...]:
     """Read a question.asked event into BlindPilot's own question shape.
 
@@ -3493,6 +3511,13 @@ class OpencodeWorker(threading.Thread):
         self._settled = threading.Event()
         self._answer: list[str] = []
         self._tools_running: set[str] = set()
+        # Set when a question was answered this turn. The provider poison that
+        # a broken question replay leaves behind is only worth the surgery
+        # below where a question was actually part of the turn.
+        self._question_answered = False
+        # One repair per turn: if the retry is refused too, report it rather
+        # than looping.
+        self._history_repaired = False
 
     # ----- what the window drives -----
 
@@ -3575,6 +3600,157 @@ class OpencodeWorker(threading.Thread):
         if not self._settled.is_set():
             self._settled.set()
             self._on_failed(message)
+
+    def _on_session_error(self, properties: dict) -> bool:
+        """A session.error ends the turn — unless one repair attempt fits.
+
+        A provider that refuses a stored message refuses every following
+        request too, so an ordinary failure here would leave the conversation
+        permanently stuck behind a turn that can never be replayed. The one
+        break BlindPilot itself can walk into is a question round-trip, so
+        when the error reads like refused history and a question was answered
+        this turn, the question's step is deleted and the prompt sent again.
+
+        Returns False when the turn is over for good (failure reported, or the
+        reader should keep going on the repaired conversation).
+        """
+        text = opencode_error_text(properties.get("error"), "opencode reported an error")
+        if not (_poison_history_error(text) and self._question_answered):
+            self._fail(text)
+            return False
+        if self._history_repaired or self._cancelled:
+            self._fail(text)
+            return False
+        self._history_repaired = True
+        if self._repair_history():
+            self._on_activity(
+                "tool",
+                "opencode refused the conversation after the question; "
+                "removing the broken step and trying again.",
+            )
+            self._resend()
+            return True
+        self._fail(text)
+        return False
+
+    def _repair_history(self) -> bool:
+        """Delete the poisoned question step and everything after it.
+
+        The message the provider cannot replay is two-fold: the question
+        step whose tool call comes back unpaired, and the empty assistant
+        step it died on — neither content nor tool calls, which is the very
+        text of the 400. Both go, and so does anything written after them,
+        since every later step is refused for the same reason.
+
+        Returns True when something was actually removed. The listing's order
+        is not counted on: the question step to cut at is the latest one by
+        its own timestamp.
+        """
+        server = self._server
+        session = self._session_id
+        if server is None or not session:
+            return False
+        try:
+            messages = server.request(
+                "GET", f"/session/{session}/message", params={"directory": self._cwd}, timeout=60
+            )
+        except (OSError, ValueError):
+            return False
+        entries = [
+            entry
+            for entry in (messages if isinstance(messages, list) else [])
+            if isinstance(entry, dict)
+        ]
+
+        def stamp(entry: dict) -> float:
+            info = entry.get("info") if isinstance(entry.get("info"), dict) else entry
+            time = info.get("time") if isinstance(info.get("time"), dict) else {}
+            try:
+                return float(time.get("created") or info.get("time_created") or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        cutoff_id = ""
+        cutoff_stamp = -1.0
+        for entry in entries:
+            info = entry.get("info") if isinstance(entry.get("info"), dict) else entry
+            if str(info.get("role") or "") != "assistant":
+                continue
+            message_id = str(info.get("id") or "")
+            if not message_id:
+                continue
+            parts = entry.get("parts") if isinstance(entry.get("parts"), list) else []
+            for part in parts:
+                if not isinstance(part, dict) or str(part.get("tool") or "") != "question":
+                    continue
+                state = part.get("state") if isinstance(part.get("state"), dict) else {}
+                if str(state.get("status") or "") != "completed":
+                    continue
+                when = stamp(entry)
+                if when >= cutoff_stamp:
+                    cutoff_id, cutoff_stamp = message_id, when
+                break
+        if not cutoff_id:
+            return False
+        # The step the question died on has no timestamp of its own worth
+        # trusting, so the cut is by position in the listing relative to the
+        # question step, and by time for anything ordered oddly.
+        try:
+            index = next(
+                position
+                for position, entry in enumerate(entries)
+                if (entry.get("info") if isinstance(entry.get("info"), dict) else entry).get("id")
+                == cutoff_id
+            )
+        except StopIteration:
+            return False
+        doomed = [
+            entry
+            for position, entry in enumerate(entries)
+            if position >= index and stamp(entry) >= cutoff_stamp
+        ]
+        removed = False
+        for entry in doomed:
+            info = entry.get("info") if isinstance(entry.get("info"), dict) else entry
+            message_id = str(info.get("id") or "")
+            if not message_id:
+                continue
+            try:
+                server.request(
+                    "DELETE",
+                    f"/session/{session}/message/{message_id}",
+                    params={"directory": self._cwd},
+                    timeout=60,
+                )
+            except (OSError, ValueError):
+                return removed
+            removed = True
+        return removed
+
+    def _resend(self) -> None:
+        """Send this turn's prompt again on the repaired conversation."""
+        server = self._server
+        if server is None or not self._session_id:
+            self._fail("opencode's server went away while repairing the conversation")
+            return
+        command = self._as_command()
+        try:
+            if command is not None:
+                self._start_command(*command)
+            else:
+                server.request(
+                    "POST",
+                    f"/session/{self._session_id}/prompt_async",
+                    params={"directory": self._cwd},
+                    body=self._prompt_body(self._prompt),
+                    timeout=120,
+                )
+        except (OSError, ValueError) as exc:
+            self._fail(opencode_error_text(exc, "opencode would not take the message again."))
+            return
+        self._answer.clear()
+        self._emitted.clear()
+        self._accepting_input.set()
 
     def _prompt_body(self, text: str) -> dict:
         body: dict = {"parts": [{"type": "text", "text": text}]}
@@ -3770,10 +3946,10 @@ class OpencodeWorker(threading.Thread):
                 if properties.get("sessionID") not in (None, self._session_id):
                     continue
                 if kind == "session.error":
-                    self._fail(
-                        opencode_error_text(properties.get("error"), "opencode reported an error")
-                    )
-                    return
+                    # The repair path re-sends and keeps reading; only an
+                    # unrepaired failure returns here for good.
+                    if not self._on_session_error(properties):
+                        return
                 if kind in ("session.idle", "session.compacted"):
                     self._finish()
                     return
@@ -3953,6 +4129,7 @@ class OpencodeWorker(threading.Thread):
                 "a question",
             )
             return
+        self._question_answered = True
         body = {"answers": [list(answer) for answer in answers]}
         self._post(
             [

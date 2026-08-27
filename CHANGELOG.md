@@ -4,6 +4,11 @@ Readable release history for BlindPilot. When adjacent releases were part of the
 same fix stream, they are combined with a version range such as
 `v0.3.6-v0.3.7`.
 
+## v0.6.1 - 2026-08-27
+
+- A conversation survives the questions it asked. Answering a question on the opencode backend could leave the conversation permanently broken: the provider refused the stored question step on every later request with "Invalid assistant message: content or tool_calls must be set", so every following message failed with the same 400 and no amount of retrying got past it. BlindPilot now recognises that refusal, deletes the broken step and everything after it, and sends the message again — the transcript row saying what was asked and answered stays, so nothing said is lost, and the conversation carries on instead of ending. A refusal with no question in the turn, or where the question was dismissed rather than answered, is still reported as the failure it is, and only one repair is attempted per turn.
+- Four regression tests cover the repair: the broken step and the empty step it died on are deleted and nothing else, the same refusal with no question is only reported, a second refusal is reported rather than looped, and a dismissed question never triggers the surgery.
+
 ## v0.6.0 - 2026-08-27
 
 - A backend that stops to ask a question is now answered rather than turned down. All four can pause a turn to put a multiple-choice question to the person driving them, and BlindPilot now opens a dialog for it: one radio button per answer where a single answer is wanted, checkboxes where several are, and an "Other" choice that opens a box to type an answer of your own. The answer goes back the way each backend expects it and the turn carries on; the transcript keeps a row saying what was asked and what was said.

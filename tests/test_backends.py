@@ -848,6 +848,9 @@ class _ScriptedOpencodeServer:
         self.events = events
         self.closed = False
         self.fail: set[str] = set()
+        # Canned request replies, matched by path substring. Everything else
+        # answers with {} as before.
+        self.replies: dict[str, object] = {}
 
     def paths(self) -> list[str]:
         return [path for _method, path, _body in self.calls]
@@ -862,6 +865,9 @@ class _ScriptedOpencodeServer:
         self.calls.append((method, path, body))
         if any(marker in path for marker in self.fail):
             raise OSError(f"no route for {path}")
+        for needle, reply in self.replies.items():
+            if needle in path:
+                return reply
         if method == "POST" and path == "/session":
             return {"id": self.session_id}
         return {}
@@ -1125,6 +1131,193 @@ def test_opencode_error_is_reported_rather_than_left_running(monkeypatch):
 
     assert seen["failed"] == ["5-hour usage limit reached."]
     assert not seen["complete"]
+
+
+_POISONED_HISTORY = [
+    {
+        "info": {"id": "msg_1", "role": "user", "time": {"created": 1000}},
+        "parts": [{"type": "text", "text": "Build the mirror"}],
+    },
+    {
+        "info": {"id": "msg_2", "role": "assistant", "time": {"created": 2000}},
+        "parts": [
+            {"type": "text", "text": "Research complete."},
+            {
+                "type": "tool",
+                "tool": "webfetch",
+                "state": {"status": "completed", "output": "ok"},
+            },
+        ],
+    },
+    {
+        "info": {"id": "msg_3", "role": "assistant", "time": {"created": 3000}},
+        "parts": [
+            {
+                "type": "tool",
+                "tool": "question",
+                "state": {
+                    "status": "completed",
+                    "input": {"questions": [{"question": "Which?"}]},
+                    "output": "User has answered your questions.",
+                },
+            }
+        ],
+    },
+    # The step the turn died on: no content and no tool calls — the very
+    # message "content or tool_calls must be set" is about.
+    {"info": {"id": "msg_4", "role": "assistant", "time": {"created": 4000}}, "parts": []},
+]
+
+
+def test_opencode_refused_history_after_a_question_is_repaired_and_resent(monkeypatch):
+    """The 400 that follows an answered question kills every later turn.
+
+    The question's step is what the provider cannot replay, so it is deleted
+    and this turn's prompt sent again instead of reporting the failure.
+    """
+    poison = (
+        "RequestExecutor.execute: Provider request failed with HTTP 400: "
+        '{"error":{"message":"Error from provider (Console Go): Upstream request failed: '
+        '[invalid_request_error] Invalid assistant message: content or tool_calls must be set"}}'
+    )
+    events = [
+        _opencode_event("question.asked", id="que_1", questions=[{"question": "Which?"}]),
+        _opencode_event(
+            "session.error", error={"name": "UnknownError", "data": {"message": poison}}
+        ),
+        # The repaired turn runs to completion.
+        _opencode_event("session.idle"),
+    ]
+    server = _ScriptedOpencodeServer(events)
+    server.replies["/message"] = _POISONED_HISTORY
+    monkeypatch.setattr(agent_backends, "opencode_server", lambda: server)
+    monkeypatch.setattr(agent_backends, "opencode_default_model", lambda *_a, **_k: "")
+    monkeypatch.setattr(agent_backends, "opencode_model_efforts", lambda *_a, **_k: [])
+    seen: dict = {"activity": [], "complete": [], "failed": [], "session": []}
+    callbacks = _callbacks()
+    callbacks["on_activity"] = lambda kind, value: seen["activity"].append((kind, value))
+    callbacks["on_complete"] = seen["complete"].append
+    callbacks["on_failed"] = seen["failed"].append
+    callbacks["on_session"] = seen["session"].append
+    OpencodeWorker(
+        "continue",
+        "ses_test",
+        "/work",
+        "default",
+        on_question=lambda _questions: [["Spaces"]],
+        **callbacks,
+    )._do_run()
+
+    # The poisoned question step and the empty step it died on are deleted;
+    # the earlier, perfectly replayable steps are not.
+    deleted = [path for method, path, _b in server.calls if method == "DELETE"]
+    assert deleted == ["/session/ses_test/message/msg_3", "/session/ses_test/message/msg_4"]
+    # The prompt is sent twice: the original turn and the retry.
+    sends = [path for path in server.paths() if "prompt_async" in path]
+    assert len(sends) == 2
+    assert seen["complete"] == [""]
+    assert not seen["failed"]
+
+
+def test_opencode_refused_history_without_a_question_is_only_reported(monkeypatch):
+    """The same refusal where no question was asked is a plain failure.
+
+    BlindPilot only ever breaks history itself through the question tool, so
+    a refusal with no question in the turn is left to the person to see.
+    """
+    poison = (
+        "Provider request failed with HTTP 400: Invalid assistant message: "
+        "content or tool_calls must be set"
+    )
+    events = [
+        _opencode_event(
+            "session.error", error={"name": "UnknownError", "data": {"message": poison}}
+        ),
+    ]
+    server = _ScriptedOpencodeServer(events)
+    server.replies["/message"] = _POISONED_HISTORY
+    monkeypatch.setattr(agent_backends, "opencode_server", lambda: server)
+    monkeypatch.setattr(agent_backends, "opencode_default_model", lambda *_a, **_k: "")
+    monkeypatch.setattr(agent_backends, "opencode_model_efforts", lambda *_a, **_k: [])
+
+    seen, server2 = _opencode_turn(events, monkeypatch, session_id="ses_test")
+
+    assert seen["failed"] == [
+        "Provider request failed with HTTP 400: Invalid assistant message: "
+        "content or tool_calls must be set"
+    ]
+    assert not any(method == "DELETE" for method, _p, _b in server2.calls)
+
+
+def test_opencode_a_second_refusal_is_reported_not_looped(monkeypatch):
+    """One repair per turn: if the retry is refused too, the failure lands."""
+    poison = "Provider request failed with HTTP 400: Invalid assistant message: content or tool_calls must be set"
+    events = [
+        _opencode_event("question.asked", id="que_1", questions=[{"question": "Which?"}]),
+        _opencode_event(
+            "session.error", error={"name": "UnknownError", "data": {"message": poison}}
+        ),
+        _opencode_event(
+            "session.error", error={"name": "UnknownError", "data": {"message": poison}}
+        ),
+    ]
+    server = _ScriptedOpencodeServer(events)
+    server.replies["/message"] = _POISONED_HISTORY
+    monkeypatch.setattr(agent_backends, "opencode_server", lambda: server)
+    monkeypatch.setattr(agent_backends, "opencode_default_model", lambda *_a, **_k: "")
+    monkeypatch.setattr(agent_backends, "opencode_model_efforts", lambda *_a, **_k: [])
+    seen: dict = {"activity": [], "complete": [], "failed": [], "session": []}
+    callbacks = _callbacks()
+    callbacks["on_activity"] = lambda kind, value: seen["activity"].append((kind, value))
+    callbacks["on_complete"] = seen["complete"].append
+    callbacks["on_failed"] = seen["failed"].append
+    callbacks["on_session"] = seen["session"].append
+    OpencodeWorker(
+        "continue",
+        "ses_test",
+        "/work",
+        "default",
+        on_question=lambda _questions: [["Spaces"]],
+        **callbacks,
+    )._do_run()
+
+    deleted = [path for method, path, _b in server.calls if method == "DELETE"]
+    assert len(deleted) == 2
+    assert len(seen["failed"]) == 1
+
+
+def test_opencode_a_question_left_unanswered_never_triggers_the_repair(monkeypatch):
+    """A rejected question round-trip does not poison anything, so the same
+    refusal with a rejected question is a plain failure too."""
+    poison = "Provider request failed with HTTP 400: Invalid assistant message: content or tool_calls must be set"
+    events = [
+        _opencode_event("question.asked", id="que_1", questions=[{"question": "Which?"}]),
+        _opencode_event(
+            "session.error", error={"name": "UnknownError", "data": {"message": poison}}
+        ),
+    ]
+    server = _ScriptedOpencodeServer(events)
+    server.replies["/message"] = _POISONED_HISTORY
+    monkeypatch.setattr(agent_backends, "opencode_server", lambda: server)
+    monkeypatch.setattr(agent_backends, "opencode_default_model", lambda *_a, **_k: "")
+    monkeypatch.setattr(agent_backends, "opencode_model_efforts", lambda *_a, **_k: [])
+    seen: dict = {"activity": [], "complete": [], "failed": [], "session": []}
+    callbacks = _callbacks()
+    callbacks["on_activity"] = lambda kind, value: seen["activity"].append((kind, value))
+    callbacks["on_complete"] = seen["complete"].append
+    callbacks["on_failed"] = seen["failed"].append
+    callbacks["on_session"] = seen["session"].append
+    OpencodeWorker(
+        "continue",
+        "ses_test",
+        "/work",
+        "default",
+        on_question=lambda _questions: None,
+        **callbacks,
+    )._do_run()
+
+    assert seen["failed"]
+    assert not any(method == "DELETE" for method, _p, _b in server.calls)
 
 
 def test_opencode_compaction_is_a_request_of_its_own_not_a_message(monkeypatch):
