@@ -315,6 +315,16 @@ class BackendInfo:
     # up its context window. FreeBuff's CLI has no such command — its only
     # context control is starting a new conversation.
     supports_compaction: bool = False
+    # Whether the CLI opens the sign-in page itself. Claude Code and Codex do,
+    # even when BlindPilot starts them with no console; FreeBuff deliberately
+    # prints the address and tells you to open it yourself. Opening a page the
+    # CLI has already opened leaves two tabs on the same authorization, so
+    # BlindPilot only opens the ones nobody else will.
+    login_opens_browser: bool = False
+    # What the CLI's "paste the code from the browser" prompt looks like. It is
+    # written without a newline after it, so it is matched against the output
+    # as it arrives rather than line by line. Empty when the CLI never asks.
+    login_code_prompt: str = ""
 
 
 BACKENDS = {
@@ -323,12 +333,18 @@ BACKENDS = {
         "Claude Code",
         "claude",
         "See https://claude.com/claude-code",
-        ("/login",),
+        # "claude /login" is a slash command typed inside the interactive
+        # session, not a command line. Run that way it opens a terminal UI that
+        # BlindPilot has no console for, so it sat there until it timed out and
+        # no browser ever opened. "claude auth login" is the command line.
+        ("auth", "login"),
         True,
         True,
         True,
         True,
         supports_compaction=True,
+        login_opens_browser=True,
+        login_code_prompt=r"[Pp]aste code here[^>]*>",
     ),
     BACKEND_CODEX: BackendInfo(
         BACKEND_CODEX,
@@ -341,6 +357,7 @@ BACKENDS = {
         True,
         True,
         supports_compaction=True,
+        login_opens_browser=True,
     ),
     BACKEND_FREEBUFF: BackendInfo(
         BACKEND_FREEBUFF,

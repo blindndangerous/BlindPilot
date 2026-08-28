@@ -1,58 +1,50 @@
-# BlindPilot 0.6.1
+# BlindPilot 0.6.2
 
 BlindPilot is an accessible desktop reader for AI coding agents. It is based on Claude
 Code Reader and remains available under the MIT License, with credit to the original
 project throughout the application and documentation.
 
-## A conversation survives the questions it asked
+## Sign In gets you signed in
 
-Answering a question on the opencode backend could leave the whole conversation
-permanently broken. The provider refused the stored question step when it rebuilt the
-conversation for the next request — "Invalid assistant message: content or tool_calls
-must be set" — and because that rebuild happens on every step, every following message
-failed with the same error no matter what was typed. Three "continue" attempts became
-three identical failures.
+Sign In did not work. On Claude Code it could not have: BlindPilot ran `claude /login`,
+and `/login` is a slash command typed inside a session, not a command line. Run as one it
+opens the terminal interface — with no console to draw in and no keyboard reaching it, it
+sat there until it timed out five minutes later, having opened nothing and said nothing.
 
-BlindPilot now recognises that refusal when a question was answered during the turn,
-removes the broken step and everything after it, and sends the message again on the
-repaired conversation. The transcript keeps its row saying what was asked and what was
-answered, so nothing the person said is lost, and the turn carries on instead of
-ending. Only one repair is attempted per turn: if the provider refuses the conversation
-again, that second refusal is reported rather than looping. The same refusal with no
-question in the turn — or where the question was dismissed rather than answered — is
-still reported as the plain failure it is.
+The other backends failed more quietly. Codex prints the address to sign in on, and
+BlindPilot threw its entire output away, so anything it had to say about what was
+happening or what had gone wrong was lost. Only FreeBuff was handled, and only because it
+had been special-cased.
 
-# BlindPilot 0.6.0
+All of them now run through one sign-in that treats them the same way. It reads the CLI's
+output as it arrives, finds the address to sign in on, speaks it, and makes sure it
+reaches your default browser: the CLI opens the page itself where it can, BlindPilot opens
+it where the CLI will not, and a new **Open Sign-in Page** button opens it again for when
+the browser never appeared or was closed by accident. Every line the CLI says on the way
+is spoken, colour codes and stray bytes stripped out, so "Waiting for login…" and "Login
+failed: Request failed with status code 400" both arrive instead of silence.
 
-BlindPilot is an accessible desktop reader for AI coding agents. It is based on Claude
-Code Reader and remains available under the MIT License, with credit to the original
-project throughout the application and documentation.
+Two things had to be got right for Claude Code in particular. Its prompt for the code the
+sign-in page hands back — `Paste code here if prompted > ` — is written with no newline
+after it, so anything reading the output a line at a time never sees the prompt it is
+being asked to answer. It is now read a character at a time, and the prompt opens a box to
+paste the code into, which is passed straight to the CLI. That box is a way in rather than
+a wall: the same page usually finishes the sign-in on its own, and when it does the box
+closes by itself. And Codex announces its own callback server — `http://localhost:1455` —
+*before* it prints the page to visit, so the first address in its output is never the one
+to open. Loopback addresses are no longer mistaken for the sign-in page.
 
-## Answering the questions a backend stops to ask
+Whether it worked is no longer taken on trust. When the CLI stops, BlindPilot asks it
+whether you are signed in, so a sign-in that succeeded without a tidy exit code is
+recognised and one that failed is not reported as success. Closing the wizard, pressing
+Escape, or switching backends stops a sign-in that is still running instead of leaving the
+process and its half-open browser behind.
 
-Every backend BlindPilot drives can pause a turn to put a multiple-choice question to the
-person driving it. Until now none of those questions ever reached anybody: they were
-declined, ignored, or never offered in the first place. They are now asked properly.
+opencode is signed in through Connect a Provider, which was already working; it now says
+so out loud when a browser could not be opened, and gives you the address to open yourself
+rather than asking you to finish in a browser that never came up.
 
-A question opens a dialog. Where one answer is wanted there is one radio button per
-answer, each read as its label and then what choosing it means. Where several are allowed
-there is a checked list. The last choice in every list is "Other: type your own answer",
-and picking it opens a box to type in. Closing the dialog tells the backend the question
-went unanswered, so a turn is never left waiting on an answer that is not coming, and
-stopping a run closes an open question with it. The transcript keeps a row saying what was
-asked and what was said.
-
-Each backend is handled in its own terms. Claude Code's AskUserQuestion arrives on the
-permission channel of the stream BlindPilot is already reading, and headless Claude Code is
-now told that this app can show a prompt — without that the tool is not offered at all,
-which is why Claude could never ask before. Codex's `request_user_input` is switched on for
-the app server BlindPilot starts and answered by question id. opencode's `question.asked`
-event is replied to instead of rejected. FreeBuff, which has no API of any kind, has its
-own question box read off its terminal and driven with the keys it understands.
-
-## FreeBuff reaches its composer again
-
-FreeBuff no longer labels the model on its start screen "RECOMMENDED", and BlindPilot
-waited for that word before answering the chooser. On current FreeBuff every message
-therefore sat behind a start screen nobody could see, and the turn never began. The start
-screen is now recognised however it is worded.
+Fifteen tests drive the new sign-in against transcripts taken verbatim from all three
+CLIs — the missing newline, the loopback address, the code written back to the CLI, the
+failure repeated word for word, the CLI that never finishes, and the one that asks for a
+code forever.

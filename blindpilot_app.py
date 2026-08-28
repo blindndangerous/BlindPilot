@@ -42,6 +42,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import webbrowser
 import zipfile
@@ -196,7 +197,7 @@ def announce(text: str) -> None:
 
 
 APP_NAME = "BlindPilot"
-APP_VERSION = "0.6.1"
+APP_VERSION = "0.6.2"
 
 # Streamed coding-agent output can arrive much faster than a native list and a
 # screen reader can consume it. Process a bounded number of events per GUI turn
@@ -1250,7 +1251,7 @@ AUTH_ERROR_MARKERS = (
     "auth required",
     "oauth token",
 )
-AUTH_HINT = "Not signed in — run `claude /login` in a terminal, then try again."
+AUTH_HINT = "Not signed in — run `claude auth login` in a terminal, then try again."
 
 
 def _check_auth_quick(binary: str) -> bool:
@@ -3106,14 +3107,17 @@ class ConnectDialog(wx.Dialog):
             return
         url = str(authorization.get("url") or "")
         instructions = str(authorization.get("instructions") or "")
+        opened = True
         if url:
-            # Opening the browser is a convenience; the address is spoken and
-            # shown either way, so a machine with no default browser is not
-            # left with nothing to go on.
+            # opencode hands back the address and expects whoever asked to open
+            # it. The address is spoken and shown either way, so a machine with
+            # no default browser is not left with nothing to go on.
             try:
-                webbrowser.open(url)
+                opened = bool(webbrowser.open(url))
             except Exception:
-                pass
+                opened = False
+            if not opened:
+                announce(f"Could not open a browser. The sign-in address is {url}")
         if str(authorization.get("method")) == "code":
             self._set_busy(False, f"Finish signing in to {name} in your browser.")
             with wx.TextEntryDialog(
@@ -3132,7 +3136,9 @@ class ConnectDialog(wx.Dialog):
         else:
             code = ""
             message = instructions or f"Finish signing in to {name} in your browser."
-            if url:
+            if url and not opened:
+                message = f"{message} Open this address yourself: {url}"
+            elif url:
                 message = f"{message} The address is {url}"
             self._set_busy(True, f"{message} Waiting for {name} to confirm it…")
 
@@ -4877,11 +4883,223 @@ class SessionPanel(wx.Panel):
 
 _LOGIN_URL_RE = re.compile(r"https?://[^\s\x1b<>]+", re.IGNORECASE)
 
+# What a CLI says when the sign-in itself went wrong, as opposed to a step of it
+# that is still in progress. Worth repeating verbatim: "Login failed: Request
+# failed with status code 400" is the only clue there is.
+_LOGIN_FAILED_RE = re.compile(
+    r"login failed|sign[- ]?in failed|authentication failed|not authenticated",
+    re.IGNORECASE,
+)
+
+
+# The callback a CLI listens on is not the page anyone signs in on. Codex
+# announces "Starting local login server on http://localhost:1455." before it
+# prints the address to actually visit, and opening the first URL in its output
+# lands the user on a blank local port.
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "0.0.0.0", "::1"})
+
+
+_LOGIN_NOISE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\)|[()][A-Z0-9])")
+
+
+def _login_speech(text: str) -> str:
+    """A line of CLI output as it should be read out.
+
+    Colour and cursor codes are invisible on a screen and gibberish out loud,
+    and a character the CLI wrote in some other encoding arrives here as
+    U+FFFD, which NVDA announces in the middle of the sentence it interrupts.
+    """
+    return " ".join(_LOGIN_NOISE_RE.sub("", text).replace("�", "").split())
+
 
 def _first_login_url(text: str) -> str:
-    """Extract a browser-safe URL from plain CLI login output."""
-    match = _LOGIN_URL_RE.search(text)
-    return match.group(0).rstrip(".,;:)]}'\"") if match else ""
+    """The sign-in address in a line of CLI output, or "" if it has none."""
+    for match in _LOGIN_URL_RE.finditer(text):
+        url = match.group(0).rstrip(".,;:)]}'\"")
+        host = (urllib.parse.urlsplit(url).hostname or "").casefold()
+        if host in _LOOPBACK_HOSTS:
+            continue
+        return url
+    return ""
+
+
+class BackendLogin:
+    """Runs a provider CLI's sign-in from a window that has no console.
+
+    Every backend signs in the same shape: print an address, get the browser to
+    it, and wait. What differs is who opens the browser and whether the CLI then
+    wants a code typed back at it. Both are declared per backend, so this drives
+    all of them and none of them is a special case in the caller.
+
+    The output is read a character at a time rather than a line at a time,
+    because the code prompt ("Paste code here if prompted > ") is written
+    without a newline after it. Waiting for one would hide the very prompt the
+    user has to answer, which is what made a sign-in look like it had frozen.
+
+    The callbacks are called on the worker thread; a GUI caller marshals them.
+    """
+
+    def __init__(
+        self,
+        backend: str,
+        binary: str,
+        *,
+        timeout: float = 300.0,
+        opener: Optional[Callable[[str], bool]] = None,
+        popen: Optional[Callable[..., "subprocess.Popen"]] = None,
+    ):
+        self.backend = normalize_backend(backend)
+        self.binary = binary
+        self.url = ""
+        self.failure = ""
+        self._info = BACKENDS[self.backend]
+        self._timeout = timeout
+        self._opener = opener or webbrowser.open
+        self._popen = popen or subprocess.Popen
+        self._proc: Optional[subprocess.Popen] = None
+        self._writing = threading.Lock()
+
+    # ---- Driving it ----
+    def run(
+        self,
+        on_progress: Callable[[str], None],
+        on_url: Callable[[str, bool], None],
+        on_code_prompt: Callable[[str, str], None],
+    ) -> int:
+        """Sign in. Returns the CLI's exit code, -1 on timeout, -2 if it never ran."""
+        args = [self.binary, *self._info.login_args]
+        try:
+            proc = self._popen(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                # A pipe, not DEVNULL: a CLI that wants the code from the
+                # browser has to have somewhere to read it from.
+                stdin=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                **_no_window_kwargs(),
+            )
+        except OSError:
+            return -2
+        self._proc = proc
+        pattern = self._info.login_code_prompt
+        prompt = re.compile(pattern) if pattern else None
+        events: queue.Queue = queue.Queue()
+        threading.Thread(target=self._read, args=(proc, prompt, events), daemon=True).start()
+
+        deadline = time.monotonic() + self._timeout
+        asked = 0
+        ended = False
+        while not (ended and proc.poll() is not None):
+            if time.monotonic() > deadline:
+                self._stop()
+                return -1
+            try:
+                item = events.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if item is None:
+                ended = True
+                continue
+            kind, text = item
+            if kind == "prompt":
+                # The browser round-trip may still finish on its own, so this is
+                # an offer rather than a stop: the caller shows it and reading
+                # goes on. Three is enough for a mistyped code without letting a
+                # CLI that re-prompts forever keep the dialog up forever.
+                asked += 1
+                if asked > 3:
+                    self._stop()
+                    return -1
+                deadline = time.monotonic() + self._timeout
+                on_code_prompt(text.strip(), self.url)
+                continue
+            self._announce(text, on_progress, on_url)
+        return proc.returncode
+
+    def submit_code(self, code: str) -> None:
+        """Answer the CLI's code prompt. Safe to call from another thread."""
+        stdin = getattr(self._proc, "stdin", None)
+        if stdin is None:
+            return
+        with self._writing:
+            try:
+                stdin.write(f"{code}\n")
+                stdin.flush()
+            except (OSError, ValueError):
+                pass
+
+    def open_page(self) -> bool:
+        """Put the sign-in address in the browser. False if nothing happened."""
+        if not self.url:
+            return False
+        try:
+            return bool(self._opener(self.url))
+        except Exception:
+            return False
+
+    def cancel(self) -> None:
+        self._stop()
+
+    # ---- Internals ----
+    def _announce(
+        self,
+        text: str,
+        on_progress: Callable[[str], None],
+        on_url: Callable[[str, bool], None],
+    ) -> None:
+        spoken = _login_speech(text)
+        if _LOGIN_FAILED_RE.search(spoken):
+            self.failure = spoken
+        found = _first_login_url(text)
+        if found and not self.url:
+            self.url = found
+            # A CLI that opens its own page is left to it, so the user does not
+            # end up with two tabs on the same authorization. The wizard's Open
+            # Sign-in Page button opens it either way, for when that did not
+            # arrive.
+            opened = False if self._info.login_opens_browser else self.open_page()
+            on_url(found, opened)
+            return
+        if spoken:
+            on_progress(spoken)
+
+    def _read(self, proc, prompt, events: queue.Queue) -> None:
+        stream = proc.stdout
+        pending = ""
+        try:
+            while True:
+                char = stream.read(1)
+                if not char:
+                    break
+                if char == "\r":
+                    continue
+                if char == "\n":
+                    events.put(("line", pending))
+                    pending = ""
+                    continue
+                pending += char
+                if prompt is not None and prompt.search(pending):
+                    events.put(("prompt", pending))
+                    pending = ""
+        except (OSError, ValueError):
+            pass
+        finally:
+            if pending:
+                events.put(("line", pending))
+            events.put(None)
+
+    def _stop(self) -> None:
+        proc = self._proc
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            proc.kill()
+            proc.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
 
 class SetupWizard(wx.Dialog):
@@ -4906,6 +5124,8 @@ class SetupWizard(wx.Dialog):
         self._step = 0
         self._backend_path: Optional[str] = None
         self._login_thread: Optional[threading.Thread] = None
+        self._login: Optional[BackendLogin] = None
+        self._code_dialog: Optional[wx.TextEntryDialog] = None
 
         self._step_label = wx.StaticText(self, label="")
         f = self._step_label.GetFont()
@@ -4945,6 +5165,7 @@ class SetupWizard(wx.Dialog):
         self.SetSizer(root)
 
         self.Bind(wx.EVT_CHAR_HOOK, self._on_key)
+        self.Bind(wx.EVT_CLOSE, self._on_wizard_close)
         self._show_step(0)
 
     # ---- page builders ----
@@ -5027,8 +5248,8 @@ class SetupWizard(wx.Dialog):
             p,
             label=(
                 "BlindPilot needs you to be signed in to use the Claude Code backend.\n\n"
-                "If you have already run 'claude /login' in your terminal and it worked, "
-                "click Already Signed In to skip this step.\n\n"
+                "If you have already run 'claude auth login' in your terminal and "
+                "it worked, click Already Signed In to skip this step.\n\n"
                 "Otherwise click Sign In — your browser will open to complete authentication."
             ),
         )
@@ -5040,8 +5261,16 @@ class SetupWizard(wx.Dialog):
         self._signin_btn.Bind(wx.EVT_BUTTON, lambda _e: self._do_login())
         self._already_btn = wx.Button(p, label="Already Signed In")
         self._already_btn.Bind(wx.EVT_BUTTON, lambda _e: self._go(+1))
+        # The CLI opens the browser for some backends and refuses to for
+        # others, and a browser closed by accident used to mean starting the
+        # whole sign-in again. This reopens the address the CLI gave, whoever
+        # was meant to open it the first time.
+        self._open_page_btn = wx.Button(p, label="Open Sign-in Page")
+        self._open_page_btn.Bind(wx.EVT_BUTTON, lambda _e: self._open_sign_in_page())
+        self._open_page_btn.Disable()
         btn_row.Add(self._signin_btn, 0, wx.RIGHT, 12)
-        btn_row.Add(self._already_btn, 0)
+        btn_row.Add(self._already_btn, 0, wx.RIGHT, 12)
+        btn_row.Add(self._open_page_btn, 0)
         s = wx.BoxSizer(wx.VERTICAL)
         s.Add(self._signin_intro, 0, wx.ALL, 8)
         s.Add(self._signin_status, 0, wx.LEFT | wx.BOTTOM, 8)
@@ -5099,6 +5328,10 @@ class SetupWizard(wx.Dialog):
         self._signin_btn.SetLabel(
             "Connect a Provider" if self.backend == BACKEND_OPENCODE else "Sign In"
         )
+        # opencode's sign-in runs through the Connect dialog, which opens the
+        # provider's page itself; there is no CLI address for this button to
+        # reopen, so it is not offered.
+        self._open_page_btn.Show(self.backend != BACKEND_OPENCODE)
         self._welcome_text.SetLabel(
             "Welcome to BlindPilot.\n\n"
             "Choose the coding-agent backend you want to use first. This wizard "
@@ -5149,6 +5382,9 @@ class SetupWizard(wx.Dialog):
             return
         self.backend = BACKEND_IDS[selection]
         self._backend_path = None
+        # The address the previous CLI handed out signs you in to the previous
+        # provider. Opening it from here would be worse than offering nothing.
+        self._stop_login()
         self._signin_status.SetLabel("")
         self._refresh_backend_copy()
         self.Layout()
@@ -5195,15 +5431,28 @@ class SetupWizard(wx.Dialog):
         if target < 0:
             return
         if target >= len(self._STEPS):
+            self._stop_login()
             self.EndModal(wx.ID_OK)
             return
         self._show_step(target)
 
     def _on_key(self, event: wx.KeyEvent) -> None:
         if event.GetKeyCode() == wx.WXK_ESCAPE:
+            self._stop_login()
             self.EndModal(wx.ID_CANCEL)
             return
         event.Skip()
+
+    def _on_wizard_close(self, event: wx.CloseEvent) -> None:
+        self._stop_login()
+        event.Skip()
+
+    def _stop_login(self) -> None:
+        """Leave no half-finished sign-in running behind a closed wizard."""
+        self._close_code_dialog()
+        login, self._login = self._login, None
+        if login is not None:
+            login.cancel()
 
     # ---- CLI step ----
 
@@ -5472,6 +5721,7 @@ class SetupWizard(wx.Dialog):
 
     def _check_signin(self) -> None:
         label = backend_label(self.backend)
+        self._open_page_btn.Enable(self._login is not None and bool(self._login.url))
         self._backend_path = self._find_selected_cli()
         if not self._backend_path:
             self._signin_status.SetLabel(
@@ -5510,6 +5760,8 @@ class SetupWizard(wx.Dialog):
         self._signin_btn.Disable()
         self._already_btn.Disable()
         self._next_btn.Disable()
+        self._open_page_btn.Disable()
+        self._login = BackendLogin(self.backend, self._backend_path)
         self._signin_status.SetLabel(
             "Waiting for sign-in… Complete authentication in your browser, then return here."
         )
@@ -5520,106 +5772,108 @@ class SetupWizard(wx.Dialog):
         self._login_thread.start()
 
     def _run_login(self) -> None:
-        binary = self._backend_path
-        rc = -1
-        try:
-            assert binary is not None
-            args = [binary, *BACKENDS[self.backend].login_args]
-            proc = subprocess.Popen(
-                args,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                **_no_window_kwargs(),
-            )
-            if self.backend == BACKEND_FREEBUFF:
-                # Freebuff's plain login deliberately prints a URL instead of
-                # opening it. BlindPilot runs without a visible console, so
-                # swallowing that output leaves the user waiting on a browser
-                # that can never appear. Pump the URL out immediately and open
-                # it on the user's behalf while the CLI polls for completion.
-                assert proc.stdout is not None
-                output: queue.Queue[Optional[str]] = queue.Queue()
-
-                def pump() -> None:
-                    try:
-                        for raw in proc.stdout:
-                            output.put(raw.rstrip())
-                    finally:
-                        output.put(None)
-
-                threading.Thread(target=pump, daemon=True).start()
-                deadline = time.monotonic() + 300
-                saw_end = False
-                login_url = ""
-                while time.monotonic() < deadline and not (saw_end and proc.poll() is not None):
-                    try:
-                        line = output.get(timeout=0.2)
-                    except queue.Empty:
-                        continue
-                    if line is None:
-                        saw_end = True
-                        continue
-                    if not line:
-                        continue
-                    url = _first_login_url(line)
-                    if url and not login_url:
-                        login_url = url
-                        try:
-                            opened = bool(webbrowser.open(url))
-                        except Exception:
-                            opened = False
-                        wx.CallAfter(self._on_freebuff_login_url, url, opened)
-                    elif not login_url:
-                        wx.CallAfter(self._on_login_progress, line)
-                if proc.poll() is None:
-                    proc.kill()
-                    proc.wait()
-                    rc = -1
-                else:
-                    rc = proc.returncode
-            else:
-                # Only the wait can time out, and killing the process is only
-                # possible once there is one, so the timeout is caught here.
-                try:
-                    _out, _ = proc.communicate(timeout=300)
-                    rc = proc.returncode
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.communicate()
-                    rc = -1
-        except Exception:
-            rc = -2
-        wx.CallAfter(self._on_login_done, rc)
+        login = self._login
+        assert login is not None
+        rc = login.run(
+            lambda text: wx.CallAfter(self._on_login_progress, text),
+            lambda url, opened: wx.CallAfter(self._on_login_url, url, opened),
+            lambda prompt, url: wx.CallAfter(self._ask_login_code, prompt, url),
+        )
+        # The CLI is the only thing that knows whether the browser round-trip
+        # landed, and not all of them say so with an exit code — Claude Code
+        # keeps running after a rejected code, and a kill for taking too long
+        # looks identical to one for going wrong. Asking the CLI whether it is
+        # signed in settles it either way.
+        ok = rc == 0 or backend_auth_ok(self.backend)
+        wx.CallAfter(self._on_login_done, ok, login.failure)
 
     def _on_login_progress(self, text: str) -> None:
+        if not self:
+            return
         self._signin_status.SetLabel(text)
         self._signin_status.Wrap(520)
         self._pages[2].Layout()
         self.Layout()
         announce(text)
 
-    def _on_freebuff_login_url(self, url: str, opened: bool) -> None:
+    def _on_login_url(self, url: str, opened: bool) -> None:
+        """The CLI has said where to sign in. Say it, and offer to open it."""
+        if not self:
+            return
+        self._open_page_btn.Enable()
         if opened:
-            text = "FreeBuff sign-in opened in your browser. Complete it, then return here."
+            text = "The sign-in page is open in your browser. Complete it, then return here."
         else:
-            text = f"Could not open the browser automatically. Open this sign-in URL: {url}"
+            text = (
+                "Your browser should have opened the sign-in page. If it did not, "
+                f"choose Open Sign-in Page. The address is {url}"
+            )
         self._on_login_progress(text)
 
-    def _on_login_done(self, rc: int) -> None:
+    def _open_sign_in_page(self) -> None:
+        """The browser did not arrive, or it was closed. Open it again."""
+        login = self._login
+        if login is None or not login.url:
+            announce("There is no sign-in page yet. Choose Sign In first.")
+            return
+        if login.open_page():
+            announce("Opened the sign-in page in your browser.")
+        else:
+            announce(f"Could not open a browser. The sign-in address is {login.url}")
+
+    def _ask_login_code(self, prompt: str, url: str) -> None:
+        """The CLI is waiting for the code the sign-in page hands back.
+
+        Not every sign-in ends this way — the same page usually completes the
+        round-trip on its own — so this dialog is a way in, not a wall. It
+        closes itself the moment the CLI finishes without it.
+        """
+        if not self or self._code_dialog is not None:
+            return
+        message = (
+            f"{prompt or 'Paste the code from the sign-in page.'}\n\n"
+            "If the page gave you a code, paste it here and choose OK.\n"
+            "If it did not, leave this alone — it closes by itself once the "
+            "browser has finished signing you in."
+        )
+        if url:
+            message = f"{message}\n\n{url}"
+        dlg = wx.TextEntryDialog(self, message, "Sign In")
+        self._code_dialog = dlg
+        try:
+            code = dlg.GetValue().strip() if dlg.ShowModal() == wx.ID_OK else ""
+        finally:
+            self._code_dialog = None
+            dlg.Destroy()
+        if code and self._login is not None:
+            self._login.submit_code(code)
+
+    def _close_code_dialog(self) -> None:
+        dlg = self._code_dialog
+        if dlg is None:
+            return
+        self._code_dialog = None
+        try:
+            dlg.EndModal(wx.ID_CANCEL)
+        except Exception:
+            pass
+
+    def _on_login_done(self, ok: bool, failure: str) -> None:
+        if not self:
+            return
+        self._close_code_dialog()
         self._signin_btn.Enable()
         self._already_btn.Enable()
         self._next_btn.Enable()
-        if rc == 0:
+        if ok:
             self._signin_status.SetLabel("Signed in successfully.")
             wx.CallAfter(self._go, +1)
         else:
+            trouble = f"{failure} " if failure else ""
             self._signin_status.SetLabel(
-                "Sign-in did not complete (or timed out). "
-                "Try again, or click Already Signed In if you are authenticated."
+                f"{trouble}Sign-in did not complete (or timed out). "
+                "Try again, choose Open Sign-in Page to reopen the browser, or "
+                "choose Already Signed In if you are authenticated."
             )
         self._pages[2].Layout()
         self.Layout()

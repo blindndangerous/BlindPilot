@@ -71,7 +71,7 @@ BlindPilot's first-run wizard and **File → Manage Backends** can find, install
 ```powershell
 # Claude Code
 claude --version
-claude /login
+claude auth login
 
 # OpenAI Codex
 npm install -g @openai/codex
@@ -85,6 +85,8 @@ freebuff login
 npm install -g opencode-ai
 opencode providers login
 ```
+
+**Sign In** does the same thing from inside BlindPilot, with no terminal. It runs the backend's own sign-in, reads the address out of its output, speaks it, and makes sure it reaches your default browser — the CLI opens it where it can, BlindPilot opens it where it will not, and **Open Sign-in Page** opens it again if the browser was closed or never arrived. When a provider hands the page back a code instead of finishing on its own, BlindPilot asks for the code and gives it to the CLI; that dialog closes by itself if the browser completes the sign-in first.
 
 opencode reaches a model through a provider you connect to it, so BlindPilot carries opencode's `/connect` as a dialog of its own: type `/connect` in the prompt (or use **Connect a Provider** in the wizard) to pick from every provider opencode knows, give it an API key, or sign in through your browser. Nothing about that flow needs a terminal.
 
