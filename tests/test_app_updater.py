@@ -267,12 +267,14 @@ def test_macos_helper_replaces_a_quarantined_unsigned_update_and_relaunches(tmp_
     # wrong here: kill(2) reads pid 0 as the caller's own process group, so the
     # helper would wait out its 30-second window and then signal this test's
     # whole process group.
-    dead_parent = subprocess.run(["/bin/sh", "-c", "exit 0"], check=True)
+    dead_parent = subprocess.Popen(["/bin/sh", "-c", "exit 0"])
+    dead_parent_pid = dead_parent.pid
+    dead_parent.wait()
     result = subprocess.run(
         [
             "/bin/sh",
             str(helper),
-            str(dead_parent.pid),
+            str(dead_parent_pid),
             str(archive),
             str(app),
             str(log),
