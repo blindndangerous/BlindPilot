@@ -262,11 +262,17 @@ def test_macos_helper_replaces_a_quarantined_unsigned_update_and_relaunches(tmp_
     environment["PATH"] = str(fake_bin) + os.pathsep + environment["PATH"]
     environment["TMPDIR"] = str(tmp_path)
     environment["OPEN_MARKER"] = str(open_marker)
+    # The helper waits for its parent PID to close before replacing the bundle.
+    # Passing a PID that is already gone makes that wait end at once. Zero is
+    # wrong here: kill(2) reads pid 0 as the caller's own process group, so the
+    # helper would wait out its 30-second window and then signal this test's
+    # whole process group.
+    dead_parent = subprocess.run(["/bin/sh", "-c", "exit 0"], check=True)
     result = subprocess.run(
         [
             "/bin/sh",
             str(helper),
-            "0",
+            str(dead_parent.pid),
             str(archive),
             str(app),
             str(log),
