@@ -1,60 +1,48 @@
-# BlindPilot 0.6.3
+# BlindPilot 0.7.0
 
 BlindPilot is an accessible desktop reader for AI coding agents. It is based on Claude
 Code Reader and remains available under the MIT License, with credit to the original
 project throughout the application and documentation.
 
-## Every backend gets a PATH that can reach Node
+## Orca hears BlindPilot on Linux
 
-An application opened from the macOS Dock inherits launchd's PATH — `/usr/bin:/bin:/usr/sbin:/sbin`
-— and nothing else. Every provider CLI that npm installs is a `#!/usr/bin/env node` shim,
-so a child handed that PATH dies on `env: node: No such file or directory` before it
-prints anything a person could act on. FreeBuff's pseudo-terminal was the one spawn site
-that passed no environment at all, which is exactly why FreeBuff never ran on a Mac and
-every other backend did: theirs already put the CLI's own folder first.
+BlindPilot's live announcements now reach Orca without moving keyboard focus. A bare ATK
+object is not part of the application's accessible tree, so Orca correctly ignores it;
+BlindPilot now creates a real off-screen GTK accessible and emits announcements through
+that object instead. It uses GTK's native C API so wxPython and PyGObject do not both try
+to initialize GTK and produce warnings.
 
-That environment is now built in one place, it carries the PATH a login shell would have
-given, and everything that starts a CLI uses it — the sign-in, the auth probes, the
-version checks, npm itself. And a terminal that died during start-up no longer reports a
-guess: it reports its own last words, which is the only part of it anyone can act on.
+The GTK bridge is optional. If the native GTK libraries are unavailable, BlindPilot still
+starts normally and leaves the same message in the status bar for the review cursor.
 
-## What BlindPilot starts, BlindPilot stops
+## macOS updates recover instead of disappearing
 
-Half of these CLIs are launchers rather than programs. npm's `codex` and `freebuff` are
-Node scripts that run the real agent as a child, so killing the launcher left that child
-running — still holding its lock, still waiting on a sign-in nobody was completing.
+The old macOS updater closed BlindPilot and attempted one unreported bundle swap. If the
+application was running from macOS App Translocation, the folder was not writable, the
+archive could not be expanded, Gatekeeper quarantined the replacement, or the relaunch
+failed, BlindPilot could simply vanish.
 
-Children now start in a process group of their own and are stopped as one. The group is
-only ever signalled when the child is demonstrably its leader, because a child still
-sitting in our own group would have us signal ourselves.
+Those failures are now handled deliberately:
 
-## FreeBuff picks the model you chose
+- Translocated and unwritable application bundles are rejected while BlindPilot is still
+  open, with instructions that can be acted on.
+- A detached helper waits for BlindPilot to close and prevents two windows from updating
+  the same bundle at once.
+- Verified updates have quarantine removed before and after installation so macOS can
+  launch them.
+- The current application is kept as a backup until the new copy is installed and ready.
+  If anything fails, the previous version is restored and reopened.
+- Failures are logged and reported on the next launch instead of being lost after the
+  window closes. Relaunch falls back to the executable if Launch Services refuses the
+  bundle.
 
-FreeBuff has dropped `deepseek-v4-pro`. A remembered model was offered whether or not the
-installed release still had it, so the picker was driven looking for a row that never
-appears and the message was lost five seconds later.
+## Python 3.13 and release coverage
 
-Underneath that, the picker only parsed three of its five rows, because FreeBuff's display
-names disagree with its ids about where a version letter goes — `mimo/mimo-v2.5` is drawn
-"MiMo 2.5". Navigation counts arrow presses as the distance between two positions in that
-list, so a row that failed to parse did not cost only its own model: it silently selected
-the wrong one for every model below it.
+The opencode backend's event handler was named `_handle`, which collides with a private
+attribute Python 3.13 adds to every `threading.Thread`. On that Python version, opencode
+events could try to call the runtime's internal handle as a method. The handler now has a
+non-conflicting name, with a regression test that reproduces the collision on every
+supported Python version.
 
-A model the installed release has dropped is no longer offered, and one that goes missing
-mid-run falls back audibly rather than costing the turn.
-
-## Sound, and a build that could not speak
-
-The progress earcon watched an event that the next turn cleared while the previous thread
-was still inside `wait()`, so one cue became several playing over each other — and a
-player that could not play the file at all spun, spawning processes as fast as the machine
-allowed. Both are fixed.
-
-The packaged smoke test now fails on macOS if AppKit did not make it into the bundle.
-AppKit is how anything is said to VoiceOver, and a build that packaged everything else and
-dropped it starts, runs, and is silent.
-
-## Windows
-
-Unchanged by design: the process-group flags are empty there, the login shell is never
-asked, and the pywinpty spawn is untouched.
+POSIX login-shell PATH discovery is now tested without depending on the host shell, and
+release builds explicitly compile the new Linux accessibility bridge.

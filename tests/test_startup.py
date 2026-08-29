@@ -21,6 +21,23 @@ def test_linux_announcements_are_sent_to_orca_without_moving_focus(monkeypatch):
     assert spoken == ["Agent response received"]
 
 
+def test_linux_announcement_from_worker_is_queued_on_the_gui_thread(monkeypatch):
+    import blindpilot_app
+
+    queued: list[tuple] = []
+    monkeypatch.setattr(blindpilot_app.wx, "GetApp", lambda: object())
+    monkeypatch.setattr(blindpilot_app.wx, "IsMainThread", lambda: False)
+    monkeypatch.setattr(blindpilot_app.wx, "CallAfter", lambda *args: queued.append(args))
+    monkeypatch.setattr(
+        blindpilot_app,
+        "_linux_native_announce",
+        lambda _text: (_ for _ in ()).throw(AssertionError("called off the GUI thread")),
+    )
+
+    assert blindpilot_app._linux_announce("Finished") is True
+    assert queued == [(blindpilot_app._linux_announce, "Finished")]
+
+
 def test_gui_startup_smoke_skips_first_run_wizard(monkeypatch):
     import blindpilot_app
 

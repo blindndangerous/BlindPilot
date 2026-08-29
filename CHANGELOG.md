@@ -4,6 +4,13 @@ Readable release history for BlindPilot. When adjacent releases were part of the
 same fix stream, they are combined with a version range such as
 `v0.3.6-v0.3.7`.
 
+## v0.7.0 - 2026-08-28
+
+- Linux announcements now reach Orca without stealing keyboard focus. BlindPilot creates a real off-screen GTK accessible through GTK's native API and emits ATK announcements through it, avoiding duplicate GTK initialization warnings while keeping status-bar text as the fallback when GTK is unavailable.
+- macOS self-updates are recoverable. BlindPilot now rejects translocated or unwritable application bundles before closing, prevents concurrent updaters, records failures for the next launch, removes quarantine from verified updates, restores the previous application if replacement fails, and reliably reopens either the updated or restored copy.
+- The opencode backend works on Python 3.13. Its event handler no longer collides with the private `_handle` attribute added to `threading.Thread`.
+- POSIX login-shell PATH discovery is covered by a deterministic regression test, and release builds now compile the Linux accessibility bridge explicitly.
+
 ## v0.6.3 - 2026-08-28
 
 - Every backend now starts with a PATH that can reach Node. An application opened from the macOS Dock inherits launchd's PATH and nothing else, and every provider CLI npm installs is a `#!/usr/bin/env node` shim, so a child handed that PATH died on "env: node: No such file or directory" before printing anything anyone could act on. FreeBuff's pseudo-terminal was the one place that passed no environment at all, which is why FreeBuff never ran on a Mac while the others did. The environment is now built once and carries the PATH a login shell would have given, and everything that starts a CLI uses it: the sign-in, the auth probes, the version checks, and npm itself.
