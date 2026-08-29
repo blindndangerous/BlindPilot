@@ -84,6 +84,7 @@ from agent_backends import (
     codex_model_options,
     compaction_request,
     discard_freebuff_prewarm,
+    end_process_group,
     find_backend_cli,
     freebuff_model_options,
     invalidate_backend_cache,
@@ -96,11 +97,13 @@ from agent_backends import (
     opencode_oauth_finish,
     opencode_oauth_start,
     opencode_providers,
+    own_group_kwargs,
     prewarm_freebuff,
     question_summary,
     reserve_hidden_console,
     set_freebuff_model,
     stop_opencode_server,
+    subprocess_env,
     worker_class,
 )
 
@@ -988,11 +991,12 @@ def install_portable_node(log: Callable[[str], None]) -> Optional[str]:
 
 
 def _npm_environment(npm: str) -> dict[str, str]:
-    env = os.environ.copy()
-    directory = str(Path(npm).parent)
-    if not any(_same_dir(item, directory) for item in env.get("PATH", "").split(os.pathsep)):
-        env["PATH"] = directory + os.pathsep + env.get("PATH", "")
-    return env
+    """npm's own directory first, then everything a terminal would have.
+
+    npm is itself a shim that has to find `node`, so it fails from the macOS
+    Dock for exactly the reason the provider CLIs do.
+    """
+    return subprocess_env(npm)
 
 
 def _npm_install_argv(backend: str) -> Optional[List[str]]:
@@ -1118,6 +1122,7 @@ def _executable_version(binary: str) -> str:
             encoding="utf-8",
             errors="replace",
             timeout=30,
+            env=subprocess_env(binary),
             **_no_window_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -1263,6 +1268,7 @@ def _check_auth_quick(binary: str) -> bool:
             text=True,
             timeout=12,
             stdin=subprocess.DEVNULL,
+            env=subprocess_env(binary),
             **_no_window_kwargs(),
         )
         combined = (result.stdout + result.stderr).lower()
@@ -1366,6 +1372,7 @@ def _run_claude(binary: str, args: List[str], cwd: Optional[str], timeout: int) 
             stdin=subprocess.DEVNULL,
             encoding="utf-8",
             errors="replace",
+            env=subprocess_env(binary),
             **_no_window_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -2002,24 +2009,39 @@ class Earcons:
             except Exception:
                 pass
             return
-        self._loop_stop.clear()
-        self._loop_thread = threading.Thread(target=self._loop_unix, daemon=True)
+        # A fresh event per run, never the previous one reset: the thread this
+        # replaces may still be inside `wait()`, and clearing the event it is
+        # watching would set it looping again alongside the new one. Turn by
+        # turn that is how one progress cue becomes several playing at once.
+        stop = threading.Event()
+        self._loop_stop = stop
+        self._loop_thread = threading.Thread(target=self._loop_unix, args=(stop,), daemon=True)
         self._loop_thread.start()
 
-    def _loop_unix(self) -> None:
+    def _loop_unix(self, stop: threading.Event) -> None:
         player = self._unix_player()
         if not player:
             return
-        while not self._loop_stop.is_set():
+        while not stop.is_set():
+            started = time.monotonic()
             try:
-                self._loop_proc = subprocess.Popen(
+                proc = subprocess.Popen(
                     player + [self.in_progress],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
-                self._loop_proc.wait()
+                if stop.is_set():
+                    proc.kill()
+                    return
+                self._loop_proc = proc
+                proc.wait()
             except Exception:
-                break
+                return
+            # A player that cannot play the file returns at once, and looping
+            # on that spawns processes as fast as the machine allows. One cue
+            # that never sounds is a bug; a fork bomb behind it is a hang.
+            if not stop.is_set() and time.monotonic() - started < 0.05:
+                return
 
     def stop_progress(self) -> None:
         if self._system == "Windows":
@@ -2038,6 +2060,7 @@ class Earcons:
             except Exception:
                 pass
         self._loop_proc = None
+        self._loop_thread = None
 
 
 def _copy_to_clipboard(text: str) -> bool:
@@ -2201,10 +2224,7 @@ class ClaudeWorker(threading.Thread):
         self._cancelled = True
         proc = self._proc
         if proc and proc.poll() is None:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+            end_process_group(proc)
 
     def run(self) -> None:
         try:
@@ -2363,13 +2383,9 @@ class ClaudeWorker(threading.Thread):
         if self._session_id:
             cmd.extend(["--resume", self._session_id])
 
-        # Make sure the binary's directory is on PATH for the subprocess —
-        # `claude` is typically a shim that needs to find `node` (often a
-        # sibling in the same Homebrew/npm bin dir).
-        env = os.environ.copy()
-        bin_dir = os.path.dirname(binary)
-        if bin_dir and bin_dir not in env.get("PATH", "").split(os.pathsep):
-            env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+        # `claude` is typically a shim that needs to find `node`, and a window
+        # started from the macOS Dock has a PATH that holds neither.
+        env = subprocess_env(binary)
 
         try:
             self._proc = subprocess.Popen(
@@ -2382,6 +2398,9 @@ class ClaudeWorker(threading.Thread):
                 bufsize=1,
                 encoding="utf-8",
                 env=env,
+                # `claude` may be a launcher with the real agent as its child;
+                # stopping a task has to stop that too.
+                **own_group_kwargs(),
                 **_no_window_kwargs(),
             )
         except OSError as exc:
@@ -4979,6 +4998,10 @@ class BackendLogin:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                env=subprocess_env(self.binary),
+                # A cancelled sign-in must not leave the CLI's own child still
+                # running and still waiting for a browser nobody is in.
+                **own_group_kwargs(),
                 **_no_window_kwargs(),
             )
         except OSError:
@@ -5095,11 +5118,9 @@ class BackendLogin:
         proc = self._proc
         if proc is None or proc.poll() is not None:
             return
-        try:
-            proc.kill()
-            proc.wait(timeout=5)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+        # Bounded rather than expected: the signals land immediately, and the
+        # wait is only there so a wizard never closes over a live sign-in.
+        end_process_group(proc, timeout=5)
 
 
 class SetupWizard(wx.Dialog):
@@ -6716,6 +6737,11 @@ def main() -> int:
             return 2
         if not APP_NAME or not version_tuple(APP_VERSION):
             return 3
+        # AppKit is how anything is said to VoiceOver. A build that packaged
+        # everything else and dropped it starts, runs, and is silent, which on
+        # this application is the same as not working at all.
+        if platform.system() == "Darwin" and not _MAC_ANNOUNCE:
+            return 4
         return 0
     gui_startup_smoke = "--startup-gui-smoke" in sys.argv
     # Before anything is started: nothing BlindPilot launches may inherit a

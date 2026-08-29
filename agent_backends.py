@@ -20,6 +20,7 @@ import platform
 import queue
 import re
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -40,10 +41,57 @@ def no_window_kwargs() -> dict:
     return {"creationflags": CREATE_NO_WINDOW} if CREATE_NO_WINDOW else {}
 
 
-# A pseudo-terminal is the one child that cannot be given CREATE_NO_WINDOW: the
-# flag belongs to its host, which pywinpty starts itself. Launched from a
-# windowed application, which owns no console to lend it, that host puts a real
-# console on screen. It can still be hidden the moment it appears.
+def own_group_kwargs() -> dict:
+    """``subprocess`` keyword arguments that give a child its own process group.
+
+    Half the provider CLIs are launchers rather than programs: npm's
+    ``@openai/codex`` is a Node script that runs the real Codex as a child of
+    its own, and FreeBuff's is the same shape. Killing the launcher leaves that
+    child running — still holding its lock, still waiting on a sign-in nobody
+    is completing. A child in a group of its own can be stopped as a group,
+    which is the only way to stop what it started too.
+    """
+    return {} if platform.system() == "Windows" else {"start_new_session": True}
+
+
+def end_process_group(proc: object, timeout: float = 0.0) -> None:
+    """Stop a child started with :func:`own_group_kwargs`, and its own children.
+
+    Returns as soon as the signals are away unless *timeout* is given: Stop
+    Task and a closing wizard both call this from the window's own thread, and
+    a wait there is a frozen application rather than a stopped task.
+
+    The group is only signalled when the child is demonstrably the leader of
+    one, which is exactly what ``start_new_session`` made it. Anything else —
+    a child started without its own group, a stand-in in a test, Windows — is
+    stopped on its own. That check is not a formality: a process still sitting
+    in BlindPilot's group would otherwise have BlindPilot signal itself, and
+    take every other backend down with it.
+    """
+    poll = getattr(proc, "poll", None)
+    if poll is not None and poll() is not None:
+        return
+    pid = getattr(proc, "pid", None)
+    if platform.system() != "Windows" and isinstance(pid, int) and pid > 0:
+        try:
+            if os.getpgid(pid) == pid:
+                os.killpg(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    kill = getattr(proc, "kill", None)
+    if kill is not None:
+        try:
+            kill()
+        except OSError:
+            pass
+    wait = getattr(proc, "wait", None)
+    if timeout and wait is not None:
+        try:
+            wait(timeout=timeout)
+        except Exception:
+            pass
+
+
 _CONSOLE_WINDOW_CLASSES = ("ConsoleWindowClass", "PseudoConsoleWindow")
 
 
@@ -507,6 +555,7 @@ def backend_auth_ok(backend: str, timeout: int = 12) -> bool:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=timeout,
+                env=subprocess_env(binary),
                 **no_window_kwargs(),
             )
             return proc.returncode == 0
@@ -517,6 +566,7 @@ def backend_auth_ok(backend: str, timeout: int = 12) -> bool:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=timeout,
+                env=subprocess_env(binary),
                 **no_window_kwargs(),
             )
             return proc.returncode == 0
@@ -560,11 +610,68 @@ def _opencode_auth_ok() -> bool:
     return bool(os.environ.get("OPENCODE_API_KEY", "").strip())
 
 
-def _subprocess_env(binary: str) -> dict[str, str]:
+# A macOS application launched from Finder or the Dock inherits launchd's PATH
+# — /usr/bin:/bin:/usr/sbin:/sbin — and nothing else. Every provider CLI
+# installed by npm or Homebrew is a `#!/usr/bin/env node` shim, so a child
+# started with that PATH dies on "env: node: No such file or directory" before
+# it prints anything a person could act on. Asking the login shell what PATH it
+# would have given is the only way to recover the directories the user actually
+# installed into. It costs a shell start-up, so it is asked once.
+_login_shell_path: Optional[list[str]] = None
+_LOGIN_SHELL_PATH_LOCK = threading.Lock()
+
+
+def login_shell_path_dirs() -> list[str]:
+    """The PATH a terminal would have, for handing to children (POSIX only)."""
+    global _login_shell_path
+    with _LOGIN_SHELL_PATH_LOCK:
+        if _login_shell_path is not None:
+            return list(_login_shell_path)
+        dirs: list[str] = []
+        shell = os.environ.get("SHELL")
+        if platform.system() != "Windows" and shell and os.path.isfile(shell):
+            try:
+                proc = subprocess.run(
+                    [shell, "-l", "-c", "printf '%s\\n' \"$PATH\""],
+                    capture_output=True,
+                    text=True,
+                    timeout=8,
+                )
+                if proc.returncode == 0:
+                    dirs = [
+                        entry for entry in proc.stdout.strip().split(os.pathsep) if entry.strip()
+                    ]
+            # A login shell runs the user's own startup files and can fail in
+            # ways nothing here can predict. This is a best-effort addition to
+            # a PATH that already works for most installs, so a shell that
+            # misbehaves costs the addition and nothing else.
+            except Exception:
+                dirs = []
+        _login_shell_path = dirs
+        return list(dirs)
+
+
+def subprocess_env(binary: str) -> dict[str, str]:
+    """The environment every provider CLI must be started with.
+
+    The CLI's own directory goes first — an npm or Homebrew shim finds its
+    sibling `node` that way — and the login shell's PATH is appended behind
+    whatever this process already has, so a Node installed somewhere else
+    entirely (nvm, Volta, asdf) is still reachable without displacing a
+    runtime BlindPilot manages itself.
+    """
     env = os.environ.copy()
+    entries = [entry for entry in env.get("PATH", "").split(os.pathsep) if entry.strip()]
+    known = set(entries)
     directory = os.path.dirname(binary)
-    if directory and directory not in env.get("PATH", "").split(os.pathsep):
-        env["PATH"] = directory + os.pathsep + env.get("PATH", "")
+    if directory and directory not in known:
+        entries.insert(0, directory)
+        known.add(directory)
+    for entry in login_shell_path_dirs():
+        if entry not in known:
+            entries.append(entry)
+            known.add(entry)
+    env["PATH"] = os.pathsep.join(entries)
     return env
 
 
@@ -605,7 +712,7 @@ def codex_model_options(
             encoding="utf-8",
             errors="replace",
             timeout=30,
-            env=_subprocess_env(binary),
+            env=subprocess_env(binary),
             **no_window_kwargs(),
         )
         payload = json.loads(result.stdout)
@@ -884,9 +991,14 @@ def freebuff_model_options() -> tuple[list[str], list[str], str, str, str]:
         error = "Could not refresh FreeBuff's model catalog; showing the preferred default."
     else:
         error = ""
-    for candidate in (chosen, saved):
-        if candidate and candidate not in models:
-            models.append(candidate)
+    # A remembered choice is only worth offering while the catalog is unknown.
+    # When it was read successfully, a model missing from it is one this
+    # release has dropped, and listing it means picking it, waiting on a picker
+    # that will never show it, and losing the message.
+    if error:
+        for candidate in (chosen, saved):
+            if candidate and candidate not in models:
+                models.append(candidate)
     # BlindPilot's own record wins over FreeBuff's settings file. FreeBuff
     # rewrites that file to its recommended model after a turn, so honouring it
     # would quietly downgrade every following turn to the recommendation.
@@ -902,21 +1014,42 @@ def freebuff_model_options() -> tuple[list[str], list[str], str, str, str]:
     return models, [], current, "", error
 
 
+def _freebuff_display_key(text: str) -> str:
+    """Letters and digits only, with a version letter before a number dropped.
+
+    The picker paints a display name, never the model id, and the two disagree
+    in ways too small to be worth a table and too varied to keep up with:
+    ``mimo/mimo-v2.5`` is drawn "MiMo 2.5" and ``deepseek/deepseek-v4-flash``
+    is drawn "DeepSeek V4 Flash", so the ``v`` is dropped by one side or the
+    other depending on the model. Reducing both sides the same way makes the
+    id a substring of the row it belongs to whichever of them carries it.
+    """
+    return re.sub(r"v(?=\d)", "", re.sub(r"[^a-z0-9]+", "", text.casefold()))
+
+
 def _freebuff_picker_options(visible: str, models: list[str]) -> tuple[list[str], int]:
-    """Return the model IDs painted by FreeBuff's picker and its focused index."""
+    """Return the model IDs painted by FreeBuff's picker and its focused index.
+
+    The index matters as much as the list: the caller moves to a model by
+    pressing Down the difference between two positions in it, so a row that is
+    on screen and not in this list does not cost that model, it costs every
+    model below it. Matching therefore has to recognise every row the picker
+    can move to, or recognise none of them.
+    """
+    # Longest first, so a model whose id is a prefix of another's cannot claim
+    # the longer one's row.
+    keyed = sorted(
+        ((model, _freebuff_display_key(model.rsplit("/", 1)[-1])) for model in models),
+        key=lambda pair: len(pair[1]),
+        reverse=True,
+    )
     options: list[str] = []
     focused = -1
     for raw in visible.splitlines():
         if "│" not in raw:
             continue
-        words = set(re.findall(r"[a-z0-9]+", raw.casefold()))
-        matched = ""
-        for model in models:
-            leaf = model.rsplit("/", 1)[-1]
-            tokens = re.findall(r"[a-z0-9]+", leaf.casefold())
-            if tokens and all(token in words for token in tokens):
-                matched = model
-                break
+        row = _freebuff_display_key(raw)
+        matched = next((model for model, key in keyed if key and key in row), "")
         if not matched or matched in options:
             continue
         options.append(matched)
@@ -927,7 +1060,10 @@ def _freebuff_picker_options(visible: str, models: list[str]) -> tuple[list[str]
 
 def invalidate_backend_cache(backend: str | None = None) -> None:
     """Drop version-derived provider data before an explicit runtime refresh."""
-    global _freebuff_catalog_cache
+    global _freebuff_catalog_cache, _login_shell_path
+    # The wizard may have just put a backend on PATH. The answer cached before
+    # that happened is precisely the one that made putting it there necessary.
+    _login_shell_path = None
     if backend is None or normalize_backend(backend) == BACKEND_OPENCODE:
         with _OPENCODE_CATALOG_LOCK:
             _opencode_catalog_cache.clear()
@@ -1116,10 +1252,7 @@ class CodexWorker(threading.Thread):
             )
         proc = self._proc
         if proc and proc.poll() is None:
-            try:
-                proc.kill()
-            except OSError:
-                pass
+            end_process_group(proc)
 
     def run(self) -> None:
         try:
@@ -1128,14 +1261,7 @@ class CodexWorker(threading.Thread):
             self._accepting_input.clear()
             proc = self._proc
             if proc and proc.poll() is None:
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=2)
-                except (OSError, subprocess.TimeoutExpired):
-                    try:
-                        proc.kill()
-                    except OSError:
-                        pass
+                end_process_group(proc, timeout=2)
             self._on_done()
 
     @staticmethod
@@ -1168,7 +1294,11 @@ class CodexWorker(threading.Thread):
                 bufsize=1,
                 encoding="utf-8",
                 errors="replace",
-                env=_subprocess_env(server_binary),
+                env=subprocess_env(server_binary),
+                # npm's `codex` is a Node launcher that runs the real Codex as
+                # a child of its own; stopping only the launcher leaves that
+                # child holding the app-server session.
+                **own_group_kwargs(),
                 **no_window_kwargs(),
             )
         except OSError as exc:
@@ -1887,6 +2017,35 @@ def _freebuff_run_status(chat: Optional[Path], offset: int = 0) -> str:
     return ""
 
 
+def _freebuff_launch_failure(visible: str) -> str:
+    """Say why FreeBuff's terminal closed, in its own words where it gave any.
+
+    A terminal that dies during start-up has usually printed one line saying
+    why. ``env: node: No such file or directory`` is the common one on macOS,
+    where an application started from the Dock inherits a PATH holding no Node
+    at all, and it is far more use than a guess at reinstalling.
+    """
+    lines = [line.strip() for line in _strip_terminal_noise(visible).splitlines()]
+    reason = next((line for line in reversed(lines) if line), "")
+    if len(reason) > 200:
+        reason = reason[:199] + "\u2026"
+    if not reason:
+        return (
+            "FreeBuff's terminal closed before it was ready for a prompt, "
+            "without saying why. Check that FreeBuff runs in a terminal, then "
+            "try again."
+        )
+    if "node" in reason.casefold() and "not found" in reason.casefold().replace(
+        "no such file or directory", "not found"
+    ):
+        return (
+            f"FreeBuff could not start: {reason}. FreeBuff runs on Node.js, and "
+            "BlindPilot could not find it. Install Node.js, or use File \u2192 "
+            "Manage Backends to let BlindPilot install one for you."
+        )
+    return f"FreeBuff's terminal closed before it was ready for a prompt: {reason}"
+
+
 class FreebuffTerminal(Protocol):
     """The pseudo-terminal handle, whichever library produced it.
 
@@ -1987,6 +2146,11 @@ def _spawn_freebuff_pty(
         args[1:],
         cwd=cwd,
         encoding="utf-8",
+        # Without this the terminal inherits whatever PATH the window was
+        # started with. Launched from the macOS Dock that is launchd's, which
+        # holds no Node, and FreeBuff's `#!/usr/bin/env node` shim dies before
+        # it can paint anything.
+        env=subprocess_env(args[0]),
         dimensions=(60, 180),
         timeout=0.25,
     )
@@ -2391,10 +2555,11 @@ class FreebuffWorker(threading.Thread):
                 continue
             if not chunk and self._stream_ended.is_set():
                 if not sent:
-                    self._on_failed(
-                        "FreeBuff's terminal closed before it was ready for a prompt. "
-                        "Reinstall BlindPilot, then try again."
-                    )
+                    # Whatever killed it said so on the terminal before dying —
+                    # a missing Node, a failed download, a refused login. That
+                    # sentence is the whole of what the person can act on, so
+                    # it is reported instead of a guess.
+                    self._on_failed(_freebuff_launch_failure(last_visible))
                     return
                 # It ended mid-turn, so whatever was captured is the whole
                 # answer; fall through to report it rather than wait it out.
@@ -2448,8 +2613,18 @@ class FreebuffWorker(threading.Thread):
                     accepted_recommended_model = True
                     continue
                 if time.monotonic() - picker_expanded_at >= 5:
-                    self._on_failed(f"FreeBuff's model picker did not offer {self._model}")
-                    return
+                    # FreeBuff drops models between releases. Throwing the
+                    # message away over that is a worse answer than running it
+                    # on what FreeBuff is offering instead, provided the swap
+                    # is said out loud rather than made quietly.
+                    self._on_activity(
+                        "tool",
+                        f"FreeBuff no longer offers {self._model}; "
+                        "using the model it recommends instead",
+                    )
+                    self._write(_KEY_ENTER)
+                    accepted_recommended_model = True
+                    continue
 
             if (
                 sent
@@ -2984,7 +3159,7 @@ class OpencodeServer:
         from collections import deque
 
         password = secrets.token_urlsafe(24)
-        env = _subprocess_env(binary)
+        env = subprocess_env(binary)
         env["OPENCODE_SERVER_PASSWORD"] = password
         self._log: "deque[str]" = deque(maxlen=50)
         self._url = ""
@@ -3006,6 +3181,7 @@ class OpencodeServer:
             encoding="utf-8",
             errors="replace",
             env=env,
+            **own_group_kwargs(),
             **no_window_kwargs(),
         )
         threading.Thread(target=self._pump, daemon=True).start()
@@ -3077,14 +3253,15 @@ class OpencodeServer:
     def stop(self) -> None:
         proc = self._proc
         if proc.poll() is None:
+            # It owns a SQLite database, so it is asked to close before it is
+            # made to. The group sweep afterwards is for anything it started
+            # that did not go with it.
             try:
                 proc.terminate()
                 proc.wait(timeout=5)
             except (OSError, subprocess.TimeoutExpired):
-                try:
-                    proc.kill()
-                except OSError:
-                    pass
+                pass
+            end_process_group(proc, timeout=5)
 
 
 def opencode_server() -> OpencodeServer:
@@ -3189,7 +3366,7 @@ def _opencode_models_from_cli() -> list[str]:
             encoding="utf-8",
             errors="replace",
             timeout=60,
-            env=_subprocess_env(binary),
+            env=subprocess_env(binary),
             **no_window_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired):

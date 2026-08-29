@@ -10,6 +10,8 @@ import threading
 import time
 from types import SimpleNamespace
 
+import pytest
+
 import agent_backends
 from agent_backends import (
     BACKEND_CLAUDE,
@@ -1458,7 +1460,7 @@ def test_opencode_server_is_reached_over_loopback_behind_a_password(monkeypatch)
 
     monkeypatch.setattr(agent_backends.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(agent_backends, "_free_port", lambda: 41234)
-    monkeypatch.setattr(agent_backends, "_subprocess_env", lambda _binary: {})
+    monkeypatch.setattr(agent_backends, "subprocess_env", lambda _binary: {})
 
     server = agent_backends.OpencodeServer("opencode")
 
@@ -1797,3 +1799,241 @@ def test_freebuff_start_screen_is_recognised_however_it_is_worded():
     assert picker.search("  Start coding for free   1 day streak")
     assert picker.search("  See all 4 models")
     assert not picker.search("  Enter a coding task or / for commands")
+
+
+def test_a_cli_is_started_with_a_path_that_can_reach_node(monkeypatch):
+    # A window opened from the macOS Dock inherits launchd's PATH and nothing
+    # else, while every provider CLI npm installs is a `#!/usr/bin/env node`
+    # shim. Handing a child that bare PATH is how FreeBuff died before it drew
+    # a single frame, so the environment must carry both the CLI's own folder
+    # and whatever a terminal would have had.
+    monkeypatch.setattr(agent_backends, "_login_shell_path", None)
+    monkeypatch.setattr(
+        agent_backends,
+        "login_shell_path_dirs",
+        lambda: ["/opt/homebrew/bin", "/usr/bin"],
+    )
+    monkeypatch.setenv("PATH", os.pathsep.join(["/usr/bin", "/bin"]))
+
+    env = agent_backends.subprocess_env(os.path.join("/opt", "npm", "bin", "freebuff"))
+    entries = env["PATH"].split(os.pathsep)
+
+    assert entries[0] == os.path.join("/opt", "npm", "bin")
+    assert "/opt/homebrew/bin" in entries
+    # What the process already had stays ahead of the shell's own additions, so
+    # a runtime BlindPilot installed itself is not displaced by an older one.
+    assert entries.index("/usr/bin") < entries.index("/opt/homebrew/bin")
+    assert len(entries) == len(set(entries))
+
+
+def test_a_login_shell_that_misbehaves_costs_only_the_extra_path(monkeypatch):
+    monkeypatch.setattr(agent_backends, "_login_shell_path", None)
+    monkeypatch.setenv("SHELL", "/bin/sh")
+    monkeypatch.setattr(agent_backends.os.path, "isfile", lambda _path: True)
+
+    def explode(*_args, **_kwargs):
+        raise RuntimeError("the user's profile is broken")
+
+    monkeypatch.setattr(agent_backends.subprocess, "run", explode)
+
+    assert agent_backends.login_shell_path_dirs() == []
+
+
+def test_freebuff_reports_why_its_terminal_died():
+    # "Reinstall BlindPilot" is not something a missing Node can be fixed by,
+    # and the terminal said what was actually wrong before it closed.
+    missing_node = agent_backends._freebuff_launch_failure("env: node: No such file or directory")
+    assert "node" in missing_node.casefold()
+    assert "Node.js" in missing_node
+
+    other = agent_backends._freebuff_launch_failure("Error: could not reach the FreeBuff service")
+    assert "could not reach the FreeBuff service" in other
+
+    assert "without saying why" in agent_backends._freebuff_launch_failure("")
+
+
+FREEBUFF_EXPANDED_PICKER = """
+│ › GPT-5.6 Luna             Strong all-around · Reasoning: high · Images │
+│   Solar Pro 4              Limited-time trial · TEST                    │
+│   GLM 5.3 Flash            Deep reasoning · Images · NEW                │
+│   DeepSeek V4 Flash 07/31  Smart & Fast · Reasoning: high · NEW         │
+│                      May use data for AI training                       │
+│   MiMo 2.5                 Balanced · Images                            │
+"""
+
+
+def test_every_row_of_the_model_picker_is_recognised():
+    # The caller reaches a model by pressing Down the difference between two
+    # positions in this list, so a row that is on screen and missing from it
+    # does not cost that model — it silently selects the wrong one for every
+    # model below it. FreeBuff's display names disagree with its ids about
+    # where a version letter goes ("MiMo 2.5" is mimo/mimo-v2.5, "DeepSeek V4
+    # Flash" is deepseek/deepseek-v4-flash), and both have to be read.
+    models = [
+        "openai/gpt-5.6-luna",
+        "deepseek/deepseek-v4-flash",
+        "mimo/mimo-v2.5",
+        "upstage/solar-pro4",
+        "z-ai/glm-5.3-flash",
+    ]
+
+    options, focused = agent_backends._freebuff_picker_options(FREEBUFF_EXPANDED_PICKER, models)
+
+    assert options == [
+        "openai/gpt-5.6-luna",
+        "upstage/solar-pro4",
+        "z-ai/glm-5.3-flash",
+        "deepseek/deepseek-v4-flash",
+        "mimo/mimo-v2.5",
+    ]
+    assert focused == 0
+
+
+def test_a_model_the_installed_release_dropped_is_not_offered(monkeypatch, tmp_path):
+    # FreeBuff removes models between releases. Continuing to offer one it has
+    # dropped means picking it, waiting out a picker that will never show it,
+    # and losing the message.
+    monkeypatch.setattr(agent_backends, "find_backend_cli", lambda _backend: "freebuff")
+    monkeypatch.setattr(
+        agent_backends,
+        "_freebuff_models_from_install",
+        lambda _binary: ["openai/gpt-5.6-luna", "mimo/mimo-v2.5"],
+    )
+    monkeypatch.setattr(
+        agent_backends, "_read_freebuff_choice", lambda: agent_backends.FREEBUFF_PREFERRED_MODEL
+    )
+    monkeypatch.setattr(agent_backends.Path, "home", classmethod(lambda _cls: tmp_path))
+
+    models, _efforts, current, _effort, error = freebuff_model_options()
+
+    assert error == ""
+    assert agent_backends.FREEBUFF_PREFERRED_MODEL not in models
+    assert current == "openai/gpt-5.6-luna"
+
+
+def test_a_catalog_that_could_not_be_read_still_offers_the_remembered_model(monkeypatch, tmp_path):
+    monkeypatch.setattr(agent_backends, "find_backend_cli", lambda _backend: "freebuff")
+    monkeypatch.setattr(agent_backends, "_freebuff_models_from_install", lambda _binary: [])
+    monkeypatch.setattr(agent_backends, "_read_freebuff_choice", lambda: "vendor/remembered")
+    monkeypatch.setattr(agent_backends.Path, "home", classmethod(lambda _cls: tmp_path))
+
+    models, _efforts, current, _effort, error = freebuff_model_options()
+
+    assert error
+    assert "vendor/remembered" in models
+    assert current == "vendor/remembered"
+
+
+def test_a_backend_is_started_in_a_group_of_its_own():
+    # npm's `codex` and `freebuff` are Node launchers that run the real agent
+    # as a child. Stopping only the launcher leaves that child running.
+    kwargs = agent_backends.own_group_kwargs()
+    if platform.system() == "Windows":
+        assert kwargs == {}
+    else:
+        assert kwargs == {"start_new_session": True}
+
+
+def test_stopping_a_child_never_signals_blindpilots_own_group(monkeypatch):
+    # The guard that matters most: a child still sitting in BlindPilot's group
+    # must be stopped on its own. Signalling its group would signal ours, which
+    # takes down BlindPilot and every other backend with it.
+    signalled: list[int] = []
+    monkeypatch.setattr(
+        agent_backends.os, "killpg", lambda pid, _sig: signalled.append(pid), raising=False
+    )
+    # getpgid reports our group, not the child's — the child never got one.
+    monkeypatch.setattr(agent_backends.os, "getpgid", lambda _pid: 4242, raising=False)
+
+    class Child:
+        pid = 99
+        killed = False
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout=None):
+            return 0
+
+    child = Child()
+    agent_backends.end_process_group(child)
+
+    assert signalled == []
+    assert child.killed
+
+
+def test_a_child_that_leads_its_own_group_is_stopped_as_a_group(monkeypatch):
+    if platform.system() == "Windows":
+        pytest.skip("process groups are a POSIX concept")
+    signalled: list[int] = []
+    monkeypatch.setattr(
+        agent_backends.os, "killpg", lambda pid, _sig: signalled.append(pid), raising=False
+    )
+    monkeypatch.setattr(agent_backends.os, "getpgid", lambda pid: pid, raising=False)
+
+    class Child:
+        pid = 99
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+    agent_backends.end_process_group(Child())
+
+    assert signalled == [99]
+
+
+def test_stopping_a_child_that_already_exited_does_nothing(monkeypatch):
+    monkeypatch.setattr(
+        agent_backends.os,
+        "killpg",
+        lambda *_a: pytest.fail("a finished process must not be signalled"),
+        raising=False,
+    )
+
+    class Gone:
+        pid = 7
+
+        def poll(self):
+            return 0
+
+        def kill(self):
+            pytest.fail("a finished process must not be killed")
+
+    agent_backends.end_process_group(Gone())
+
+
+def test_stopping_a_task_does_not_block_the_window(monkeypatch):
+    # Stop Task and a closing wizard both call this from the GUI thread. A wait
+    # there is a frozen application rather than a stopped task, so waiting is
+    # opt-in and the callers that used to wait are the only ones that still do.
+    monkeypatch.setattr(agent_backends.os, "killpg", lambda *_a: None, raising=False)
+    monkeypatch.setattr(agent_backends.os, "getpgid", lambda pid: pid, raising=False)
+    waited: list = []
+
+    class Child:
+        pid = 99
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            waited.append(timeout)
+            return 0
+
+    agent_backends.end_process_group(Child())
+    assert waited == []
+
+    agent_backends.end_process_group(Child(), timeout=2)
+    assert waited == [2]
