@@ -4147,7 +4147,7 @@ class OpencodeWorker(threading.Thread):
                 if kind in ("session.idle", "session.compacted"):
                     self._finish()
                     return
-                self._handle(kind, properties)
+                self._handle_event(kind, properties)
         except Exception as exc:
             # Deliberately broad: Stop closes this connection from another
             # thread, mid-read, and what a socket torn out from under the HTTP
@@ -4175,7 +4175,7 @@ class OpencodeWorker(threading.Thread):
             # sentence that was never written.
             self._on_complete("\n\n".join(self._answer).strip())
 
-    def _handle(self, kind: str, properties: dict) -> None:
+    def _handle_event(self, kind: str, properties: dict) -> None:
         if kind == "message.updated":
             info = properties.get("info") or {}
             if isinstance(info, dict) and info.get("id"):

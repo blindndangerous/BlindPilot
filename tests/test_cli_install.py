@@ -103,6 +103,22 @@ class _PatchPopen:
         return False
 
 
+class _PatchRun:
+    """Stand in for subprocess.run without replacing its exception types."""
+
+    def __init__(self, function):
+        self._function = function
+
+    def __enter__(self):
+        self._real = claude_reader.subprocess.run
+        claude_reader.subprocess.run = self._function
+        return self
+
+    def __exit__(self, *exc):
+        claude_reader.subprocess.run = self._real
+        return False
+
+
 # ---- Where we look for an existing install --------------------------------
 
 
@@ -252,21 +268,29 @@ def test_login_shell_path_split_keeps_entries_containing_spaces():
     Splitting PATH by word rather than by colon would shred it into fragments
     and make us wrongly report that claude's folder is not on PATH.
     """
-    shell = _real_posix_shell()
-    if shell is None:
-        return
-
+    shell = "/bin/sh"
     spaced = "/opt/Some App/bin"
-    old = os.environ.get("PATH", "")
-    os.environ["PATH"] = f"/usr/bin:{spaced}:/opt/x"
-    try:
+    called = {}
+
+    def run(argv, **kwargs):
+        called["argv"] = argv
+        called["kwargs"] = kwargs
+
+        class Result:
+            returncode = 0
+            stdout = f"/usr/bin\n{spaced}\n/opt/x\n"
+
+        return Result()
+
+    with _PatchRun(run):
         with _Patch(platform=_FakePlatform("Darwin"), _login_shell=lambda: shell):
             dirs = claude_reader._posix_persistent_path_dirs()
-    finally:
-        os.environ["PATH"] = old
 
     assert spaced in dirs, dirs
     assert not any(d == "/opt/Some" for d in dirs)
+    assert called["argv"][1:3] == ["-l", "-c"]
+    assert 'tr ":" "\\n"' in called["argv"][3]
+    assert called["kwargs"]["text"] is True
 
 
 def test_posix_check_stays_quiet_without_a_usable_login_shell():

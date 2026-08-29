@@ -51,6 +51,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence
 
+from linux_accessibility import GTK as _GTK
+
 import wx
 
 from app_updater import (
@@ -153,12 +155,48 @@ if platform.system() == "Windows":
         _SPEAKER = None
 
 
+_LINUX_ANNOUNCER: object = None
+
+
+def _linux_announce(text: str) -> bool:
+    """Post an ATK announcement that Orca reads without moving keyboard focus."""
+    global _LINUX_ANNOUNCER
+
+    try:
+        if _GTK is None or wx.GetApp() is None:
+            return False
+        if not wx.IsMainThread():
+            wx.CallAfter(_linux_announce, text)
+            return True
+        if _LINUX_ANNOUNCER is False:
+            return False
+        if _LINUX_ANNOUNCER is None:
+            # A bare Atk.NoOpObject is not part of the application's accessible
+            # tree, so Orca correctly ignores its announcements. A realized
+            # off-screen label is a genuine GTK accessible without creating a
+            # visible window or taking keyboard focus.
+            window = _GTK.OffscreenWindow()
+            label = _GTK.Label(label="BlindPilot announcements")
+            window.add(label)
+            window.show_all()
+            _LINUX_ANNOUNCER = (window, label.get_accessible())
+        _window, source = _LINUX_ANNOUNCER
+        source.emit("announcement", text)
+        return True
+    except Exception:
+        # Accessibility must never make the application itself unstable. The
+        # same message is also mirrored to the status bar by every caller.
+        _LINUX_ANNOUNCER = False
+        return False
+
+
 def announce(text: str) -> None:
     """Speak `text` via the screen reader without stealing focus.
 
-    macOS uses the NSAccessibility announcement API; Windows goes through
-    accessible_output2. Callers also mirror the message to the status bar so
-    there is a fallback the review cursor can reach.
+    macOS uses the NSAccessibility announcement API, Windows goes through
+    accessible_output2, and Linux posts an ATK announcement for Orca. Callers
+    also mirror the message to the status bar so there is a fallback the review
+    cursor can reach.
     """
     if _SPEAKER is not None:
         try:
@@ -167,6 +205,8 @@ def announce(text: str) -> None:
             _SPEAKER.speak(text, interrupt=False)
         except Exception:
             pass
+        return
+    if platform.system() == "Linux" and _linux_announce(text):
         return
     if not _MAC_ANNOUNCE:
         return

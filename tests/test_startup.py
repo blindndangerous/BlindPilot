@@ -8,6 +8,19 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+def test_linux_announcements_are_sent_to_orca_without_moving_focus(monkeypatch):
+    import blindpilot_app
+
+    spoken: list[str] = []
+    monkeypatch.setattr(blindpilot_app.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(blindpilot_app, "_SPEAKER", None)
+    monkeypatch.setattr(blindpilot_app, "_linux_announce", lambda text: spoken.append(text) is None)
+
+    blindpilot_app.announce("Agent response received")
+
+    assert spoken == ["Agent response received"]
+
+
 def test_gui_startup_smoke_skips_first_run_wizard(monkeypatch):
     import blindpilot_app
 

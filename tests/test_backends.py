@@ -943,6 +943,23 @@ def test_opencode_worker_is_the_adapter_for_opencode():
     assert worker_class(BACKEND_OPENCODE, Claude) is OpencodeWorker
 
 
+def test_opencode_event_handler_does_not_collide_with_python_313_thread_handle(monkeypatch):
+    """Python 3.13 stores an internal object on every Thread as ``_handle``."""
+    server = _ScriptedOpencodeServer([_opencode_event("session.idle")])
+    monkeypatch.setattr(agent_backends, "opencode_server", lambda: server)
+    callbacks = _callbacks()
+    completed: list[str] = []
+    callbacks["on_complete"] = completed.append
+    worker = OpencodeWorker("hello", None, "/work", "default", **callbacks)
+    # Reproduce the attribute Python 3.13 adds even when this test is running on
+    # an older interpreter. Event dispatch must not try to call it as a method.
+    worker._handle = object()
+
+    worker._do_run()
+
+    assert completed == [""]
+
+
 def test_opencode_permission_modes_translate_to_rule_sets_and_agents(monkeypatch):
     """Plan mode has to reach opencode as something it enforces, not as prose."""
     events = [_opencode_event("session.idle")]
