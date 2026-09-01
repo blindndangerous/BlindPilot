@@ -1921,6 +1921,7 @@ class _Settings:
         cfg = _load_config()
         self.live_rows = bool(cfg.get("live_rows", True))
         self.speak_live = bool(cfg.get("speak_live", True))
+        self.sounds_enabled = bool(cfg.get("sounds_enabled", True))
         self.text_view = bool(cfg.get("text_view", False))
         self.show_thinking = bool(cfg.get("show_thinking", False))
 
@@ -1928,6 +1929,7 @@ class _Settings:
         cfg = _load_config()
         cfg["live_rows"] = self.live_rows
         cfg["speak_live"] = self.speak_live
+        cfg["sounds_enabled"] = self.sounds_enabled
         cfg["text_view"] = self.text_view
         cfg["show_thinking"] = self.show_thinking
         _save_config(cfg)
@@ -1956,9 +1958,10 @@ class Earcons:
     by re-spawning in a daemon thread). Missing files are silently ignored.
     """
 
-    def __init__(self, folder: str):
+    def __init__(self, folder: str, enabled: bool = True):
         self._folder = folder
         self._system = platform.system()
+        self.enabled = bool(enabled)
         self.send = self._resolve("send")
         self.received = self._resolve("received", "Recieved")
         self.in_progress = self._resolve("in-progress", "in_progress")
@@ -1984,7 +1987,7 @@ class Earcons:
         return None
 
     def _play_once(self, path: Optional[str]) -> None:
-        if not path:
+        if not self.enabled or not path:
             return
         try:
             if self._system == "Windows":
@@ -2003,15 +2006,17 @@ class Earcons:
             pass
 
     def play_send(self) -> None:
-        self._play_once(self.send)
+        if self.enabled:
+            self._play_once(self.send)
 
     def play_received(self) -> None:
         self.stop_progress()
-        self._play_once(self.received)
+        if self.enabled:
+            self._play_once(self.received)
 
     def start_progress(self) -> None:
         self.stop_progress()
-        if not self.in_progress:
+        if not self.enabled or not self.in_progress:
             return
         if self._system == "Windows":
             try:
@@ -2076,6 +2081,12 @@ class Earcons:
                 pass
         self._loop_proc = None
         self._loop_thread = None
+
+    def set_enabled(self, enabled: bool) -> None:
+        """Enable or mute cues, stopping the progress loop when muted."""
+        self.enabled = bool(enabled)
+        if not self.enabled:
+            self.stop_progress()
 
 
 def _copy_to_clipboard(text: str) -> bool:
@@ -5944,7 +5955,10 @@ class MainFrame(wx.Frame):
         super().__init__(None, title=APP_NAME, size=wx.Size(900, 760))
 
         # Shared audio cues (send / in-progress loop / received).
-        self.earcons = Earcons(os.path.join(_resource_dir(), "EarCons"))
+        self.earcons = Earcons(
+            os.path.join(_resource_dir(), "EarCons"),
+            enabled=SETTINGS.sounds_enabled,
+        )
         self._update_checking = False
 
         # Remembered "Projects folder" — the parent folder that holds the
@@ -6061,6 +6075,11 @@ class MainFrame(wx.Frame):
             "Add the backend's own thinking to the activity. Off by default, "
             "so only its actions and its answer are shown",
         )
+        self._sounds_item = options_menu.AppendCheckItem(
+            wx.ID_ANY,
+            "Play &sound cues",
+            "Play sounds when a message is sent, while it is working, and when a response arrives",
+        )
         options_menu.AppendSeparator()
         self._text_view_item = options_menu.AppendCheckItem(
             wx.ID_ANY,
@@ -6077,6 +6096,7 @@ class MainFrame(wx.Frame):
         self._rows_item.Check(SETTINGS.live_rows)
         self._speak_item.Check(SETTINGS.speak_live)
         self._thinking_item.Check(SETTINGS.show_thinking)
+        self._sounds_item.Check(SETTINGS.sounds_enabled)
         self._text_view_item.Check(SETTINGS.text_view)
         menubar.Append(options_menu, "&Options")
 
@@ -6099,6 +6119,7 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, lambda _e: self._toggle_live_rows(), self._rows_item)
         self.Bind(wx.EVT_MENU, lambda _e: self._toggle_speak_live(), self._speak_item)
         self.Bind(wx.EVT_MENU, lambda _e: self._toggle_show_thinking(), self._thinking_item)
+        self.Bind(wx.EVT_MENU, lambda _e: self._toggle_sounds(), self._sounds_item)
         self.Bind(wx.EVT_MENU, lambda _e: self._toggle_text_view(), self._text_view_item)
         self.Bind(
             wx.EVT_MENU,
@@ -6454,6 +6475,13 @@ class MainFrame(wx.Frame):
         SETTINGS.save()
         state = "shown" if SETTINGS.show_thinking else "hidden"
         self._announce_setting(f"The backend's reasoning is {state}")
+
+    def _toggle_sounds(self) -> None:
+        SETTINGS.sounds_enabled = self._sounds_item.IsChecked()
+        SETTINGS.save()
+        self.earcons.set_enabled(SETTINGS.sounds_enabled)
+        state = "on" if SETTINGS.sounds_enabled else "off"
+        self._announce_setting(f"Sound cues {state}")
 
     def _toggle_text_view(self) -> None:
         SETTINGS.text_view = self._text_view_item.IsChecked()

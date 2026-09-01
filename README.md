@@ -24,7 +24,7 @@ BlindPilot is based on the original **[Claude Code Reader](https://github.com/do
 - Attaches files and pasted clipboard images as explicit prompt paths.
 - Searches responses, jumps between them, and copies a code block, a whole response, or the whole conversation.
 - Picks the model and reasoning effort from whatever the installed CLI actually reports.
-- Marks sent, working, and received with earcons, so a long run is audible without being spoken.
+- Marks sent, working, and received with optional earcons, which can be turned off from the Options menu.
 - Installs, updates, adds to PATH, and signs into any of the four backends from an accessible wizard.
 - Updates itself from GitHub Releases after verifying the published SHA-256.
 
