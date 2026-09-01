@@ -164,17 +164,17 @@ def test_codex_stream_deltas_become_one_accessible_activity_row():
     assert "".join(worker._assistant_parts) == "BlindPilot ready."
 
 
-def test_freebuff_catalog_is_discovered_at_runtime_and_pro_is_default(monkeypatch, tmp_path):
+def test_freebuff_catalog_is_discovered_at_runtime_and_preferred_is_default(monkeypatch, tmp_path):
     wrapper = tmp_path / "npm" / "freebuff.cmd"
     readme = wrapper.parent / "node_modules" / "freebuff" / "README.md"
     executable = tmp_path / ".config" / "manicode" / "freebuff.exe"
     readme.parent.mkdir(parents=True)
     executable.parent.mkdir(parents=True)
     wrapper.touch()
-    readme.write_text("DeepSeek V4 Pro\nGPT Next\n", encoding="utf-8")
+    readme.write_text("GLM 5.3 Flash\nGPT Next\n", encoding="utf-8")
     executable.write_text(
-        'pro="deepseek/deepseek-v4-pro",next="openai/gpt-next";'
-        'a={id:pro,displayName:"DeepSeek V4 Pro",availability:"always"};'
+        'glm="z-ai/glm-5.3-flash",next="openai/gpt-next";'
+        'a={id:glm,displayName:"GLM 5.3 Flash",availability:"always"};'
         'b={id:next,displayName:"GPT Next",availability:"always"};',
         encoding="latin-1",
     )
@@ -188,9 +188,9 @@ def test_freebuff_catalog_is_discovered_at_runtime_and_pro_is_default(monkeypatc
 
     models, efforts, current, current_effort, error = freebuff_model_options()
 
-    assert models == ["deepseek/deepseek-v4-pro", "openai/gpt-next"]
+    assert models == ["z-ai/glm-5.3-flash", "openai/gpt-next"]
     assert efforts == []
-    assert current == "deepseek/deepseek-v4-pro"
+    assert current == "z-ai/glm-5.3-flash"
     assert current_effort == ""
     assert error == ""
 
@@ -203,18 +203,18 @@ def test_freebuff_catalog_is_discovered_at_runtime_and_pro_is_default(monkeypatc
     assert settings["freebuffModel"] == "openai/gpt-next"
 
 
-def test_freebuff_catalog_keeps_the_current_off_peak_pro_model(monkeypatch, tmp_path):
-    """Freebuff 0.0.152 changed Pro from always to off_peak_only."""
+def test_freebuff_catalog_keeps_the_current_off_peak_preferred_model(monkeypatch, tmp_path):
+    """Freebuff 0.0.152 changed its top model from always to off_peak_only."""
     wrapper = tmp_path / "npm" / "freebuff.cmd"
     readme = wrapper.parent / "node_modules" / "freebuff" / "README.md"
     executable = tmp_path / ".config" / "manicode" / "freebuff.exe"
     readme.parent.mkdir(parents=True)
     executable.parent.mkdir(parents=True)
     wrapper.touch()
-    readme.write_text("DeepSeek V4 Pro\nDeepSeek V4 Flash\n", encoding="utf-8")
+    readme.write_text("GLM 5.3 Flash\nDeepSeek V4 Flash\n", encoding="utf-8")
     executable.write_text(
-        'pro="deepseek/deepseek-v4-pro",flash="deepseek/deepseek-v4-flash";'
-        'a={id:pro,displayName:"DeepSeek V4 Pro",availability:"off_peak_only"};'
+        'glm="z-ai/glm-5.3-flash",flash="deepseek/deepseek-v4-flash";'
+        'a={id:glm,displayName:"GLM 5.3 Flash",availability:"off_peak_only"};'
         'b={id:flash,displayName:"DeepSeek V4 Flash",availability:"always"};',
         encoding="latin-1",
     )
@@ -226,8 +226,8 @@ def test_freebuff_catalog_keeps_the_current_off_peak_pro_model(monkeypatch, tmp_
 
     models, _efforts, current, _current_effort, error = freebuff_model_options()
 
-    assert models == ["deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash"]
-    assert current == "deepseek/deepseek-v4-pro"
+    assert models == ["z-ai/glm-5.3-flash", "deepseek/deepseek-v4-flash"]
+    assert current == "z-ai/glm-5.3-flash"
     assert error == ""
 
 
@@ -235,8 +235,9 @@ def test_freebuff_catalog_keeps_a_model_the_readme_names_without_its_date(monkey
     """A release date on the display name must not hide the model.
 
     FreeBuff renamed "DeepSeek V4 Pro" to "DeepSeek V4 Pro 08/13" in the binary
-    and left the README undated. Reading the two as different models dropped Pro
-    out of the catalog, which quietly handed every conversation to Flash.
+    and left the README undated. Reading the two as different models dropped the
+    preferred model out of the catalog, which quietly handed every conversation
+    to whatever was left.
     """
     wrapper = tmp_path / "npm" / "freebuff.cmd"
     readme = wrapper.parent / "node_modules" / "freebuff" / "README.md"
@@ -244,12 +245,12 @@ def test_freebuff_catalog_keeps_a_model_the_readme_names_without_its_date(monkey
     readme.parent.mkdir(parents=True)
     executable.parent.mkdir(parents=True)
     wrapper.touch()
-    readme.write_text("DeepSeek V4 Flash 07/31, DeepSeek V4 Pro, and GPT Next.\n", encoding="utf-8")
+    readme.write_text("DeepSeek V4 Flash 07/31, GLM 5.3 Flash, and GPT Next.\n", encoding="utf-8")
     executable.write_text(
-        'pro="deepseek/deepseek-v4-pro",flash="deepseek/deepseek-v4-flash",'
+        'glm="z-ai/glm-5.3-flash",flash="deepseek/deepseek-v4-flash",'
         'next="openai/gpt-next";'
         'a={id:flash,displayName:"DeepSeek V4 Flash 07/31",availability:"always"};'
-        'b={id:pro,displayName:"DeepSeek V4 Pro 08/13",availability:"always"};'
+        'b={id:glm,displayName:"GLM 5.3 Flash 08/13",availability:"always"};'
         'c={id:next,displayName:"GPT Next",availability:"always"};',
         encoding="latin-1",
     )
@@ -261,25 +262,25 @@ def test_freebuff_catalog_keeps_a_model_the_readme_names_without_its_date(monkey
 
     models, _efforts, current, _current_effort, error = freebuff_model_options()
 
-    assert models[0] == "deepseek/deepseek-v4-pro"
+    assert models[0] == "z-ai/glm-5.3-flash"
     assert "deepseek/deepseek-v4-flash" in models
-    assert current == "deepseek/deepseek-v4-pro"
+    assert current == "z-ai/glm-5.3-flash"
     assert error == ""
 
 
-def test_freebuff_falls_back_to_pro_rather_than_freebuffs_own_flash_setting(monkeypatch, tmp_path):
-    """With no BlindPilot record, Pro wins over whatever FreeBuff left behind."""
+def test_freebuff_falls_back_to_preferred_rather_than_freebuffs_own_setting(monkeypatch, tmp_path):
+    """With no BlindPilot record, the preferred model wins over FreeBuff's."""
     wrapper = tmp_path / "npm" / "freebuff.cmd"
     readme = wrapper.parent / "node_modules" / "freebuff" / "README.md"
     executable = tmp_path / ".config" / "manicode" / "freebuff.exe"
     readme.parent.mkdir(parents=True)
     executable.parent.mkdir(parents=True)
     wrapper.touch()
-    readme.write_text("DeepSeek V4 Flash 07/31 and DeepSeek V4 Pro.\n", encoding="utf-8")
+    readme.write_text("DeepSeek V4 Flash 07/31 and GLM 5.3 Flash.\n", encoding="utf-8")
     executable.write_text(
-        'pro="deepseek/deepseek-v4-pro",flash="deepseek/deepseek-v4-flash";'
+        'glm="z-ai/glm-5.3-flash",flash="deepseek/deepseek-v4-flash";'
         'a={id:flash,displayName:"DeepSeek V4 Flash 07/31",availability:"always"};'
-        'b={id:pro,displayName:"DeepSeek V4 Pro 08/13",availability:"always"};',
+        'b={id:glm,displayName:"GLM 5.3 Flash 08/13",availability:"always"};',
         encoding="latin-1",
     )
     settings = executable.parent / "settings.json"
@@ -292,7 +293,7 @@ def test_freebuff_falls_back_to_pro_rather_than_freebuffs_own_flash_setting(monk
 
     _models, _efforts, current, _current_effort, _error = freebuff_model_options()
 
-    assert current == "deepseek/deepseek-v4-pro"
+    assert current == "z-ai/glm-5.3-flash"
 
 
 def test_freebuff_picker_navigation_uses_runtime_model_order():
@@ -651,7 +652,7 @@ def test_codex_app_server_is_spawned_with_the_no_window_flag(monkeypatch):
     assert captured.get("creationflags", 0) == agent_backends.CREATE_NO_WINDOW
 
 
-def test_freebuff_keeps_pro_when_freebuff_resets_its_own_setting(monkeypatch, tmp_path):
+def test_freebuff_keeps_its_choice_when_freebuff_resets_its_own_setting(monkeypatch, tmp_path):
     """FreeBuff rewrites its settings to the model it recommends after a turn.
 
     Reading that back as the user's choice downgraded every following turn to
@@ -664,10 +665,10 @@ def test_freebuff_keeps_pro_when_freebuff_resets_its_own_setting(monkeypatch, tm
     readme.parent.mkdir(parents=True)
     executable.parent.mkdir(parents=True)
     wrapper.touch()
-    readme.write_text("DeepSeek V4 Pro\nDeepSeek V4 Flash\n", encoding="utf-8")
+    readme.write_text("GLM 5.3 Flash\nDeepSeek V4 Flash\n", encoding="utf-8")
     executable.write_text(
-        'pro="deepseek/deepseek-v4-pro",flash="deepseek/deepseek-v4-flash";'
-        'a={id:pro,displayName:"DeepSeek V4 Pro",availability:"always"};'
+        'glm="z-ai/glm-5.3-flash",flash="deepseek/deepseek-v4-flash";'
+        'a={id:glm,displayName:"GLM 5.3 Flash",availability:"always"};'
         'b={id:flash,displayName:"DeepSeek V4 Flash",availability:"always"};',
         encoding="latin-1",
     )
@@ -681,11 +682,11 @@ def test_freebuff_keeps_pro_when_freebuff_resets_its_own_setting(monkeypatch, tm
     # record yet, which is the state after a first run.
     settings.write_text(json.dumps({"freebuffModel": "deepseek/deepseek-v4-flash"}), "utf-8")
     _models, _efforts, current, _effort, _error = freebuff_model_options()
-    assert current == "deepseek/deepseek-v4-pro"
+    assert current == "z-ai/glm-5.3-flash"
 
     # An explicit choice is recorded by BlindPilot and survives the same reset.
     set_freebuff_model("deepseek/deepseek-v4-flash")
-    settings.write_text(json.dumps({"freebuffModel": "deepseek/deepseek-v4-pro"}), "utf-8")
+    settings.write_text(json.dumps({"freebuffModel": "z-ai/glm-5.3-flash"}), "utf-8")
     _models, _efforts, current, _effort, _error = freebuff_model_options()
     assert current == "deepseek/deepseek-v4-flash"
 
@@ -717,6 +718,42 @@ def test_freebuff_reports_a_terminal_that_closes_before_it_is_ready(monkeypatch)
     worker._do_run()
 
     assert failures and "closed before it was ready" in failures[0]
+
+
+def test_freebuff_gives_up_on_a_terminal_that_starts_and_then_paints_nothing(monkeypatch):
+    """A living terminal that never reaches a composer must not be waited out.
+
+    FreeBuff 0.0.163 starts, connects, writes one line to its own log and then
+    paints nothing ever again. The turn's deadline is an hour, so the message
+    was swallowed along with an hour of silence; the wait is now bounded by how
+    long FreeBuff goes without painting anything.
+    """
+    failures: list[str] = []
+    callbacks = _callbacks()
+    callbacks["on_failed"] = failures.append
+    worker = FreebuffWorker("do the work", None, ".", "default", **callbacks)
+
+    monkeypatch.setattr(agent_backends, "find_backend_cli", lambda _backend: "freebuff")
+    monkeypatch.setattr(agent_backends, "set_freebuff_model", lambda _model: None)
+    monkeypatch.setattr(agent_backends, "_FREEBUFF_STARTUP_SILENCE_SECONDS", 0.2)
+    # Alive, readable, and permanently silent: the terminal never ends and
+    # never paints, which is the whole of the failure being reported.
+    monkeypatch.setattr(
+        FreebuffWorker, "_spawn_pty", staticmethod(lambda _args: lambda _timeout: "")
+    )
+
+    started = time.monotonic()
+    worker._do_run()
+
+    assert time.monotonic() - started < 30
+    assert failures and "printed nothing at all" in failures[0]
+
+
+def test_freebuff_startup_silence_quotes_the_last_thing_it_showed():
+    """A terminal that painted something before going quiet says what."""
+    reason = agent_backends._freebuff_startup_silence("Checking for updates...", 120.0)
+    assert "Checking for updates..." in reason
+    assert "120" in reason
 
 
 def test_freebuff_narrates_only_finished_sentences():

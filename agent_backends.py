@@ -265,8 +265,11 @@ BACKEND_LABELS = {
 # FreeBuff has no model-list or model-selection CLI flags. Its installed
 # package and downloaded executable do contain the live picker catalog, so the
 # adapter discovers that catalog at runtime and writes the same setting the
-# picker uses. Pro remains the preferred default when FreeBuff still offers it.
-FREEBUFF_PREFERRED_MODEL = "deepseek/deepseek-v4-pro"
+# picker uses. GLM 5.3 is the preferred default while FreeBuff still offers it;
+# FreeBuff drops and renames models between releases, so this is a preference
+# rather than a requirement, and a release without it falls back to FreeBuff's
+# own choice rather than failing.
+FREEBUFF_PREFERRED_MODEL = "z-ai/glm-5.3-flash"
 _FREEBUFF_SETTINGS_LOCK = threading.Lock()
 _freebuff_catalog_cache: tuple[tuple[str, float, int], list[str]] | None = None
 
@@ -1785,6 +1788,18 @@ _FREEBUFF_FRAME_SECONDS = 0.1
 # never reach the listener until the turn ended.
 _FREEBUFF_MAX_LAG_SECONDS = 0.4
 
+# How long a starting FreeBuff may paint nothing at all before the message is
+# given up on. This bounds the wait by silence rather than by the clock: any
+# repaint at all -- a download progress bar, a splash, the model picker -- is
+# progress and starts it again, so a slow first launch that is visibly doing
+# something is never cut off. What it does catch is a FreeBuff that starts,
+# connects, and then paints nothing ever again, which is what 0.0.163 does
+# here: the turn's own deadline is an hour, so waiting that out cost the
+# message and an hour of silence with it. Two minutes because a first launch
+# downloads a 125MB FreeBuff and then unpacks it, and only the download half
+# draws a progress bar.
+_FREEBUFF_STARTUP_SILENCE_SECONDS = 120.0
+
 # Sentence-ending punctuation, or the end of a paragraph, either of which is a
 # place a listener expects the reading to stop.
 _SENTENCE_END_RE = re.compile(r"(?s)^.*(?:[.!?:;…][\"'”’)\]]*(?=\s|$)|\n)")
@@ -2044,6 +2059,32 @@ def _freebuff_launch_failure(visible: str) -> str:
             "Manage Backends to let BlindPilot install one for you."
         )
     return f"FreeBuff's terminal closed before it was ready for a prompt: {reason}"
+
+
+def _freebuff_startup_silence(visible: str, seconds: float) -> str:
+    """Say that FreeBuff started, went quiet, and never asked for a prompt.
+
+    A terminal that dies prints why on its way out, and
+    :func:`_freebuff_launch_failure` reports that sentence. This is the other
+    shape of the same lost message: FreeBuff is still running, still connected,
+    and simply never paints a composer to type into.
+    """
+    waited = int(seconds)
+    lines = [line.strip() for line in _strip_terminal_noise(visible).splitlines()]
+    reason = next((line for line in reversed(lines) if line), "")
+    if len(reason) > 200:
+        reason = reason[:199] + "\u2026"
+    if reason:
+        return (
+            f"FreeBuff stopped short of a prompt and printed nothing for {waited} "
+            f"seconds. The last thing it showed was: {reason}"
+        )
+    return (
+        f"FreeBuff started but printed nothing at all for {waited} seconds, so "
+        "there was never a prompt to send the message to. Run freebuff in a "
+        "terminal to see what it does there: if it hangs there too, the "
+        "installed FreeBuff release is at fault rather than BlindPilot."
+    )
 
 
 class FreebuffTerminal(Protocol):
@@ -2552,6 +2593,9 @@ class FreebuffWorker(threading.Thread):
                 stream = pyte.Stream(screen)
                 last_visible = ""
                 screen_dirty = False
+                # The replacement has painted nothing yet, and nothing is what
+                # the startup wait is measured in, so start it again here.
+                screen_changed_at = time.monotonic()
                 continue
             if not chunk and self._stream_ended.is_set():
                 if not sent:
@@ -2663,6 +2707,11 @@ class FreebuffWorker(threading.Thread):
                 continue
 
             now = time.monotonic()
+            if not sent and now - screen_changed_at >= _FREEBUFF_STARTUP_SILENCE_SECONDS:
+                self._on_failed(
+                    _freebuff_startup_silence(last_visible, _FREEBUFF_STARTUP_SILENCE_SECONDS)
+                )
+                return
             if sent and now >= next_session_check:
                 next_session_check = now + 1.0
                 if chat_path is None:
