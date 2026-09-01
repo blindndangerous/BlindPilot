@@ -4,6 +4,11 @@ Readable release history for BlindPilot. When adjacent releases were part of the
 same fix stream, they are combined with a version range such as
 `v0.3.6-v0.3.7`.
 
+## v0.7.1 - 2026-08-31
+
+- A FreeBuff that starts and then paints nothing is reported in two minutes instead of being waited out for the whole hour a turn is allowed. FreeBuff 0.0.163 starts, connects, and then never draws a prompt to type into, on a bare terminal as readily as under BlindPilot; because the terminal neither died nor became ready, the message bought an hour of silence and was then reported unsent. Start-up is now bounded by how long FreeBuff goes without painting anything, so a first launch that is visibly downloading, unpacking, or offering the model picker is never cut off, while one that has stopped is reported in its own last words.
+- FreeBuff's preferred model is now GLM 5.3 (`z-ai/glm-5.3-flash`). FreeBuff has dropped `deepseek/deepseek-v4-pro`, which BlindPilot preferred by default. This stays a preference rather than a requirement: the catalogue is still read out of the installed release at run time, a release without GLM 5.3 falls back to a model it does offer, and an explicit choice in BlindPilot still wins over both.
+
 ## v0.7.0 - 2026-08-28
 
 - Linux announcements now reach Orca without stealing keyboard focus. BlindPilot creates a real off-screen GTK accessible through GTK's native API and emits ATK announcements through it, avoiding duplicate GTK initialization warnings while keeping status-bar text as the fallback when GTK is unavailable.

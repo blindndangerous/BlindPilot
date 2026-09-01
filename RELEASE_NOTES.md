@@ -1,48 +1,36 @@
-# BlindPilot 0.7.0
+# BlindPilot 0.7.1
 
 BlindPilot is an accessible desktop reader for AI coding agents. It is based on Claude
 Code Reader and remains available under the MIT License, with credit to the original
 project throughout the application and documentation.
 
-## Orca hears BlindPilot on Linux
+## A FreeBuff that never starts now says so
 
-BlindPilot's live announcements now reach Orca without moving keyboard focus. A bare ATK
-object is not part of the application's accessible tree, so Orca correctly ignores it;
-BlindPilot now creates a real off-screen GTK accessible and emits announcements through
-that object instead. It uses GTK's native C API so wxPython and PyGObject do not both try
-to initialize GTK and produce warnings.
+FreeBuff 0.0.163 can start, connect, and then paint nothing at all. It is still running
+and still holding its connections, so nothing ever ends and nothing is ever drawn to type
+a message into. This happens on a bare terminal exactly as readily as it does inside
+BlindPilot, so it is FreeBuff's own fault rather than BlindPilot's — but BlindPilot
+handled it badly.
 
-The GTK bridge is optional. If the native GTK libraries are unavailable, BlindPilot still
-starts normally and leaves the same message in the status bar for the review cursor.
+A turn is given an hour to finish, and a terminal that neither dies nor reaches a prompt
+used all of it. From the outside that was a message sent into complete silence, with the
+failure finally spoken an hour later.
 
-## macOS updates recover instead of disappearing
+FreeBuff's start-up is now bounded by how long it goes without painting anything, rather
+than by the clock. Any repaint counts as progress and starts the wait over, so a first
+launch that is downloading and unpacking FreeBuff, showing a splash, or offering the model
+picker is never cut off no matter how long it takes. A FreeBuff that has simply stopped is
+reported after two minutes, quoting the last thing it managed to show, or saying plainly
+that it showed nothing at all and suggesting FreeBuff be run in a terminal to confirm
+where the fault lies.
 
-The old macOS updater closed BlindPilot and attempted one unreported bundle swap. If the
-application was running from macOS App Translocation, the folder was not writable, the
-archive could not be expanded, Gatekeeper quarantined the replacement, or the relaunch
-failed, BlindPilot could simply vanish.
+## GLM 5.3 is the preferred FreeBuff model
 
-Those failures are now handled deliberately:
+FreeBuff has removed `deepseek/deepseek-v4-pro` from its catalogue, which is the model
+BlindPilot preferred by default. GLM 5.3 (`z-ai/glm-5.3-flash`) takes its place.
 
-- Translocated and unwritable application bundles are rejected while BlindPilot is still
-  open, with instructions that can be acted on.
-- A detached helper waits for BlindPilot to close and prevents two windows from updating
-  the same bundle at once.
-- Verified updates have quarantine removed before and after installation so macOS can
-  launch them.
-- The current application is kept as a backup until the new copy is installed and ready.
-  If anything fails, the previous version is restored and reopened.
-- Failures are logged and reported on the next launch instead of being lost after the
-  window closes. Relaunch falls back to the executable if Launch Services refuses the
-  bundle.
-
-## Python 3.13 and release coverage
-
-The opencode backend's event handler was named `_handle`, which collides with a private
-attribute Python 3.13 adds to every `threading.Thread`. On that Python version, opencode
-events could try to call the runtime's internal handle as a method. The handler now has a
-non-conflicting name, with a regression test that reproduces the collision on every
-supported Python version.
-
-POSIX login-shell PATH discovery is now tested without depending on the host shell, and
-release builds explicitly compile the new Linux accessibility bridge.
+This remains a preference rather than a requirement. FreeBuff drops and renames models
+between releases, so BlindPilot still reads the catalogue out of the installed release at
+run time, and a release that no longer offers GLM 5.3 falls back to a model that release
+does offer instead of driving the picker toward a row that will never appear. A model
+chosen explicitly in BlindPilot still wins over both.
