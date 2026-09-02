@@ -2106,6 +2106,9 @@ class Earcons:
         self._loop_stop = threading.Event()
         self._loop_thread: Optional[threading.Thread] = None
         self._loop_proc: Optional[subprocess.Popen] = None
+        # Held only so the interpreter does not collect it while the sound
+        # is still playing, which leaves a child nobody ever reaps.
+        self._error_proc: Optional[subprocess.Popen] = None
 
     def _resolve(self, *basenames: str) -> Optional[str]:
         for name in basenames:
@@ -2165,7 +2168,12 @@ class Earcons:
             winsound.MessageBeep(winsound.MB_ICONHAND)
             return
         if self._system == "Darwin":
-            subprocess.Popen(
+            previous = self._error_proc
+            if previous is not None and previous.poll() is None:
+                # The last one is still playing. Two error sounds on top of
+                # each other say no more than one does.
+                return
+            self._error_proc = subprocess.Popen(
                 ["afplay", "/System/Library/Sounds/Basso.aiff"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,

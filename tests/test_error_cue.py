@@ -90,14 +90,24 @@ def test_an_error_is_announced_urgently(monkeypatch):
 
 
 # ----- the cue needs no shipped audio file -----
-def test_the_error_cue_uses_the_platform_sound_rather_than_a_file(tmp_path):
+def test_the_error_cue_uses_the_platform_sound_rather_than_a_file(tmp_path, monkeypatch):
     """`EarCons/` ships three files. Authoring a fourth is not something to
     fake, and the system error sound is the one already associated with
-    failure on whichever platform this is."""
+    failure on whichever platform this is.
+
+    The platform call itself is stubbed rather than made: on macOS it spawns
+    `afplay`, and a unit test has no business starting an audio process on
+    somebody's machine or leaving a child for the interpreter to reap.
+    """
+    played: list[str] = []
     box = app.Earcons(str(tmp_path))
+    monkeypatch.setattr(box, "_play_system_error", lambda: played.append("system"))
 
     assert box._resolve("error") is None, "no error file is shipped, by design"
-    box.play_error()  # must not raise on any platform
+
+    box.play_error()
+
+    assert played == ["system"]
 
 
 def test_a_muted_application_plays_no_error_cue(tmp_path, monkeypatch):
