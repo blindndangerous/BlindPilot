@@ -205,6 +205,19 @@ python -m ruff format --check .
 python -m mypy
 ```
 
+The same checks can run before each commit, so a failed run on GitHub is not
+where a lint error is first seen:
+
+```
+pip install pre-commit
+pre-commit install
+pre-commit install --hook-type pre-push
+```
+
+Ruff and mypy run on every commit; the test suite runs on push, with the same
+`-W error` the CI uses. A failure on Linux or macOS still needs the CI runners.
+
+
 Pull requests are welcome.
 
 ## License and credits
