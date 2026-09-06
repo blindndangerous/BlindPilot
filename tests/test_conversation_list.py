@@ -91,7 +91,10 @@ def test_measurements_are_cached_until_the_rows_or_width_change(frame):
     lst.SetSize(wx.Size(300, 200))
     lst.OnMeasureItem(0)
     lst.OnMeasureItem(1)
-    assert set(lst._measured) == {(0, lst.GetClientSize().width), (1, lst.GetClientSize().width)}
+    # GTK can resize the client area once more after SetSize, so an older width may sit beside the current one.
+    width = lst.GetClientSize().width
+    assert {n for n, _w in lst._measured} == {0, 1}
+    assert (0, width) in lst._measured and (1, width) in lst._measured
     lst.AppendItems(["more"])
     assert (0, lst.GetClientSize().width) in lst._measured, "append kept the rows that stayed"
     lst.Set(["fresh"])
