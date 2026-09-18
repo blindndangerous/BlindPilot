@@ -2,6 +2,12 @@
 
 Release history for BlindPilot, newest first. Entries are short by design. The reasoning behind each change is in the commit messages.
 
+## v0.29.3 - 2026-09-18
+
+- A turn that ends by asking you something now opens the question dialog, even when it never used a question tool. Every backend's dialog was opened by a structured event and nothing else - Claude Code's `AskUserQuestion`, Codex's `request_user_input`, opencode's question, Hermes' clarify, Muse's userInput - so a model that wrote its question into its answer instead announced nothing and showed nothing: the turn just ended, with no sign an answer was wanted. This is what a skill that interviews you does as a matter of course, "grill me" among them, and on Command Code, which withholds `ask_user_question` from headless runs, it was the only way a question ever arrived. The end of each answer is now read, and a turn that ends on a question opens the same dialog on every backend; what you type is sent as your next message. Under Options, and on by default.
+- The reading is deliberately narrow, because a dialog nobody asked for interrupts for nothing: the question mark has to be near the end, code blocks are not read, and a question the answer then goes on to answer itself is left alone.
+- Claude Code and Codex are now told to ask through their question tool rather than writing the question out. Claude Code takes it as `--append-system-prompt`; Codex takes it as `developer_instructions`, added behind your own rather than replacing them, since `-c` overwrites a key rather than adding to it.
+
 ## v0.29.2 - 2026-09-15
 
 - A tool Claude Code refused is no longer read out as though it were the tool's output. A `permissions.deny` rule, a disabled tool and a PreToolUse hook all refuse in `bypassPermissions` exactly as they do in any other mode, and each one comes back as an ordinary tool result carrying `is_error` — which was announced as "Result: Permission to use Bash ... has been denied", indistinguishable by ear from the command output it never produced. A refusal now names the tool and the reason, a call that merely failed is told apart from one that was refused, and the full text still gets its own row. In bypass, one sentence follows the first refusal saying what bypass does not cover.

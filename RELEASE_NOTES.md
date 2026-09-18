@@ -1,8 +1,9 @@
-# BlindPilot 0.29.2
+# BlindPilot 0.29.3
 
-Claude Code's refused tool calls are now said out loud as refusals.
+A turn that ends by asking you something now opens the question dialog, whichever backend it was.
 
-- A `permissions.deny` rule, a tool disabled for the session, and a `PreToolUse` hook all refuse a call in `bypassPermissions` mode exactly as they do in every other mode. Each came back as an ordinary result row — "Result: Permission to use Bash with command ... has been denied" — which sounds like the output of a command that in fact never ran. A refusal now names the tool and the reason it was given, and a call that simply failed is distinguished from one that was refused.
-- In bypass, the first refusal of a turn is followed by one sentence explaining what bypass does not cover, so a refusal in the mode you chose so that nothing would be refused is not left looking like a fault.
-- The full text of the refusal still gets a row of its own to read in the list.
-- Checked against the installed Claude Code: in bypass the CLI asks no permission at all, and Read, Write, Edit, Bash, Glob and Grep all run. The refusals that reach you come from your own deny rules, disabled tools and hooks.
+- Every backend can stop a turn to ask you a question through a question tool of its own, and BlindPilot announces that and opens a dialog. A model does not always use the tool: asked to interview you, or told to ask one question at a time, it writes the question into its answer instead. Skills that grill you do this as a matter of course. A question written into an answer sends no event, so nothing was announced and no dialog opened — the turn simply ended, and nothing told you an answer was wanted.
+- The end of each answer is now read, and a turn that ends on a question opens the same dialog it would have opened for a question tool. What you type is sent as your next message. It is under Options, on by default, and can be switched off.
+- This matters most on Command Code, which withholds its `ask_user_question` tool from headless runs entirely, so a written question was the only kind it could ever ask.
+- The reading is narrow on purpose. The question mark has to be near the end of the answer, question marks inside code blocks are ignored, and a question the answer then answers itself is left alone, so a dialog does not open when nothing was asked of you.
+- Claude Code and Codex are also told, in their own instructions, to ask through their question tool rather than writing the question out. On Codex that is added behind your own `developer_instructions` rather than replacing them.
